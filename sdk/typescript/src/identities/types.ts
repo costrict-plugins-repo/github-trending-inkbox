@@ -1,0 +1,478 @@
+/**
+ * inkbox-identities TypeScript SDK — public types.
+ */
+
+import type {
+  FilterMode,
+  FilterModeChangeNotice,
+  RawFilterModeChangeNotice,
+} from "../mail/types.js";
+import {
+  FilterMode as FilterModeEnum,
+  parseFilterModeChangeNotice,
+} from "../mail/types.js";
+import { ForwardingTargetType, SmsStatus } from "../phone/types.js";
+import type { RawTunnelSummary, TLSMode, TunnelSummary } from "../tunnels/types.js";
+import { parseTunnelSummary } from "../tunnels/types.js";
+import type {
+  IdentityIMessageNumber,
+  RawIdentityIMessageNumber,
+} from "../imessage/types.js";
+import { parseIdentityIMessageNumber } from "../imessage/types.js";
+
+export interface IdentityMailboxCreateOptions {
+  emailLocalPart?: string;
+  /**
+   * Optional sending-domain selector by **bare domain name** (not an id).
+   * Omit to inherit the org's default. Pass `null` to force the platform
+   * default. Pass a verified custom-domain name (e.g. `"mail.acme.com"`)
+   * to bind this mailbox to it.
+   */
+  sendingDomain?: string | null;
+}
+
+export interface IdentityPhoneNumberCreateOptions {
+  type?: string;
+  state?: string;
+  incomingCallAction?: string;
+  clientWebsocketUrl?: string;
+  incomingCallWebhookUrl?: string;
+  forwardingTargetType?: ForwardingTargetType;
+  forwardingPhoneNumber?: string;
+  forwardingSipUri?: string;
+}
+
+export interface IdentityTunnelCreateOptions {
+  tlsMode?: TLSMode | "edge" | "passthrough";
+}
+
+export interface CreateIdentityOptions {
+  /** Identity-level human-readable name. Defaults server-side to `agentHandle`. */
+  displayName?: string;
+  /**
+   * Free-form org-internal description. Pass a string to set, `null` to
+   * leave the column null. Never surfaces in outbound mail / public payloads.
+   */
+  description?: string | null;
+  /**
+   * Whether this identity can be reached over the shared iMessage
+   * service. Defaults server-side to `false`; pass `true` to opt in.
+   */
+  imessageEnabled?: boolean;
+  /** Automatically share this identity's name and optional avatar on an attached dedicated iMessage line. */
+  contactSharingEnabled?: boolean;
+  /**
+   * Claim and attach a dedicated iMessage line atomically during identity
+   * creation. Requires `imessageEnabled: true`.
+   */
+  claimIMessageNumber?: true;
+  emailLocalPart?: string;
+  /**
+   * Optional sending-domain selector by **bare domain name**. Presence
+   * (including explicit `null`) configures the mailbox's sending domain.
+   * Omit to inherit the org's default, `null` to force the platform default,
+   * or a verified domain name to bind to that domain.
+   */
+  sendingDomain?: string | null;
+  /** Optional nested tunnel spec. Server defaults to edge TLS if omitted. */
+  tunnel?: IdentityTunnelCreateOptions;
+  phoneNumber?: IdentityPhoneNumberCreateOptions;
+  vaultSecretIds?: string | string[] | "*" | "all";
+}
+
+/** Fields accepted by identity PATCH. Omitted fields remain unchanged. */
+export interface UpdateIdentityOptions {
+  mailInboundFilterMode?: "whitelist" | "blacklist";
+  mailOutboundFilterMode?: "whitelist" | "blacklist";
+  slackFilterMode?: "whitelist" | "blacklist";
+  slackInboundFilterMode?: "whitelist" | "blacklist";
+  slackOutboundFilterMode?: "whitelist" | "blacklist";
+  phoneInboundFilterMode?: "whitelist" | "blacklist";
+  phoneOutboundFilterMode?: "whitelist" | "blacklist";
+  displayName?: string | null;
+  description?: string | null;
+  imessageEnabled?: boolean;
+  /** Toggle automatic name and optional photo sharing for an attached dedicated iMessage line. */
+  contactSharingEnabled?: boolean;
+  /**
+   * Attach an already-owned dedicated line by id, atomically swap lines,
+   * or pass `null` to return to the shared iMessage service.
+   */
+  imessageNumberId?: string | null;
+  /** Claim and atomically attach or swap to a new dedicated line. */
+  claimIMessageNumber?: true;
+  /**
+   * Stable caller-generated key for a `claimIMessageNumber` operation.
+   * Reuse it when retrying an ambiguous update.
+   */
+  idempotencyKey?: string;
+  imessageFilterMode?: "whitelist" | "blacklist";
+  mailFilterMode?: "whitelist" | "blacklist";
+  phoneFilterMode?: "whitelist" | "blacklist";
+}
+
+export interface IdentityMailbox {
+  inboundFilterMode?: FilterMode;
+  outboundFilterMode?: FilterMode;
+  signatureHtml: string | null;
+  signatureText: string | null;
+  signatureEnabled: boolean;
+  id: string;
+  emailAddress: string;
+  /**
+   * Bare domain the mailbox sends from, derived from `emailAddress`.
+   * Either the platform default or a verified custom domain.
+   */
+  sendingDomain: string;
+  filterMode: FilterMode;
+  /**
+   * UUID of the owning agent identity. Non-null for live customer
+   * mailboxes (1:1 invariant); null only on deleted rows and system mailboxes.
+   */
+  agentIdentityId: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  filterModeChangeNotice: FilterModeChangeNotice | null;
+}
+
+export interface IdentityPhoneNumber {
+  inboundFilterMode?: FilterMode;
+  outboundFilterMode?: FilterMode;
+  id: string;
+  number: string;
+  /** Number type. Always `"local"`. */
+  type: string;
+  /** "active" | "paused" | "released" */
+  status: string;
+  /** Outbound SMS readiness — gate `sendText` on `ready`. */
+  smsStatus: SmsStatus;
+  smsErrorCode: string | null;
+  smsErrorDetail: string | null;
+  smsReadyAt: Date | null;
+  /** "auto_accept" | "auto_reject" | "webhook" | "hosted_agent" | "forward" */
+  incomingCallAction: string;
+  clientWebsocketUrl: string | null;
+  incomingCallWebhookUrl: string | null;
+  forwardingTargetType: ForwardingTargetType | null;
+  forwardingPhoneNumber: string | null;
+  forwardingSipUri: string | null;
+  filterMode: FilterMode;
+  /**
+   * US state abbreviation when known; `null` when not applicable.
+   */
+  state: string | null;
+  /** ISO 3166-1 alpha-2 code. Parsers default older responses to `"US"`. */
+  country?: string;
+  /**
+   * UUID of the owning agent identity. On the embedded variant this
+   * always equals the owning identity's ID.
+   */
+  agentIdentityId: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  filterModeChangeNotice: FilterModeChangeNotice | null;
+}
+
+/** Identity returned by list endpoints. */
+export interface AgentIdentitySummary {
+  mailInboundFilterMode?: FilterMode;
+  mailOutboundFilterMode?: FilterMode;
+  slackFilterMode?: FilterMode;
+  slackInboundFilterMode?: FilterMode;
+  slackOutboundFilterMode?: FilterMode;
+  phoneInboundFilterMode?: FilterMode;
+  phoneOutboundFilterMode?: FilterMode;
+  id: string;
+  organizationId: string;
+  agentHandle: string;
+  displayName: string | null;
+  description: string | null;
+  /** Email address assigned at creation time. Always trust this value — do not derive it from `agentHandle`. */
+  emailAddress: string | null;
+  /**
+   * Whether this identity can be reached over iMessage. A detailed identity
+   * may also carry an attached dedicated line.
+   */
+  imessageEnabled: boolean;
+  contactSharingEnabled: boolean;
+  /** Whitelist/blacklist mode for this identity's iMessage contact rules. */
+  imessageFilterMode: FilterMode;
+  /**
+   * Whitelist/blacklist mode for this identity's mail contact rules. Lives
+   * on the identity (set via `identity.update(...)`); the same field on the
+   * mailbox object is the deprecated legacy mirror.
+   */
+  mailFilterMode: FilterMode;
+  /**
+   * Whitelist/blacklist mode for this identity's phone contact rules. Lives
+   * on the identity (set via `identity.update(...)`); the same field on the
+   * phone-number object is the deprecated legacy mirror.
+   */
+  phoneFilterMode: FilterMode;
+  createdAt: Date;
+  updatedAt: Date;
+  /** Whether this identity has a webhook signing key configured. Status only — never the secret. */
+  signingKeyConfigured: boolean;
+  /** When the signing key was created, or `null` if none is configured. */
+  signingKeyCreatedAt: Date | null;
+  /** Linked mailbox when included by the response. */
+  mailbox?: IdentityMailbox | null;
+  /** Linked phone number when included by the response. */
+  phoneNumber?: IdentityPhoneNumber | null;
+  /** Attached dedicated iMessage line when included by the response. */
+  imessageNumber?: IdentityIMessageNumber | null;
+  /** Linked tunnel summary when included by the response. */
+  tunnel?: TunnelSummary | null;
+}
+
+/** @internal Full identity data with channels — users interact with AgentIdentity (the class) instead. */
+export interface _AgentIdentityData extends AgentIdentitySummary {
+  /** Mailbox assigned to this identity, or `null` when unavailable. */
+  mailbox: IdentityMailbox | null;
+  /** Phone number assigned to this identity, or null if unlinked. */
+  phoneNumber: IdentityPhoneNumber | null;
+  /** Dedicated iMessage line attached to this identity, or null on shared service. */
+  imessageNumber: IdentityIMessageNumber | null;
+  /**
+   * Summary of the tunnel assigned to this identity, or `null` when unavailable.
+   * For connection state and certificate material, fetch the full tunnel:
+   * `tunnels.get(identity.tunnel.id)`.
+  */
+  tunnel: TunnelSummary | null;
+}
+
+// ---- internal raw API shapes (snake_case from JSON) ----
+
+export interface RawIdentityMailbox {
+  inbound_filter_mode?: string;
+  outbound_filter_mode?: string;
+  signature_html?: string | null;
+  signature_text?: string | null;
+  signature_enabled?: boolean;
+  id: string;
+  email_address: string;
+  sending_domain?: string;
+  filter_mode?: string;
+  agent_identity_id?: string | null;
+  filter_mode_change_notice?: RawFilterModeChangeNotice | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RawIdentityPhoneNumber {
+  inbound_filter_mode?: string;
+  outbound_filter_mode?: string;
+  id: string;
+  number: string;
+  type: string;
+  status: string;
+  sms_status?: string;
+  sms_error_code?: string | null;
+  sms_error_detail?: string | null;
+  sms_ready_at?: string | null;
+  incoming_call_action: string;
+  client_websocket_url: string | null;
+  incoming_call_webhook_url?: string | null;
+  forwarding_target_type?: string | null;
+  forwarding_phone_number?: string | null;
+  forwarding_sip_uri?: string | null;
+  filter_mode?: string;
+  state?: string | null;
+  country?: string;
+  agent_identity_id?: string | null;
+  filter_mode_change_notice?: RawFilterModeChangeNotice | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RawAgentIdentitySummary {
+  mail_inbound_filter_mode?: string;
+  mail_outbound_filter_mode?: string;
+  slack_filter_mode?: string | null;
+  slack_inbound_filter_mode?: string | null;
+  slack_outbound_filter_mode?: string | null;
+  phone_inbound_filter_mode?: string;
+  phone_outbound_filter_mode?: string;
+  id: string;
+  organization_id: string;
+  agent_handle: string;
+  display_name: string | null;
+  description: string | null;
+  email_address: string | null;
+  imessage_enabled?: boolean;
+  contact_sharing_enabled?: boolean;
+  imessage_filter_mode?: string | null;
+  mail_filter_mode?: string | null;
+  phone_filter_mode?: string | null;
+  signing_key_configured?: boolean;
+  signing_key_created_at?: string | null;
+  created_at: string;
+  updated_at: string;
+  mailbox?: RawIdentityMailbox | null;
+  phone_number?: RawIdentityPhoneNumber | null;
+  imessage_number?: RawIdentityIMessageNumber | null;
+  tunnel?: RawTunnelSummary | null;
+}
+
+export interface RawAgentIdentityData extends RawAgentIdentitySummary {
+  mailbox: RawIdentityMailbox | null;
+  phone_number: RawIdentityPhoneNumber | null;
+  imessage_number?: RawIdentityIMessageNumber | null;
+  tunnel: RawTunnelSummary | null;
+}
+
+// ---- parsers ----
+
+export function parseIdentityMailbox(r: RawIdentityMailbox): IdentityMailbox {
+  return {
+    inboundFilterMode: (r.inbound_filter_mode ?? r.filter_mode ?? FilterModeEnum.BLACKLIST) as FilterMode,
+    outboundFilterMode: (r.outbound_filter_mode ?? r.filter_mode ?? FilterModeEnum.BLACKLIST) as FilterMode,
+    signatureHtml: r.signature_html ?? null,
+    signatureText: r.signature_text ?? null,
+    signatureEnabled: r.signature_enabled ?? false,
+    id: r.id,
+    emailAddress: r.email_address,
+    sendingDomain: r.sending_domain ?? r.email_address.split("@")[1] ?? "",
+    filterMode: (r.filter_mode as FilterMode) ?? FilterModeEnum.BLACKLIST,
+    agentIdentityId: r.agent_identity_id ?? null,
+    createdAt: new Date(r.created_at),
+    updatedAt: new Date(r.updated_at),
+    filterModeChangeNotice: r.filter_mode_change_notice
+      ? parseFilterModeChangeNotice(r.filter_mode_change_notice)
+      : null,
+  };
+}
+
+export function parseIdentityPhoneNumber(r: RawIdentityPhoneNumber): IdentityPhoneNumber {
+  return {
+    inboundFilterMode: (r.inbound_filter_mode ?? r.filter_mode ?? FilterModeEnum.BLACKLIST) as FilterMode,
+    outboundFilterMode: (r.outbound_filter_mode ?? r.filter_mode ?? FilterModeEnum.BLACKLIST) as FilterMode,
+    id: r.id,
+    number: r.number,
+    type: r.type,
+    status: r.status,
+    smsStatus: (r.sms_status as SmsStatus) ?? SmsStatus.READY,
+    smsErrorCode: r.sms_error_code ?? null,
+    smsErrorDetail: r.sms_error_detail ?? null,
+    smsReadyAt: r.sms_ready_at ? new Date(r.sms_ready_at) : null,
+    incomingCallAction: r.incoming_call_action,
+    clientWebsocketUrl: r.client_websocket_url,
+    incomingCallWebhookUrl: r.incoming_call_webhook_url ?? null,
+    forwardingTargetType: (r.forwarding_target_type as ForwardingTargetType) ?? null,
+    forwardingPhoneNumber: r.forwarding_phone_number ?? null,
+    forwardingSipUri: r.forwarding_sip_uri ?? null,
+    filterMode: (r.filter_mode as FilterMode) ?? FilterModeEnum.BLACKLIST,
+    state: r.state ?? null,
+    country: r.country ?? "US",
+    agentIdentityId: r.agent_identity_id ?? null,
+    createdAt: new Date(r.created_at),
+    updatedAt: new Date(r.updated_at),
+    filterModeChangeNotice: r.filter_mode_change_notice
+      ? parseFilterModeChangeNotice(r.filter_mode_change_notice)
+      : null,
+  };
+}
+
+export function parseAgentIdentitySummary(r: RawAgentIdentitySummary): AgentIdentitySummary {
+  return {
+    mailInboundFilterMode: (r.mail_inbound_filter_mode ?? r.mail_filter_mode ?? FilterModeEnum.BLACKLIST) as FilterMode,
+    mailOutboundFilterMode: (r.mail_outbound_filter_mode ?? r.mail_filter_mode ?? FilterModeEnum.BLACKLIST) as FilterMode,
+    slackFilterMode: (r.slack_filter_mode ?? FilterModeEnum.BLACKLIST) as FilterMode,
+    slackInboundFilterMode: (r.slack_inbound_filter_mode ?? r.slack_filter_mode ?? FilterModeEnum.BLACKLIST) as FilterMode,
+    slackOutboundFilterMode: (r.slack_outbound_filter_mode ?? r.slack_filter_mode ?? FilterModeEnum.BLACKLIST) as FilterMode,
+    phoneInboundFilterMode: (r.phone_inbound_filter_mode ?? r.phone_filter_mode ?? FilterModeEnum.BLACKLIST) as FilterMode,
+    phoneOutboundFilterMode: (r.phone_outbound_filter_mode ?? r.phone_filter_mode ?? FilterModeEnum.BLACKLIST) as FilterMode,
+    id: r.id,
+    organizationId: r.organization_id,
+    agentHandle: r.agent_handle,
+    displayName: r.display_name ?? null,
+    description: r.description ?? null,
+    emailAddress: r.email_address,
+    imessageEnabled: r.imessage_enabled ?? false,
+    contactSharingEnabled: r.contact_sharing_enabled ?? true,
+    imessageFilterMode: (r.imessage_filter_mode as FilterMode) ?? FilterModeEnum.BLACKLIST,
+    mailFilterMode: (r.mail_filter_mode as FilterMode) ?? FilterModeEnum.BLACKLIST,
+    phoneFilterMode: (r.phone_filter_mode as FilterMode) ?? FilterModeEnum.BLACKLIST,
+    createdAt: new Date(r.created_at),
+    updatedAt: new Date(r.updated_at),
+    signingKeyConfigured: r.signing_key_configured ?? false,
+    signingKeyCreatedAt: r.signing_key_created_at ? new Date(r.signing_key_created_at) : null,
+    mailbox: r.mailbox ? parseIdentityMailbox(r.mailbox) : null,
+    phoneNumber: r.phone_number ? parseIdentityPhoneNumber(r.phone_number) : null,
+    imessageNumber: r.imessage_number
+      ? parseIdentityIMessageNumber(r.imessage_number)
+      : null,
+    tunnel: r.tunnel ? parseTunnelSummary(r.tunnel) : null,
+  };
+}
+
+export function parseAgentIdentityData(r: RawAgentIdentityData): _AgentIdentityData {
+  return {
+    ...parseAgentIdentitySummary(r),
+    mailbox: r.mailbox ? parseIdentityMailbox(r.mailbox) : null,
+    phoneNumber: r.phone_number ? parseIdentityPhoneNumber(r.phone_number) : null,
+    imessageNumber: r.imessage_number
+      ? parseIdentityIMessageNumber(r.imessage_number)
+      : null,
+    tunnel: r.tunnel ? parseTunnelSummary(r.tunnel) : null,
+  };
+}
+
+export function identityMailboxCreateOptionsToWire(
+  options: IdentityMailboxCreateOptions,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  if (options.emailLocalPart !== undefined) body["email_local_part"] = options.emailLocalPart;
+  if ("sendingDomain" in options) body["sending_domain"] = options.sendingDomain;
+  return body;
+}
+
+export function identityTunnelCreateOptionsToWire(
+  options: IdentityTunnelCreateOptions,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  if (options.tlsMode !== undefined) body["tls_mode"] = options.tlsMode;
+  return body;
+}
+
+export function identityPhoneNumberCreateOptionsToWire(
+  options: IdentityPhoneNumberCreateOptions,
+): Record<string, unknown> {
+  if (options.incomingCallAction === "auto_accept" && options.clientWebsocketUrl === undefined) {
+    throw new Error("clientWebsocketUrl is required for auto_accept");
+  }
+  if (options.incomingCallAction === "webhook" && options.incomingCallWebhookUrl === undefined) {
+    throw new Error("incomingCallWebhookUrl is required for webhook");
+  }
+  if (options.incomingCallAction === "forward" && options.forwardingTargetType === undefined) {
+    throw new Error("forwardingTargetType is required for forward");
+  }
+  if (options.forwardingTargetType === undefined) {
+    if (options.forwardingPhoneNumber !== undefined || options.forwardingSipUri !== undefined) {
+      throw new Error("forwardingTargetType is required when a forwarding target is set");
+    }
+  } else if (options.forwardingTargetType === "phone") {
+    if (!options.forwardingPhoneNumber || options.forwardingSipUri !== undefined) {
+      throw new Error("phone forwarding requires only forwardingPhoneNumber");
+    }
+  } else if (!options.forwardingSipUri || options.forwardingPhoneNumber !== undefined) {
+    throw new Error("SIP forwarding requires only forwardingSipUri");
+  }
+
+  const body: Record<string, unknown> = {};
+  if (options.type !== undefined) body["type"] = options.type;
+  if (options.state !== undefined) body["state"] = options.state;
+  if (options.incomingCallAction !== undefined) body["incoming_call_action"] = options.incomingCallAction;
+  if (options.clientWebsocketUrl !== undefined) body["client_websocket_url"] = options.clientWebsocketUrl;
+  if (options.incomingCallWebhookUrl !== undefined) body["incoming_call_webhook_url"] = options.incomingCallWebhookUrl;
+  if (options.forwardingTargetType !== undefined) body["forwarding_target_type"] = options.forwardingTargetType;
+  if (options.forwardingPhoneNumber !== undefined) body["forwarding_phone_number"] = options.forwardingPhoneNumber;
+  if (options.forwardingSipUri !== undefined) body["forwarding_sip_uri"] = options.forwardingSipUri;
+  return body;
+}
+
+export function vaultSecretIdsToWire(
+  value: string | string[] | "*" | "all" | undefined,
+): string | string[] | "*" | "all" | undefined {
+  return value;
+}

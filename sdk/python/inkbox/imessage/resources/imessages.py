@@ -1,0 +1,507 @@
+"""
+inkbox/imessage/resources/imessages.py
+
+iMessage operations: send, list, conversations, reactions, read
+receipts, typing indicators, media upload.
+
+iMessage messaging operations are identity-scoped, so they key off
+``conversation_id`` / ``agent_identity_id`` rather than a local number ID.
+One-to-one conversations may carry assignment state; groups require a dedicated
+line. This resource also lists and claims dedicated lines.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
+
+from inkbox._message_requests import post_message
+from inkbox.imessage.types import (
+    IMessage,
+    IMessageThread,
+    IMessageAssignment,
+    IMessageConversation,
+    IMessageConversationSummary,
+    IMessageNumber,
+    IMessageMarkReadResult,
+    IMessageMediaUpload,
+    IMessageReaction,
+    IMessageReactionType,
+    IMessageSendStyle,
+    IMessageTriageNumber,
+    _validate_idempotency_key,
+)
+
+if TYPE_CHECKING:
+    from inkbox._http import HttpTransport
+
+
+_SENDABLE_REACTIONS = (
+    "love",
+    "like",
+    "dislike",
+    "laugh",
+    "emphasize",
+    "question",
+    "eyes",
+)
+
+
+def _sendable_reaction_value(reaction: IMessageReactionType | str) -> str:
+    value = reaction.value if isinstance(reaction, IMessageReactionType) else reaction
+    if value not in _SENDABLE_REACTIONS:
+        allowed = ", ".join(_SENDABLE_REACTIONS)
+        raise ValueError(f"reaction must be one of: {allowed}")
+    return value
+
+
+class IMessagesResource:
+
+    def __init__(self, http: HttpTransport) -> None:
+        self._http = http
+
+    def get_triage_number(self) -> IMessageTriageNumber:
+        """Return the active triage number and the connect command.
+
+        Recipients text the returned ``connect_command`` (e.g.
+        ``connect @your-handle``) to the triage ``number`` to get
+        connected to an agent identity. Resolve this at runtime instead
+        of hardcoding the number — it can change.
+
+        Raises:
+            InkboxAPIError: 404 when no triage number is active.
+        """
+        data = self._http.get("/triage-number")
+        return IMessageTriageNumber._from_dict(data)
+
+    def list_numbers(self) -> list[IMessageNumber]:
+        """List the organization's dedicated iMessage lines.
+
+        Attached and unattached numbers are both returned. Released numbers are
+        excluded by the server.
+        """
+        data = self._http.get("/numbers")
+        return [IMessageNumber._from_dict(number) for number in data]
+
+    def claim_number(
+        self,
+        *,
+        idempotency_key: str,
+    ) -> IMessageNumber:
+        """Claim a new dedicated iMessage line for the organization.
+
+        ``idempotency_key`` must be stable across retries of the same logical
+        claim. Dedicated lines may start new conversations, subject to
+        server-side consent, contact-rule, and rate-limit checks.
+
+        Raises:
+            DedicatedIMessageNumberQuotaExceededError: The organization has
+                reached its plan limit.
+            DedicatedIMessageNumberInventoryPendingError: No number is
+                currently available; retry after the reported interval.
+            IdempotencyKeyReusedError: The key was previously used for
+                a different claim.
+        """
+        key = _validate_idempotency_key(idempotency_key)
+        data = self._http.post(
+            "/numbers",
+            json={},
+            headers={"Idempotency-Key": key},
+        )
+        return IMessageNumber._from_dict(data)
+
+    def get(self, message_id: UUID | str, *, agent_identity_id: UUID | str | None = None) -> IMessage:
+        """Read one visible message and its current delivery status."""
+        params = {"agent_identity_id": str(agent_identity_id)} if agent_identity_id is not None else None
+        data = self._http.get(f"/messages/{message_id}", params=params)
+        return IMessage._from_dict(data)
+
+    def get_thread(
+        self, message_id: UUID | str, *, limit: int = 50,
+        cursor: str | None = None, agent_identity_id: UUID | str | None = None,
+    ) -> IMessageThread:
+        """Get a chronological thread page using any visible message in it."""
+        return self._get_thread_page(f"/messages/{message_id}/thread", limit, cursor, agent_identity_id)
+
+    def get_conversation_thread(
+        self, conversation_id: UUID | str, thread_id: UUID | str, *,
+        limit: int = 50, cursor: str | None = None,
+        agent_identity_id: UUID | str | None = None,
+    ) -> IMessageThread:
+        """Get a thread by its opaque ID within a conversation."""
+        return self._get_thread_page(
+            f"/conversations/{conversation_id}/threads/{thread_id}", limit, cursor, agent_identity_id,
+        )
+
+    def _get_thread_page(
+        self, path: str, limit: int, cursor: str | None,
+        agent_identity_id: UUID | str | None,
+    ) -> IMessageThread:
+        params: dict[str, Any] = {"limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        if agent_identity_id is not None:
+            params["agent_identity_id"] = str(agent_identity_id)
+        return IMessageThread._from_dict(self._http.get(path, params=params))
+
+    def send(
+        self,
+        *,
+        to: str | list[str] | None = None,
+        conversation_id: UUID | str | None = None,
+        text: str | None = None,
+        media_urls: list[str] | None = None,
+        send_style: IMessageSendStyle | str | None = None,
+        agent_identity_id: UUID | str | None = None,
+        idempotency_key: str | None = None,
+        reply_to_message_id: UUID | str | None = None,
+        plain_reply_fallback: bool = True,
+    ) -> IMessage:
+        """Send an outbound iMessage.
+
+        Shared service requires an existing assignment. An identity attached to
+        a dedicated line may start a new conversation, subject to server-side
+        policy checks.
+
+        Args:
+            to: One E.164 recipient or 1–8 distinct recipients. Two or more
+                recipients select or create a dedicated-line group.
+                Mutually exclusive with ``conversation_id``.
+            conversation_id: Existing conversation UUID to reply into.
+            reply_to_message_id: Message to reply to in that conversation.
+                Requires ``conversation_id`` and cannot be used with ``to``.
+            plain_reply_fallback: Allow an ordinary message in the same conversation
+                when native threading is unsupported (default True). False requires
+                a native reply. Ignored without ``reply_to_message_id``.
+            text: Message body.
+            media_urls: Media URLs (at most one). Pass with ``text`` or
+                by themselves. Use :meth:`upload_media` to turn raw
+                bytes into a sendable URL first.
+            send_style: Optional expressive send style (see
+                ``IMessageSendStyle``). The same styles work for one-to-one
+                sends, new groups, and replies by group ``conversation_id``;
+                they may be combined with the single supported media URL.
+            agent_identity_id: Identity to send as. Required for
+                org-wide API keys when sending by ``to``; ignored for
+                identity-scoped keys (the key's identity wins).
+            idempotency_key: Optional key to reuse across calls with identical input.
+                Omitted keys are generated per call and preserved during retries.
+
+        Returns:
+            The queued ``IMessage`` row. Inbound replies and reactions
+            arrive via identity-owned webhook subscriptions
+            (``inkbox.webhooks.subscriptions.create(agent_identity_id=...,
+            url=..., event_types=["imessage.received", ...])``).
+
+        Raises:
+            InkboxAPIError: 400 when the identity is not iMessage-enabled;
+                404 when no assignment exists (shared service includes the
+                connect command and router number); 409 when an
+                existing conversation is inactive or a recipient-first line
+                has not received a message yet, with setup-appropriate next
+                steps in the detail; 429 when the identity's rolling 24-hour
+                send cap is reached.
+            RecipientBlockedError: 403 when the recipient is blocked by a
+                contact rule.
+        """
+        if reply_to_message_id is not None and (conversation_id is None or to is not None):
+            raise ValueError("reply_to_message_id requires conversation_id and cannot be used with to")
+        body: dict[str, Any] = {}
+        if reply_to_message_id is not None:
+            body["reply_to_message_id"] = str(reply_to_message_id)
+            body["plain_reply_fallback"] = plain_reply_fallback
+        if to is not None:
+            body["to"] = to
+        if conversation_id is not None:
+            body["conversation_id"] = str(conversation_id)
+        if text is not None:
+            body["text"] = text
+        if media_urls is not None:
+            body["media_urls"] = media_urls
+        if send_style is not None:
+            body["send_style"] = (
+                send_style.value if isinstance(send_style, IMessageSendStyle) else send_style
+            )
+
+        params: dict[str, Any] | None = None
+        if agent_identity_id is not None:
+            params = {"agent_identity_id": str(agent_identity_id)}
+        data = post_message(self._http, "/messages", json=body, params=params, idempotency_key=idempotency_key)
+        return IMessage._from_dict(data["message"])
+
+    def list(
+        self,
+        *,
+        agent_identity_id: UUID | str | None = None,
+        conversation_id: UUID | str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        is_read: bool | None = None,
+        is_blocked: bool | None = None,
+        include_groups: bool = False,
+        start_datetime: str | None = None,
+        end_datetime: str | None = None,
+        tz: str | None = None,
+        thread_id: UUID | str | None = None,
+    ) -> list[IMessage]:
+        """List iMessages visible to the caller, newest first.
+
+        Identity-scoped API keys never see contact-rule-blocked rows
+        regardless of ``is_blocked`` — the server filters them at the
+        access-policy layer. Admin-scoped keys and JWT humans see
+        everything by default.
+
+        Args:
+            agent_identity_id: Narrow to one agent identity. Ignored
+                for identity-scoped keys (always their own identity).
+            conversation_id: Narrow to one conversation.
+            thread_id: Narrow to a thread; requires ``conversation_id``.
+            limit: Max results to return (1–200).
+            offset: Pagination offset.
+            is_read: Filter by read state (``True``, ``False``, or ``None`` for all).
+            is_blocked: Tri-state filter — ``True`` for only blocked,
+                ``False`` for only non-blocked, ``None`` for all.
+            include_groups: Include group messages. Defaults to ``False`` for
+                backwards-compatible one-to-one listings. A specific
+                ``conversation_id`` is returned even when this is ``False``.
+            start_datetime: Inclusive lower bound on ``created_at`` (str). Bare
+                dates resolve to the start of that day; naive datetimes are
+                interpreted in ``tz``; zoned datetimes are exact instants.
+                ``None`` leaves the range open on this side.
+            end_datetime: Upper bound on ``created_at`` (str). A bare date is
+                whole-day inclusive. ``None`` leaves the range open.
+            tz: IANA timezone name (str) governing zone-less values;
+                ``None`` means UTC.
+        """
+        if thread_id is not None and conversation_id is None:
+            raise ValueError("thread_id requires conversation_id")
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if thread_id is not None:
+            params["thread_id"] = str(thread_id)
+        if agent_identity_id is not None:
+            params["agent_identity_id"] = str(agent_identity_id)
+        if conversation_id is not None:
+            params["conversation_id"] = str(conversation_id)
+        if is_read is not None:
+            params["is_read"] = is_read
+        if is_blocked is not None:
+            params["is_blocked"] = is_blocked
+        if include_groups:
+            params["include_groups"] = True
+        if start_datetime is not None:
+            params["start_datetime"] = start_datetime
+        if end_datetime is not None:
+            params["end_datetime"] = end_datetime
+        if tz is not None:
+            params["tz"] = tz
+        data = self._http.get("/messages", params=params)
+        return [IMessage._from_dict(m) for m in data]
+
+    def list_assignments(
+        self,
+        *,
+        agent_identity_id: UUID | str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[IMessageAssignment]:
+        """List active iMessage connections, newest first.
+
+        One row per recipient currently connected to an agent identity
+        through triage. Released connections are not returned.
+
+        Args:
+            agent_identity_id: Narrow to one agent identity. Ignored
+                for identity-scoped keys (always their own identity).
+            limit: Max results to return (1–200).
+            offset: Pagination offset.
+        """
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if agent_identity_id is not None:
+            params["agent_identity_id"] = str(agent_identity_id)
+        data = self._http.get("/assignments", params=params)
+        return [IMessageAssignment._from_dict(a) for a in data]
+
+    def release_assignment(self, assignment_id: UUID | str) -> None:
+        """Release an active iMessage connection.
+
+        Requires an admin API key; identity-scoped keys are rejected. Inbound
+        from the recipient stops routing to the agent and the shared line can
+        be reassigned. The recipient is not notified and can reconnect by
+        texting the triage number again. Raises ``NotFoundError`` if the
+        connection does not exist or is already released.
+
+        Args:
+            assignment_id: UUID of the connection, from ``list_assignments``.
+        """
+        self._http.delete(f"/assignments/{assignment_id}")
+
+    def list_conversations(
+        self,
+        *,
+        agent_identity_id: UUID | str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        is_blocked: bool | None = None,
+        include_groups: bool = False,
+        start_datetime: str | None = None,
+        end_datetime: str | None = None,
+        tz: str | None = None,
+    ) -> list[IMessageConversationSummary]:
+        """List iMessage conversations with latest-message preview.
+
+        Args:
+            agent_identity_id: Narrow to one agent identity. Ignored
+                for identity-scoped keys (always their own identity).
+            limit: Max results to return (1–200).
+            offset: Pagination offset.
+            is_blocked: Tri-state filter applied to the underlying
+                messages — ``True`` for only blocked, ``False`` for only
+                non-blocked, ``None`` for all.
+            include_groups: Include group conversations. Defaults to ``False``.
+            start_datetime: Inclusive lower bound on ``created_at`` (str). Bare
+                dates resolve to the start of that day; naive datetimes are
+                interpreted in ``tz``; zoned datetimes are exact instants.
+                ``None`` leaves the range open on this side.
+            end_datetime: Upper bound on ``created_at`` (str). A bare date is
+                whole-day inclusive. ``None`` leaves the range open.
+            tz: IANA timezone name (str) governing zone-less values;
+                ``None`` means UTC.
+        """
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if agent_identity_id is not None:
+            params["agent_identity_id"] = str(agent_identity_id)
+        if is_blocked is not None:
+            params["is_blocked"] = is_blocked
+        if include_groups:
+            params["include_groups"] = True
+        if start_datetime is not None:
+            params["start_datetime"] = start_datetime
+        if end_datetime is not None:
+            params["end_datetime"] = end_datetime
+        if tz is not None:
+            params["tz"] = tz
+        data = self._http.get("/conversations", params=params)
+        return [IMessageConversationSummary._from_dict(c) for c in data]
+
+    def get_conversation(
+        self,
+        conversation_id: UUID | str,
+        *,
+        agent_identity_id: UUID | str | None = None,
+    ) -> IMessageConversation:
+        """Get one iMessage conversation by ID.
+
+        Args:
+            conversation_id: UUID of the conversation.
+            agent_identity_id: Optional identity assertion; 404s when
+                the conversation belongs to a different identity.
+        """
+        params: dict[str, Any] = {}
+        if agent_identity_id is not None:
+            params["agent_identity_id"] = str(agent_identity_id)
+        data = self._http.get(f"/conversations/{conversation_id}", params=params)
+        return IMessageConversation._from_dict(data)
+
+    def send_reaction(
+        self,
+        *,
+        message_id: UUID | str,
+        reaction: IMessageReactionType | str,
+        part_index: int = 0,
+    ) -> IMessageReaction:
+        """Send a tapback reaction to an inbound one-to-one or group message.
+
+        Args:
+            message_id: UUID of the message being reacted to.
+            reaction: Tapback kind. Sends accept ``love``, ``like``,
+                ``dislike``, ``laugh``, ``emphasize``, ``question``, and
+                ``eyes``. ``custom`` is inbound-only and rejected locally.
+            part_index: Part of a multi-part message to react to.
+
+        Raises:
+            ValueError: If ``reaction`` is custom or not one of the seven
+                provider-supported named tapbacks.
+        """
+        body: dict[str, Any] = {
+            "message_id": str(message_id),
+            "reaction": _sendable_reaction_value(reaction),
+            "part_index": part_index,
+        }
+        data = self._http.post("/reactions", json=body)
+        return IMessageReaction._from_dict(data)
+
+    def remove_reaction(self, reaction_id: UUID | str) -> None:
+        """Take back a tapback this agent sent.
+
+        Only the sender can remove a tapback, so a reaction the other party
+        sent is rejected. A tapback Inkbox already shows as gone -- taken back
+        already, or replaced by a newer one -- succeeds without contacting the
+        messaging network. A failed removal leaves the tapback in place rather
+        than clearing it locally, so the call can be retried.
+
+        Args:
+            reaction_id: UUID of the reaction to take back.
+        """
+        self._http.delete(f"/reactions/{reaction_id}")
+
+    def mark_conversation_read(
+        self,
+        conversation_id: UUID | str,
+    ) -> IMessageMarkReadResult:
+        """Send a one-to-one read receipt and mark inbound messages read locally.
+
+        Group conversations are unsupported and return 409.
+        Non-phone conversations are receive-only and return 422 recipient_not_e164.
+
+        Args:
+            conversation_id: UUID of the conversation.
+
+        Returns:
+            ``IMessageMarkReadResult`` with the count of rows updated.
+        """
+        data = self._http.post(
+            "/mark-read",
+            json={"conversation_id": str(conversation_id)},
+        )
+        return IMessageMarkReadResult._from_dict(data)
+
+    def send_typing(self, conversation_id: UUID | str) -> None:
+        """Show a typing indicator to a one-to-one recipient.
+
+        Group conversations are unsupported and return 409.
+        Non-phone conversations are receive-only and return 422 recipient_not_e164.
+
+        Args:
+            conversation_id: UUID of the conversation.
+        """
+        self._http.post(
+            "/typing",
+            json={"conversation_id": str(conversation_id)},
+        )
+
+    def upload_media(
+        self,
+        *,
+        content: bytes,
+        filename: str,
+        content_type: str | None = None,
+    ) -> IMessageMediaUpload:
+        """Upload media and get back a URL usable in ``media_urls``.
+
+        Args:
+            content: Raw file bytes (max 10 MiB).
+            filename: Original filename, used for type inference.
+            content_type: Optional MIME type; defaults server-side to
+                ``application/octet-stream``.
+
+        Returns:
+            ``IMessageMediaUpload`` with the reusable ``media_url``.
+        """
+        data = self._http.post_multipart(
+            "/media",
+            field_name="file",
+            filename=filename,
+            content=content,
+            content_type=content_type or "application/octet-stream",
+        )
+        return IMessageMediaUpload._from_dict(data)

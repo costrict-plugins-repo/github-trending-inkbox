@@ -1,0 +1,205 @@
+// sdk/typescript/tests/mail/mailboxes.test.ts
+import { describe, it, expect, vi } from "vitest";
+import { MailboxesResource } from "../../src/mail/resources/mailboxes.js";
+import type { HttpTransport } from "../../src/_http.js";
+import { FilterMode } from "../../src/mail/types.js";
+import { RAW_MAILBOX, CURSOR_PAGE_MESSAGES } from "../sampleData.js";
+
+function mockHttp() {
+  return {
+    get: vi.fn(),
+    post: vi.fn(),
+    patch: vi.fn(),
+    delete: vi.fn(),
+  } as unknown as HttpTransport;
+}
+
+const ADDR = "agent01@inkbox.ai";
+
+describe("MailboxesResource.list", () => {
+  it("returns array of mailboxes", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue([RAW_MAILBOX]);
+    const res = new MailboxesResource(http);
+
+    const mailboxes = await res.list();
+
+    expect(http.get).toHaveBeenCalledWith("/mailboxes");
+    expect(mailboxes).toHaveLength(1);
+    expect(mailboxes[0].emailAddress).toBe("agent01@inkbox.ai");
+  });
+
+  it("returns empty array", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue([]);
+    const res = new MailboxesResource(http);
+    expect(await res.list()).toEqual([]);
+  });
+});
+
+describe("MailboxesResource.get", () => {
+  it("fetches by email address", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue(RAW_MAILBOX);
+    const res = new MailboxesResource(http);
+
+    const mailbox = await res.get(ADDR);
+
+    expect(http.get).toHaveBeenCalledWith(`/mailboxes/${ADDR}`);
+    expect(mailbox.emailAddress).toBe(ADDR);
+    expect(mailbox.agentIdentityId).toBeTruthy();
+  });
+});
+
+describe("parseMailbox sendingDomain", () => {
+  it("reads sending_domain from response", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue({
+      ...RAW_MAILBOX,
+      sending_domain: "mail.acme.com",
+    });
+    const res = new MailboxesResource(http);
+
+    const mailbox = await res.get("agent01@inkbox.ai");
+    expect(mailbox.sendingDomain).toBe("mail.acme.com");
+  });
+
+  it("falls back to email_address split when sending_domain is absent (compat for old fixtures)", async () => {
+    const http = mockHttp();
+    const { sending_domain: _omit, ...withoutSendingDomain } = RAW_MAILBOX;
+    void _omit;
+    vi.mocked(http.get).mockResolvedValue(withoutSendingDomain);
+    const res = new MailboxesResource(http);
+
+    const mailbox = await res.get("agent01@inkbox.ai");
+    expect(mailbox.sendingDomain).toBe("inkbox.ai");
+  });
+});
+
+describe("parseMailbox storage", () => {
+  it("reads storage fields", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue(RAW_MAILBOX);
+    const res = new MailboxesResource(http);
+
+    const mailbox = await res.get(ADDR);
+
+    expect(mailbox.storageUsedBytes).toBe(1_288_490_188);
+    expect(mailbox.storageLimitBytes).toBe(2_147_483_648);
+  });
+
+  it("keeps a null limit null", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue({ ...RAW_MAILBOX, storage_limit_bytes: null });
+    const res = new MailboxesResource(http);
+
+    const mailbox = await res.get(ADDR);
+
+    expect(mailbox.storageLimitBytes).toBeNull();
+    expect(mailbox.storageUsedBytes).toBe(1_288_490_188);
+  });
+
+  it("defaults to 0/null when the fields are omitted (old server)", async () => {
+    const http = mockHttp();
+    const {
+      storage_used_bytes: _used,
+      storage_limit_bytes: _limit,
+      ...withoutStorage
+    } = RAW_MAILBOX;
+    void _used;
+    void _limit;
+    vi.mocked(http.get).mockResolvedValue(withoutStorage);
+    const res = new MailboxesResource(http);
+
+    const mailbox = await res.get(ADDR);
+
+    expect(mailbox.storageUsedBytes).toBe(0);
+    expect(mailbox.storageLimitBytes).toBeNull();
+  });
+
+  it("surfaces storage on list", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue([RAW_MAILBOX]);
+    const res = new MailboxesResource(http);
+
+    const mailboxes = await res.list();
+
+    expect(mailboxes[0].storageUsedBytes).toBe(1_288_490_188);
+    expect(mailboxes[0].storageLimitBytes).toBe(2_147_483_648);
+  });
+});
+
+describe("MailboxesResource.update", () => {
+  it("sends filter_mode", async () => {
+    const http = mockHttp();
+    vi.mocked(http.patch).mockResolvedValue(RAW_MAILBOX);
+    const res = new MailboxesResource(http);
+
+    await res.update(ADDR, { filterMode: FilterMode.WHITELIST });
+
+    expect(http.patch).toHaveBeenCalledWith(`/mailboxes/${ADDR}`, {
+      filter_mode: "whitelist",
+    });
+  });
+
+  it("sends empty body when no options provided", async () => {
+    const http = mockHttp();
+    vi.mocked(http.patch).mockResolvedValue(RAW_MAILBOX);
+    const res = new MailboxesResource(http);
+
+    await res.update(ADDR, {});
+
+    expect(http.patch).toHaveBeenCalledWith(`/mailboxes/${ADDR}`, {});
+  });
+});
+
+describe("MailboxesResource.search", () => {
+  it("passes q and default limit", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue(CURSOR_PAGE_MESSAGES);
+    const res = new MailboxesResource(http);
+
+    const results = await res.search(ADDR, { q: "invoice" });
+
+    expect(http.get).toHaveBeenCalledWith(`/mailboxes/${ADDR}/search`, { q: "invoice", limit: 50 });
+    expect(results).toHaveLength(1);
+    expect(results[0].subject).toBe("Hello from test");
+  });
+
+  it("passes custom limit", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue({ items: [], next_cursor: null, has_more: false });
+    const res = new MailboxesResource(http);
+
+    await res.search(ADDR, { q: "test", limit: 10 });
+
+    expect(http.get).toHaveBeenCalledWith(`/mailboxes/${ADDR}/search`, { q: "test", limit: 10 });
+  });
+});
+
+describe("mailbox signatures", () => {
+  it("preserves omitted fields, explicit null and false on PATCH", async () => {
+    const http = mockHttp();
+    vi.mocked(http.patch).mockResolvedValue(RAW_MAILBOX);
+    const res = new MailboxesResource(http);
+    for (const [options, wire] of [
+      [{}, {}],
+      [{ signatureHtml: "<b>Alex</b>", signatureEnabled: true }, { signature_html: "<b>Alex</b>", signature_enabled: true }],
+      [{ signatureHtml: null, signatureText: null, signatureEnabled: false }, { signature_html: null, signature_text: null, signature_enabled: false }],
+      [{ signatureText: "Alex" }, { signature_text: "Alex" }],
+    ] as const) {
+      await res.update(ADDR, options);
+      expect(http.patch).toHaveBeenLastCalledWith(`/mailboxes/${ADDR}`, wire);
+    }
+  });
+
+  it("parses mailbox and nested identity signatures with old-response defaults", async () => {
+    const { parseMailbox } = await import("../../src/mail/types.js");
+    const { parseIdentityMailbox } = await import("../../src/identities/types.js");
+    for (const parse of [parseMailbox, parseIdentityMailbox]) {
+      expect(parse(RAW_MAILBOX)).toMatchObject({ signatureHtml: null, signatureText: null, signatureEnabled: false });
+      expect(parse({ ...RAW_MAILBOX, signature_html: "<b>Alex</b>", signature_text: "Alex", signature_enabled: true }))
+        .toMatchObject({ signatureHtml: "<b>Alex</b>", signatureText: "Alex", signatureEnabled: true });
+    }
+  });
+});

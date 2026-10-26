@@ -1,0 +1,1021 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { execFile, execFileSync } from "node:child_process";
+import http from "node:http";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { buildPlaceCallOptions } from "../dist/commands/phone.js";
+
+const cli = fileURLToPath(new URL("../dist/index.js", import.meta.url));
+
+function help(...args) {
+  return execFileSync(process.execPath, [cli, ...args, "--help"], {
+    encoding: "utf8",
+  });
+}
+
+function runCli(args) {
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      [cli, ...args],
+      {
+        env: {
+          ...process.env,
+          NODE_USE_ENV_PROXY: "0",
+        },
+        timeout: 15_000,
+      },
+      (error, stdout, stderr) => resolve({ error, stdout, stderr }),
+    );
+  });
+}
+
+function listen(handler) {
+  return new Promise((resolve) => {
+    const server = http.createServer(handler);
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ server, port: server.address().port });
+    });
+  });
+}
+
+const IDENTITY = {
+  id: "eeee5555-0000-0000-0000-000000000001",
+  organization_id: "org_test",
+  agent_handle: "support-bot",
+  display_name: "Support Bot",
+  description: null,
+  email_address: null,
+  created_at: "2026-07-29T00:00:00Z",
+  updated_at: "2026-07-29T00:00:00Z",
+  mailbox: null,
+  phone_number: {
+    id: "11111111-1111-1111-1111-111111111111",
+    number: "+15550000001",
+    type: "local",
+    status: "active",
+    sms_status: "ready",
+    sms_error_code: null,
+    sms_error_detail: null,
+    sms_ready_at: "2026-07-29T00:00:00Z",
+    incoming_call_action: "auto_reject",
+    client_websocket_url: null,
+    incoming_call_webhook_url: null,
+    state: null,
+    agent_identity_id: "eeee5555-0000-0000-0000-000000000001",
+    created_at: "2026-07-29T00:00:00Z",
+    updated_at: "2026-07-29T00:00:00Z",
+  },
+  tunnel: null,
+};
+
+for (const args of [
+  ["transcripts", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+  ["search-transcripts", "--query", "Hello"],
+]) {
+  test(`${args[0]} shows per-turn numbers and preserves transcript JSON`, async () => {
+    const turns = JSON.parse(readFileSync(new URL("../../tests/fixtures/phone_transcript_numbers.json", import.meta.url), "utf8"));
+    const mock = await listen((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(req.url === "/api/v1/identities/support-bot" ? IDENTITY : turns));
+    });
+    try {
+      const options = ["--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`];
+      const result = await runCli([...options, "phone", ...args, "-i", "support-bot"]);
+      assert.ifError(result.error);
+      assert.match(result.stdout.split("\n")[0], /phoneNumber/);
+      assert.match(result.stdout, /\+14155550100/);
+      assert.match(result.stdout, /\+14155550101/);
+      const json = await runCli([...options, "--json", "phone", ...args, "-i", "support-bot"]);
+      assert.ifError(json.error);
+      const parsed = JSON.parse(json.stdout);
+      assert.equal(parsed[0].phoneNumber, turns[0].phone_number);
+      assert.deepEqual(Object.keys(parsed[0]).sort(), ["id", "callId", "seq", "tsMs", "party", "text", "createdAt", "phoneNumber"].sort());
+      assert.equal(parsed[2].phoneNumber, null);
+      assert.equal(parsed[3].text, turns[3].text);
+    } finally {
+      mock.server.close();
+    }
+  });
+}
+
+test("phone help exposes authority controls", () => {
+  assert.match(help("phone", "call"), /--authority-mode <mode>/);
+  assert.match(help("phone", "call"), /--no-voicemail-detection\s+Deprecated; use --on-voicemail ignore/);
+  assert.match(help("phone", "call"), /--on-voicemail <action>/);
+  assert.match(help("phone", "call"), /leave_message,\s+hang_up, or ignore/);
+  assert.match(help("phone", "call"), /--voicemail-message <text>/);
+  assert.match(help("phone", "call"), /dedicated_imessage_number/);
+  assert.match(help("phone", "tool-activity"), /--limit <n>/);
+  assert.match(help("phone", "tool-activity"), /--offset <n>/);
+  assert.match(
+    help("phone", "hosted-agent", "set"),
+    /--model <model>\s+Deprecated; accepted but ignored/,
+  );
+  const authorityHelp = help("phone", "hosted-agent", "authority-mode");
+  assert.match(authorityHelp, /admin API key/);
+  const incomingHelp = help("phone", "incoming-action");
+  assert.match(incomingHelp, /--forward-to-phone <number>/);
+  assert.match(incomingHelp, /--forward-to-sip <uri>/);
+});
+
+test("hosted-agent voices requires no identity and preserves the full JSON catalog", async () => {
+  const requests = [];
+  const mock = await listen((req, res) => {
+    requests.push({ method: req.method, url: req.url, apiKey: req.headers["x-api-key"] });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      voices: [
+        { id: "future-voice", name: "Future Voice", description: "Warm", available: true, preview_url: "https://example.com/voice.wav" },
+        { id: "unavailable-voice", name: "Unavailable Voice", description: "Clear", available: false, preview_url: null },
+        { id: "no-preview", name: "No Preview", description: "Calm", available: true },
+      ],
+      default_voice: "future-voice",
+    }));
+  });
+  try {
+    const result = await runCli([
+      "--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`,
+      "--json", "phone", "hosted-agent", "voices",
+    ]);
+    assert.ifError(result.error);
+    assert.deepEqual(requests, [{ method: "GET", url: "/api/v1/phone/hosted-agent-voices", apiKey: "test-key" }]);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      voices: [
+        { id: "future-voice", name: "Future Voice", description: "Warm", available: true, previewUrl: "https://example.com/voice.wav" },
+        { id: "unavailable-voice", name: "Unavailable Voice", description: "Clear", available: false, previewUrl: null },
+        { id: "no-preview", name: "No Preview", description: "Calm", available: true, previewUrl: null },
+      ],
+      defaultVoice: "future-voice",
+    });
+    assert.doesNotMatch(help("phone", "hosted-agent", "voices"), /--identity/);
+  } finally {
+    mock.server.close();
+  }
+});
+
+test("hosted-agent voices displays the default, unavailable voices, and previews", async () => {
+  const mock = await listen((_req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      voices: [{ id: "future-voice", name: "Future Voice", description: "Warm", available: false, preview_url: "https://example.com/voice.wav" }],
+      default_voice: "future-default",
+    }));
+  });
+  try {
+    const result = await runCli([
+      "--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`,
+      "phone", "hosted-agent", "voices",
+    ]);
+    assert.ifError(result.error);
+    assert.match(result.stdout, /Default voice: future-default/);
+    assert.match(result.stdout, /future-voice.*Future Voice.*Warm.*false.*https:\/\/example.com\/voice.wav/);
+  } finally {
+    mock.server.close();
+  }
+});
+
+test("hosted-agent voices retains the default for an empty catalog", async () => {
+  const mock = await listen((_req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ voices: [], default_voice: "future-default" }));
+  });
+  try {
+    const result = await runCli([
+      "--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`,
+      "phone", "hosted-agent", "voices",
+    ]);
+    assert.ifError(result.error);
+    assert.match(result.stdout, /Default voice: future-default/);
+    assert.match(result.stdout, /No results\./);
+  } finally {
+    mock.server.close();
+  }
+});
+
+test("hosted-agent voices surfaces API errors without printing a catalog", async () => {
+  const mock = await listen((_req, res) => {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ detail: "Voice catalog access denied" }));
+  });
+  try {
+    const result = await runCli([
+      "--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`,
+      "--json", "phone", "hosted-agent", "voices",
+    ]);
+    assert.ok(result.error);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /Voice catalog access denied/);
+  } finally {
+    mock.server.close();
+  }
+});
+
+test("incoming-action forward sends one complete SIP destination", async () => {
+  const requests = [];
+  const mock = await listen((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      requests.push({ method: req.method, url: req.url, body: body ? JSON.parse(body) : null });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/api/v1/identities/support-bot") {
+        res.end(JSON.stringify(IDENTITY));
+        return;
+      }
+      res.end(JSON.stringify({
+        agent_identity_id: IDENTITY.id,
+        incoming_call_action: "forward",
+        client_websocket_url: null,
+        incoming_call_webhook_url: null,
+        forwarding_target_type: "sip",
+        forwarding_phone_number: null,
+        forwarding_sip_uri: "sip:+14155550100@voice.example.com",
+      }));
+    });
+  });
+
+  try {
+    const result = await runCli([
+      "--api-key", "test-key",
+      "--base-url", `http://127.0.0.1:${mock.port}`,
+      "--json", "phone", "incoming-action", "forward",
+      "-i", "support-bot",
+      "--forward-to-sip", "sip:+14155550100@voice.example.com",
+    ]);
+    assert.ifError(result.error);
+    assert.deepEqual(requests[1].body, {
+      incoming_call_action: "forward",
+      agent_identity_id: IDENTITY.id,
+      forwarding_target_type: "sip",
+      forwarding_sip_uri: "sip:+14155550100@voice.example.com",
+    });
+    assert.equal(JSON.parse(result.stdout).forwardingTargetType, "sip");
+  } finally {
+    mock.server.close();
+  }
+});
+
+test("buildPlaceCallOptions disables voicemail detection only when requested", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    voicemailDetection: false,
+  });
+
+  assert.deepEqual(result, {
+    callOptions: {
+      toNumber: "+15551234567",
+      voicemailDetection: "disabled",
+    },
+  });
+});
+
+test("buildPlaceCallOptions forwards every --on-voicemail action verbatim", () => {
+  for (const onVoicemail of ["leave_message", "hang_up", "ignore"]) {
+    const result = buildPlaceCallOptions({
+      identity: "support-bot",
+      to: "+15551234567",
+      hosted: true,
+      reason: "Coordinate the appointment",
+      onVoicemail,
+    });
+
+    assert.deepEqual(result, {
+      callOptions: {
+        toNumber: "+15551234567",
+        mode: "hosted_agent",
+        reason: "Coordinate the appointment",
+        onVoicemail,
+      },
+    });
+  }
+});
+
+test("buildPlaceCallOptions forwards --voicemail-message with leave_message", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    hosted: true,
+    reason: "Coordinate the appointment",
+    onVoicemail: "leave_message",
+    voicemailMessage: "Please call us back.",
+  });
+
+  assert.deepEqual(result, {
+    callOptions: {
+      toNumber: "+15551234567",
+      mode: "hosted_agent",
+      reason: "Coordinate the appointment",
+      onVoicemail: "leave_message",
+      voicemailMessage: "Please call us back.",
+    },
+  });
+});
+
+test("buildPlaceCallOptions allows --on-voicemail on client-driven calls", () => {
+  // Unlike --authority-mode, voicemail handling applies to every mode; the
+  // server decides whether a value fits the call.
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    wsUrl: "wss://agent.example.com/audio",
+    onVoicemail: "ignore",
+  });
+
+  assert.deepEqual(result, {
+    callOptions: {
+      toNumber: "+15551234567",
+      clientWebsocketUrl: "wss://agent.example.com/audio",
+      onVoicemail: "ignore",
+    },
+  });
+});
+
+test("buildPlaceCallOptions rejects an unknown --on-voicemail action", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    onVoicemail: "callback",
+  });
+
+  assert.deepEqual(result, {
+    error: "--on-voicemail must be leave_message, hang_up, or ignore.",
+  });
+});
+
+test("buildPlaceCallOptions rejects --voicemail-message without leave_message", () => {
+  const expected = {
+    error: "--voicemail-message requires --on-voicemail leave_message.",
+  };
+  // Missing --on-voicemail entirely.
+  assert.deepEqual(buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    hosted: true,
+    reason: "Coordinate the appointment",
+    voicemailMessage: "Please call us back.",
+  }), expected);
+  // Explicit non-leave_message actions.
+  for (const onVoicemail of ["hang_up", "ignore"]) {
+    assert.deepEqual(buildPlaceCallOptions({
+      identity: "support-bot",
+      to: "+15551234567",
+      hosted: true,
+      reason: "Coordinate the appointment",
+      onVoicemail,
+      voicemailMessage: "Please call us back.",
+    }), expected);
+  }
+});
+
+test("buildPlaceCallOptions rejects --voicemail-message with --no-voicemail-detection", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    hosted: true,
+    reason: "Coordinate the appointment",
+    onVoicemail: "leave_message",
+    voicemailMessage: "Please call us back.",
+    voicemailDetection: false,
+  });
+
+  assert.deepEqual(result, {
+    error: "--voicemail-message conflicts with --no-voicemail-detection.",
+  });
+});
+
+test("buildPlaceCallOptions builds a plain client-driven call", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+  });
+
+  // No mode key: the SDK defaults it to client_websocket on the wire.
+  assert.deepEqual(result, {
+    callOptions: { toNumber: "+15551234567" },
+  });
+});
+
+test("buildPlaceCallOptions forwards the ws url and origination on client-driven calls", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    wsUrl: "wss://agent.example.com/ws",
+    origination: "shared_imessage_number",
+  });
+
+  assert.deepEqual(result, {
+    callOptions: {
+      toNumber: "+15551234567",
+      clientWebsocketUrl: "wss://agent.example.com/ws",
+      origination: "shared_imessage_number",
+    },
+  });
+});
+
+test("buildPlaceCallOptions forwards shared iMessage origination", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    origination: "shared_imessage_number",
+  });
+
+  assert.deepEqual(result, {
+    callOptions: {
+      toNumber: "+15551234567",
+      origination: "shared_imessage_number",
+    },
+  });
+});
+
+test("buildPlaceCallOptions forwards explicit dedicated origination", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    origination: "dedicated_number",
+  });
+
+  assert.deepEqual(result, {
+    callOptions: {
+      toNumber: "+15551234567",
+      origination: "dedicated_number",
+    },
+  });
+});
+
+test("buildPlaceCallOptions forwards dedicated iMessage origination", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    origination: "dedicated_imessage_number",
+  });
+
+  assert.deepEqual(result, {
+    callOptions: {
+      toNumber: "+15551234567",
+      origination: "dedicated_imessage_number",
+    },
+  });
+});
+
+test("buildPlaceCallOptions rejects an unknown origination", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    origination: "unknown_line",
+  });
+
+  assert.deepEqual(result, {
+    error:
+      "--origination must be dedicated_number, shared_imessage_number, "
+      + "or dedicated_imessage_number.",
+  });
+});
+
+test("buildPlaceCallOptions omits authority so hosted calls inherit the saved default", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    hosted: true,
+    reason: "Book a cleaning next week, mornings preferred",
+    origination: "shared_imessage_number",
+  });
+
+  assert.deepEqual(result, {
+    callOptions: {
+      toNumber: "+15551234567",
+      mode: "hosted_agent",
+      reason: "Book a cleaning next week, mornings preferred",
+      origination: "shared_imessage_number",
+    },
+  });
+});
+
+test("buildPlaceCallOptions forwards explicit authority overrides", () => {
+  for (const authorityMode of ["contact_scoped", "yolo"]) {
+    const result = buildPlaceCallOptions({
+      identity: "support-bot",
+      to: "+15551234567",
+      hosted: true,
+      reason: "Coordinate the appointment",
+      authorityMode,
+    });
+
+    assert.deepEqual(result, {
+      callOptions: {
+        toNumber: "+15551234567",
+        mode: "hosted_agent",
+        reason: "Coordinate the appointment",
+        hostedAgentAuthorityMode: authorityMode,
+      },
+    });
+  }
+});
+
+test("buildPlaceCallOptions rejects authority without --hosted", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    authorityMode: "yolo",
+  });
+
+  assert.deepEqual(result, {
+    error: "--authority-mode requires --hosted.",
+  });
+
+  assert.deepEqual(buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    authorityMode: "contact_scoped",
+  }), {
+    error: "--authority-mode requires --hosted.",
+  });
+});
+
+test("buildPlaceCallOptions rejects an unknown authority mode", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    authorityMode: "global",
+  });
+
+  assert.deepEqual(result, {
+    error: "--authority-mode must be contact_scoped or yolo.",
+  });
+});
+
+test("buildPlaceCallOptions rejects --hosted without --reason", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    hosted: true,
+  });
+
+  assert.deepEqual(result, {
+    error: "--hosted requires --reason (the agent's task brief).",
+  });
+});
+
+test("buildPlaceCallOptions rejects --hosted with --ws-url", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    hosted: true,
+    reason: "Confirm the appointment",
+    wsUrl: "wss://agent.example.com/ws",
+  });
+
+  assert.deepEqual(result, {
+    error: "--hosted conflicts with --ws-url (Voice AI calls need no socket).",
+  });
+});
+
+test("buildPlaceCallOptions rejects --reason without --hosted", () => {
+  const result = buildPlaceCallOptions({
+    identity: "support-bot",
+    to: "+15551234567",
+    reason: "Confirm the appointment",
+  });
+
+  assert.deepEqual(result, {
+    error: "--reason is only valid with --hosted.",
+  });
+});
+
+test("phone call forwards voicemail opt-out and prints the persisted value", async () => {
+  const requests = [];
+  const mock = await listen((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      requests.push({
+        method: req.method,
+        url: req.url,
+        body: body ? JSON.parse(body) : null,
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/api/v1/identities/support-bot") {
+        res.end(JSON.stringify(IDENTITY));
+        return;
+      }
+      res.end(JSON.stringify({
+        id: "22222222-2222-2222-2222-222222222222",
+        local_phone_number: "+15550000001",
+        remote_phone_number: "+15551234567",
+        direction: "outbound",
+        status: "initiated",
+        client_websocket_url: "wss://agent.example.com/audio",
+        use_inkbox_tts: null,
+        use_inkbox_stt: null,
+        hangup_reason: null,
+        started_at: null,
+        ended_at: null,
+        is_blocked: false,
+        origin: "dedicated_number",
+        mode: "client_websocket",
+        hosted_agent_authority_mode: "contact_scoped",
+        voicemail_detection: "disabled",
+        reason: null,
+        post_call_action_items: [],
+        created_at: "2026-07-29T00:00:00Z",
+        updated_at: "2026-07-29T00:00:00Z",
+        rate_limit: {
+          calls_used: 1,
+          calls_remaining: 99,
+          calls_limit: 100,
+          minutes_used: 0,
+          minutes_remaining: 1000,
+          minutes_limit: 1000,
+        },
+      }));
+    });
+  });
+
+  try {
+    const result = await runCli([
+      "--api-key", "test-key",
+      "--base-url", `http://127.0.0.1:${mock.port}`,
+      "--json",
+      "phone", "call",
+      "-i", "support-bot",
+      "--to", "+15551234567",
+      "--ws-url", "wss://agent.example.com/audio",
+      "--no-voicemail-detection",
+    ]);
+
+    assert.ifError(result.error);
+    assert.equal(result.stderr, "");
+    assert.deepEqual(requests, [
+      {
+        method: "GET",
+        url: "/api/v1/identities/support-bot",
+        body: null,
+      },
+      {
+        method: "POST",
+        url: "/api/v1/phone/place-call",
+        body: {
+          from_number: "+15550000001",
+          to_number: "+15551234567",
+          client_websocket_url: "wss://agent.example.com/audio",
+          mode: "client_websocket",
+          origination: "dedicated_number",
+          voicemail_detection: "disabled",
+        },
+      },
+    ]);
+    assert.equal(JSON.parse(result.stdout).voicemailDetection, "disabled");
+    // Legacy responses without on_voicemail print the hang_up fallback.
+    assert.equal(JSON.parse(result.stdout).onVoicemail, "hang_up");
+  } finally {
+    mock.server.close();
+  }
+});
+
+test("phone call forwards --on-voicemail and --voicemail-message and prints the persisted value", async () => {
+  const requests = [];
+  const mock = await listen((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      requests.push({
+        method: req.method,
+        url: req.url,
+        body: body ? JSON.parse(body) : null,
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/api/v1/identities/support-bot") {
+        res.end(JSON.stringify(IDENTITY));
+        return;
+      }
+      res.end(JSON.stringify({
+        id: "22222222-2222-2222-2222-222222222222",
+        local_phone_number: "+15550000001",
+        remote_phone_number: "+15551234567",
+        direction: "outbound",
+        status: "initiated",
+        client_websocket_url: null,
+        use_inkbox_tts: null,
+        use_inkbox_stt: null,
+        hangup_reason: null,
+        started_at: null,
+        ended_at: null,
+        is_blocked: false,
+        origin: "dedicated_number",
+        mode: "hosted_agent",
+        hosted_agent_authority_mode: "contact_scoped",
+        voicemail_detection: "enabled",
+        on_voicemail: "leave_message",
+        reason: "Confirm the appointment",
+        post_call_action_items: [],
+        created_at: "2026-07-29T00:00:00Z",
+        updated_at: "2026-07-29T00:00:00Z",
+        rate_limit: {
+          calls_used: 1,
+          calls_remaining: 99,
+          calls_limit: 100,
+          minutes_used: 0,
+          minutes_remaining: 1000,
+          minutes_limit: 1000,
+        },
+      }));
+    });
+  });
+
+  try {
+    const result = await runCli([
+      "--api-key", "test-key",
+      "--base-url", `http://127.0.0.1:${mock.port}`,
+      "--json",
+      "phone", "call",
+      "-i", "support-bot",
+      "--to", "+15551234567",
+      "--hosted",
+      "--reason", "Confirm the appointment",
+      "--on-voicemail", "leave_message",
+      "--voicemail-message", "Please call us back.",
+    ]);
+
+    assert.ifError(result.error);
+    assert.equal(result.stderr, "");
+    assert.deepEqual(requests, [
+      {
+        method: "GET",
+        url: "/api/v1/identities/support-bot",
+        body: null,
+      },
+      {
+        method: "POST",
+        url: "/api/v1/phone/place-call",
+        body: {
+          from_number: "+15550000001",
+          to_number: "+15551234567",
+          mode: "hosted_agent",
+          reason: "Confirm the appointment",
+          origination: "dedicated_number",
+          on_voicemail: "leave_message",
+          voicemail_message: "Please call us back.",
+        },
+      },
+    ]);
+    const printed = JSON.parse(result.stdout);
+    assert.equal(printed.onVoicemail, "leave_message");
+    assert.equal(printed.voicemailDetection, "enabled");
+  } finally {
+    mock.server.close();
+  }
+});
+
+test("phone call rejects --voicemail-message without --on-voicemail leave_message before any request", async () => {
+  const result = await runCli([
+    "--api-key", "test-key",
+    "--base-url", "http://127.0.0.1:9",
+    "phone", "call",
+    "-i", "support-bot",
+    "--to", "+15551234567",
+    "--hosted",
+    "--reason", "Confirm the appointment",
+    "--voicemail-message", "Please call us back.",
+  ]);
+
+  assert.equal(result.error?.code, 1);
+  assert.match(result.stderr, /--voicemail-message requires --on-voicemail leave_message\./);
+});
+
+test("tool-activity calls the paginated SDK surface and prints the page", async () => {
+  const requests = [];
+  const mock = await listen((req, res) => {
+    requests.push({ method: req.method, url: req.url });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    if (req.url === "/api/v1/identities/support-bot") {
+      res.end(JSON.stringify(IDENTITY));
+      return;
+    }
+    res.end(JSON.stringify({
+      items: [{
+        id: "11111111-1111-1111-1111-111111111111",
+        call_id: "22222222-2222-2222-2222-222222222222",
+        tool_name: "send_email",
+        status: "succeeded",
+        result: { state: "sent" },
+        started_at: "2026-07-29T00:00:00Z",
+        completed_at: "2026-07-29T00:00:01Z",
+      }],
+      limit: 2,
+      offset: 3,
+      has_more: false,
+    }));
+  });
+
+  try {
+    const result = await runCli([
+      "--api-key", "test-key",
+      "--base-url", `http://127.0.0.1:${mock.port}`,
+      "--json",
+      "phone", "tool-activity", "22222222-2222-2222-2222-222222222222",
+      "-i", "support-bot",
+      "--limit", "2",
+      "--offset", "3",
+    ]);
+
+    assert.ifError(result.error);
+    assert.equal(result.stderr, "");
+    assert.deepEqual(requests, [
+      { method: "GET", url: "/api/v1/identities/support-bot" },
+      {
+        method: "GET",
+        url:
+          "/api/v1/phone/calls/22222222-2222-2222-2222-222222222222/tool-invocations"
+          + "?limit=2&offset=3",
+      },
+    ]);
+    const page = JSON.parse(result.stdout);
+    assert.equal(page.items[0].toolName, "send_email");
+    assert.equal(page.limit, 2);
+    assert.equal(page.offset, 3);
+  } finally {
+    mock.server.close();
+  }
+});
+
+test("authority-mode calls the privileged SDK setter", async () => {
+  const requests = [];
+  const mock = await listen((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      requests.push({
+        method: req.method,
+        url: req.url,
+        body: body ? JSON.parse(body) : null,
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/api/v1/identities/support-bot") {
+        res.end(JSON.stringify(IDENTITY));
+        return;
+      }
+      res.end(JSON.stringify({
+        agent_identity_id: IDENTITY.id,
+        voice: null,
+        model: null,
+        effective_voice: "voice-default",
+        effective_model: "model-default",
+        instructions: null,
+        authority_mode: "yolo",
+      }));
+    });
+  });
+
+  try {
+    const result = await runCli([
+      "--api-key", "test-key",
+      "--base-url", `http://127.0.0.1:${mock.port}`,
+      "--json",
+      "phone", "hosted-agent", "authority-mode", "yolo",
+      "-i", "support-bot",
+    ]);
+
+    assert.ifError(result.error);
+    assert.equal(result.stderr, "");
+    assert.deepEqual(requests, [
+      {
+        method: "GET",
+        url: "/api/v1/identities/support-bot",
+        body: null,
+      },
+      {
+        method: "PUT",
+        url: "/api/v1/phone/hosted-agent-config/authority-mode",
+        body: {
+          agent_identity_id: IDENTITY.id,
+          authority_mode: "yolo",
+        },
+      },
+    ]);
+    assert.equal(JSON.parse(result.stdout).authorityMode, "yolo");
+  } finally {
+    mock.server.close();
+  }
+});
+
+for (const command of ["get", "refresh"]) {
+  for (const [name, phoneNumber, country, state] of [
+    ["UK", { ...IDENTITY.phone_number, number: "+447700900123", country: "GB", state: null }, "GB", null],
+    ["legacy US", { ...IDENTITY.phone_number, state: "NY" }, "US", "NY"],
+    ["no phone", null, null, null],
+  ]) {
+    test(`identity ${command} preserves ${name} phone metadata`, async () => {
+      const mock = await listen((_req, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ...IDENTITY, phone_number: phoneNumber }));
+      });
+      try {
+        const result = await runCli([
+          "--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`,
+          "--json", "identity", command, "support-bot",
+        ]);
+        assert.ifError(result.error);
+        const output = JSON.parse(result.stdout);
+        assert.equal(output.phoneNumber, phoneNumber?.number ?? null);
+        assert.equal(output.phoneCountry, country);
+        assert.equal(output.phoneState, state);
+      } finally {
+        mock.server.close();
+      }
+    });
+  }
+}
+
+test("text send and list work with a UK identity phone without a state", async () => {
+  const requests = [];
+  const ukIdentity = {
+    ...IDENTITY,
+    phone_number: { ...IDENTITY.phone_number, number: "+447700900123", country: "GB", state: null },
+  };
+  const message = {
+    id: "dddd4444-0000-0000-0000-000000000001",
+    direction: "inbound",
+    local_phone_number: "+447700900123",
+    remote_phone_number: "+447700900456",
+    text: "Hello",
+    type: "sms",
+    media: null,
+    is_read: false,
+    is_blocked: false,
+    created_at: "2026-07-29T00:00:00Z",
+    updated_at: "2026-07-29T00:00:00Z",
+  };
+  const mock = await listen(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    requests.push({ method: req.method, url: req.url, body: body ? JSON.parse(body) : null });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    if (req.method === "POST") {
+      res.end(JSON.stringify({ ...message, direction: "outbound", delivery_status: "queued" }));
+    } else if (req.url.includes("/texts")) {
+      res.end(JSON.stringify([message]));
+    } else {
+      res.end(JSON.stringify(ukIdentity));
+    }
+  });
+  try {
+    const options = ["--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`, "--json"];
+    const sent = await runCli([...options, "text", "send", "-i", "support-bot", "--to", "+447700900456", "--text", "Hello"]);
+    assert.ifError(sent.error);
+    assert.equal(JSON.parse(sent.stdout).local, "+447700900123");
+    assert.equal(JSON.parse(sent.stdout).deliveryStatus, "queued");
+    assert.deepEqual(requests.find((request) => request.method === "POST"), {
+      method: "POST",
+      url: `/api/v1/phone/numbers/${IDENTITY.phone_number.id}/texts`,
+      body: { to: "+447700900456", text: "Hello" },
+    });
+    const received = await runCli([...options, "text", "list", "-i", "support-bot"]);
+    assert.ifError(received.error);
+    const inbound = JSON.parse(received.stdout)[0];
+    assert.equal(inbound.localPhoneNumber, "+447700900123");
+    assert.equal(inbound.remotePhoneNumber, "+447700900456");
+    assert.equal(inbound.direction, "inbound");
+  } finally {
+    mock.server.close();
+  }
+});
+
+test("calls JSON preserves canonical connections without dropping legacy history", async () => {
+  const call = JSON.parse(readFileSync(new URL("../../tests/fixtures/phone_call_connections.json", import.meta.url), "utf8"));
+  const requests = [];
+  const mock = await listen((req, res) => {
+    requests.push({ method: req.method, url: req.url });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(req.url === "/api/v1/identities/support-bot" ? IDENTITY : [call]));
+  });
+  try {
+    const result = await runCli([
+      "--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`, "--json",
+      "phone", "calls", "-i", "support-bot",
+    ]);
+    assert.ifError(result.error);
+    assert.equal(result.stderr, "");
+    assert.equal(requests.length, 2);
+    assert.ok(requests.every(request => request.method === "GET"));
+    const calls = JSON.parse(result.stdout);
+    assert.equal(calls[0].connections[2].kind, "conference");
+    assert.equal(calls[0].connections[2].status, "connected");
+    assert.equal(calls[0].connections[2].connectedAt, "2026-10-09T12:02:03.000Z");
+    assert.equal(calls[0].forwardings.length, 1);
+    assert.equal(calls[0].forwardings[0].trigger, "incoming_action");
+  } finally {
+    mock.server.close();
+  }
+});

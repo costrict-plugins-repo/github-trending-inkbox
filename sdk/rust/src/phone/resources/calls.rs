@@ -1,0 +1,1222 @@
+//! Identity-scoped call operations: list, get, transcripts, place.
+
+use std::sync::Arc;
+
+use serde_json::Map;
+
+use crate::error::Result;
+use crate::filters::DateRangeFilter;
+use crate::http::HttpTransport;
+use crate::phone::types::{
+    CallOrigin, CallPlacementOptions, HostedAgentAuthorityMode, HostedAgentToolInvocationPage,
+    HostedCallPlacementOptions, PhoneCall, PhoneCallWithRateLimit, PhoneTranscript,
+};
+
+pub struct CallsResource {
+    http: Arc<HttpTransport>,
+}
+
+impl CallsResource {
+    pub fn new(http: Arc<HttpTransport>) -> Self {
+        Self { http }
+    }
+
+    /// List calls, newest first.
+    ///
+    /// Identity-scoped API keys resolve their own identity and never see
+    /// contact-rule-blocked rows regardless of `is_blocked` (filtered
+    /// server-side). Admin/JWT callers must pass `agent_identity_id` (the
+    /// server returns 422 otherwise).
+    ///
+    /// # Arguments
+    /// * `agent_identity_id` - UUID (or string) of the agent identity to scope
+    ///   to. `None` for agent-scoped keys; required under admin/JWT.
+    /// * `limit` - Max results to return (1-200).
+    /// * `offset` - Pagination offset.
+    /// * `is_blocked` - Tri-state filter: `Some(true)` for only blocked,
+    ///   `Some(false)` for only non-blocked, `None` for all.
+    pub fn list(
+        &self,
+        agent_identity_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+        is_blocked: Option<bool>,
+    ) -> Result<Vec<PhoneCall>> {
+        // Delegate to the filtered variant with an empty (default) date range,
+        // which sends no extra params — wire-identical to the original list.
+        self.list_filtered(
+            agent_identity_id,
+            limit,
+            offset,
+            is_blocked,
+            &DateRangeFilter::default(),
+        )
+    }
+
+    /// List calls, newest first, additionally narrowed by a `created_at`
+    /// [`DateRangeFilter`].
+    ///
+    /// Identical to [`CallsResource::list`] but also forwards the filter's
+    /// `start_datetime` / `end_datetime` / `tz`. A default filter sends nothing extra,
+    /// so this behaves exactly like `list`.
+    ///
+    /// # Arguments
+    /// * `agent_identity_id` / `limit` / `offset` / `is_blocked` - See
+    ///   [`CallsResource::list`].
+    /// * `filter` - Optional `created_at` date-range bounds.
+    pub fn list_filtered(
+        &self,
+        agent_identity_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+        is_blocked: Option<bool>,
+        filter: &DateRangeFilter,
+    ) -> Result<Vec<PhoneCall>> {
+        // Always send limit + offset; scope by identity + filter only when set.
+        let mut params: Vec<(&str, String)> =
+            vec![("limit", limit.to_string()), ("offset", offset.to_string())];
+        if let Some(id) = agent_identity_id {
+            params.push(("agent_identity_id", id.to_string()));
+        }
+        if let Some(b) = is_blocked {
+            params.push(("is_blocked", b.to_string()));
+        }
+        filter.apply(&mut params);
+        let data = self.http.get("/calls", &params)?;
+        Ok(serde_json::from_value(data)?)
+    }
+
+    /// Get a single call by ID.
+    ///
+    /// # Arguments
+    /// * `call_id` - UUID (or string) of the call.
+    pub fn get(&self, call_id: &str) -> Result<PhoneCall> {
+        let data = self
+            .http
+            .get(&format!("/calls/{call_id}"), crate::http::NO_QUERY)?;
+        Ok(serde_json::from_value(data)?)
+    }
+
+    /// Hang up a live call by ID, from outside the call.
+    ///
+    /// The lever for anything not on the call itself (tests, operators,
+    /// another process); the agent on the call keeps ending it in-band. The
+    /// carrier confirms the teardown asynchronously, so the returned call can
+    /// still show its live status for a moment. A call that has already ended
+    /// (or has no active carrier leg yet) surfaces the server's 409 verbatim.
+    ///
+    /// # Arguments
+    /// * `call_id` - UUID (or string) of the call.
+    ///
+    /// # Returns
+    /// The call record as of the hangup request.
+    pub fn hangup(&self, call_id: &str) -> Result<PhoneCall> {
+        let data = self.http.post(
+            &format!("/calls/{call_id}/hangup"),
+            None::<&serde_json::Value>,
+            crate::http::NO_QUERY,
+        )?;
+        Ok(serde_json::from_value(data)?)
+    }
+
+    /// List all transcript segments for a call, ordered by sequence number.
+    ///
+    /// # Arguments
+    /// * `call_id` - UUID (or string) of the call.
+    pub fn transcripts(&self, call_id: &str) -> Result<Vec<PhoneTranscript>> {
+        let data = self.http.get(
+            &format!("/calls/{call_id}/transcripts"),
+            crate::http::NO_QUERY,
+        )?;
+        Ok(serde_json::from_value(data)?)
+    }
+
+    /// List a page of safe Voice AI tool activity for a call.
+    ///
+    /// Tool arguments and provider details are intentionally excluded.
+    pub fn tool_invocations(
+        &self,
+        call_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<HostedAgentToolInvocationPage> {
+        let data = self.http.get(
+            &format!("/calls/{call_id}/tool-invocations"),
+            &[("limit", limit.to_string()), ("offset", offset.to_string())],
+        )?;
+        Ok(serde_json::from_value(data)?)
+    }
+
+    /// Place an outbound call.
+    ///
+    /// The server enforces the conditional requirements: `from_number` is
+    /// required for `dedicated_number`, `agent_identity_id` for either
+    /// iMessage origination. Omissions surface as a server 422.
+    ///
+    /// # Arguments
+    /// * `to_number` - E.164 number to call.
+    /// * `origination` - Where the call originates (defaults to
+    ///   [`CallOrigin::DedicatedNumber`]).
+    /// * `from_number` - E.164 number to call from (dedicated origination).
+    /// * `agent_identity_id` - UUID of the placing identity (iMessage origination).
+    /// * `client_websocket_url` - WebSocket URL (wss://) for audio bridging.
+    ///
+    /// # Returns
+    /// The created call record with current rate limit info.
+    pub fn place(
+        &self,
+        to_number: &str,
+        origination: CallOrigin,
+        from_number: Option<&str>,
+        agent_identity_id: Option<&str>,
+        client_websocket_url: Option<&str>,
+    ) -> Result<PhoneCallWithRateLimit> {
+        self.place_with_options(
+            to_number,
+            origination,
+            from_number,
+            agent_identity_id,
+            client_websocket_url,
+            &CallPlacementOptions::default(),
+        )
+    }
+
+    /// Place an outbound call with optional call controls.
+    ///
+    /// `voicemail_detection`, `on_voicemail`, and `voicemail_message` are
+    /// omitted when unset, preserving the server's default behavior and the
+    /// wire shape of [`CallsResource::place`].
+    pub fn place_with_options(
+        &self,
+        to_number: &str,
+        origination: CallOrigin,
+        from_number: Option<&str>,
+        agent_identity_id: Option<&str>,
+        client_websocket_url: Option<&str>,
+        options: &CallPlacementOptions,
+    ) -> Result<PhoneCallWithRateLimit> {
+        // Always send origination; include the rest only when provided.
+        let mut body = Map::new();
+        body.insert("to_number".into(), to_number.into());
+        body.insert("origination".into(), origination.as_str().into());
+        if let Some(n) = from_number {
+            body.insert("from_number".into(), n.into());
+        }
+        if let Some(id) = agent_identity_id {
+            body.insert("agent_identity_id".into(), id.into());
+        }
+        if let Some(url) = client_websocket_url {
+            body.insert("client_websocket_url".into(), url.into());
+        }
+        if let Some(detection) = options.voicemail_detection {
+            body.insert("voicemail_detection".into(), detection.as_str().into());
+        }
+        if let Some(on_voicemail) = options.on_voicemail {
+            body.insert("on_voicemail".into(), on_voicemail.as_str().into());
+        }
+        if let Some(message) = &options.voicemail_message {
+            body.insert("voicemail_message".into(), message.as_str().into());
+        }
+        let data = self
+            .http
+            .post("/place-call", Some(&body), crate::http::NO_QUERY)?;
+        Ok(serde_json::from_value(data)?)
+    }
+
+    /// Place an outbound call driven by Inkbox Voice AI.
+    ///
+    /// Sibling of [`CallsResource::place`] (which stays client-driven);
+    /// sends `mode=hosted_agent` plus the required `reason` brief and no
+    /// WebSocket URL. Origination rules are unchanged and server-enforced:
+    /// `from_number` for `dedicated_number`, `agent_identity_id` for either
+    /// iMessage origination — violations surface as a server 422.
+    ///
+    /// # Arguments
+    /// * `to_number` - E.164 number to call.
+    /// * `origination` - Where the call originates.
+    /// * `from_number` - E.164 number to call from (dedicated origination).
+    /// * `agent_identity_id` - UUID of the placing identity (iMessage origination).
+    /// * `reason` - Voice AI's task brief for the call — what to
+    ///   accomplish.
+    ///
+    /// # Returns
+    /// The created call record with current rate limit info.
+    pub fn place_hosted(
+        &self,
+        to_number: &str,
+        origination: CallOrigin,
+        from_number: Option<&str>,
+        agent_identity_id: Option<&str>,
+        reason: &str,
+    ) -> Result<PhoneCallWithRateLimit> {
+        self.place_hosted_with_options(
+            to_number,
+            origination,
+            from_number,
+            agent_identity_id,
+            reason,
+            &HostedCallPlacementOptions::default(),
+        )
+    }
+
+    /// Place an outbound hosted-agent call with optional call controls.
+    pub fn place_hosted_with_options(
+        &self,
+        to_number: &str,
+        origination: CallOrigin,
+        from_number: Option<&str>,
+        agent_identity_id: Option<&str>,
+        reason: &str,
+        options: &HostedCallPlacementOptions,
+    ) -> Result<PhoneCallWithRateLimit> {
+        let mut body = Map::new();
+        body.insert("to_number".into(), to_number.into());
+        body.insert("origination".into(), origination.as_str().into());
+        body.insert("mode".into(), "hosted_agent".into());
+        body.insert("reason".into(), reason.into());
+        if let Some(authority_mode) = options.authority_mode {
+            body.insert(
+                "hosted_agent_authority_mode".into(),
+                authority_mode.as_str().into(),
+            );
+        }
+        if let Some(detection) = options.voicemail_detection {
+            body.insert("voicemail_detection".into(), detection.as_str().into());
+        }
+        if let Some(on_voicemail) = options.on_voicemail {
+            body.insert("on_voicemail".into(), on_voicemail.as_str().into());
+        }
+        if let Some(message) = &options.voicemail_message {
+            body.insert("voicemail_message".into(), message.as_str().into());
+        }
+        if let Some(n) = from_number {
+            body.insert("from_number".into(), n.into());
+        }
+        if let Some(id) = agent_identity_id {
+            body.insert("agent_identity_id".into(), id.into());
+        }
+        let data = self
+            .http
+            .post("/place-call", Some(&body), crate::http::NO_QUERY)?;
+        Ok(serde_json::from_value(data)?)
+    }
+
+    /// Place an outbound hosted-agent call with an explicit authority mode.
+    pub fn place_hosted_with_authority(
+        &self,
+        to_number: &str,
+        origination: CallOrigin,
+        from_number: Option<&str>,
+        agent_identity_id: Option<&str>,
+        reason: &str,
+        authority_mode: HostedAgentAuthorityMode,
+    ) -> Result<PhoneCallWithRateLimit> {
+        self.place_hosted_with_options(
+            to_number,
+            origination,
+            from_number,
+            agent_identity_id,
+            reason,
+            &HostedCallPlacementOptions {
+                authority_mode: Some(authority_mode),
+                voicemail_detection: None,
+                on_voicemail: None,
+                voicemail_message: None,
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use httpmock::prelude::*;
+    use serde_json::json;
+
+    use crate::client::Inkbox;
+    use crate::error::{ApiErrorDetail, InkboxError};
+    use crate::phone::types::{
+        CallOrigin, CallPlacementOptions, HostedAgentAuthorityMode, HostedCallPlacementOptions,
+        OnVoicemail, VoicemailDetection,
+    };
+
+    /// Client whose phone transport points at the mock server (phone resources
+    /// ride the `/api/v1/phone` sub-base).
+    fn client(server: &MockServer) -> std::sync::Arc<Inkbox> {
+        Inkbox::builder("test-key")
+            .base_url(server.base_url())
+            .build()
+            .unwrap()
+    }
+
+    /// A dedicated-origin `PhoneCall` response payload.
+    fn call_json() -> serde_json::Value {
+        json!({
+            "id": "22222222-2222-2222-2222-222222222222",
+            "local_phone_number": "+15550001111",
+            "remote_phone_number": "+15550002222",
+            "direction": "outbound",
+            "status": "completed",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "updated_at": "2026-06-01T00:00:01+00:00",
+            "is_blocked": false,
+            "origin": "dedicated_number"
+        })
+    }
+
+    /// A place-call response: flat call fields + `rate_limit` snapshot.
+    fn placed_json(origin: &str, local: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": "22222222-2222-2222-2222-222222222222",
+            "local_phone_number": local,
+            "remote_phone_number": "+15550002222",
+            "direction": "outbound",
+            "status": "initiated",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "updated_at": "2026-06-01T00:00:00+00:00",
+            "is_blocked": false,
+            "origin": origin,
+            "rate_limit": {
+                "calls_used": 1,
+                "calls_remaining": 9,
+                "calls_limit": 10,
+                "minutes_used": 1.5,
+                "minutes_remaining": 58.5,
+                "minutes_limit": 60
+            }
+        })
+    }
+
+    #[test]
+    fn list_sends_scope_and_filter_params_when_set() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls")
+                .query_param("limit", "25")
+                .query_param("offset", "5")
+                .query_param("agent_identity_id", "33333333-3333-3333-3333-333333333333")
+                .query_param("is_blocked", "true");
+            then.status(200).json_body(json!([call_json()]));
+        });
+        let calls = client(&server)
+            .calls()
+            .list(
+                Some("33333333-3333-3333-3333-333333333333"),
+                25,
+                5,
+                Some(true),
+            )
+            .unwrap();
+        mock.assert();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].remote_phone_number, "+15550002222");
+    }
+
+    #[test]
+    fn list_filtered_sends_date_range_params_when_set() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls")
+                .query_param("start_datetime", "2026-07-01")
+                .query_param("end_datetime", "2026-07-06")
+                .query_param("tz", "America/New_York");
+            then.status(200).json_body(json!([]));
+        });
+        let filter = crate::DateRangeFilter {
+            start_datetime: Some("2026-07-01".to_string()),
+            end_datetime: Some("2026-07-06".to_string()),
+            tz: Some("America/New_York".to_string()),
+        };
+        client(&server)
+            .calls()
+            .list_filtered(None, 50, 0, None, &filter)
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn list_omits_identity_and_blocked_params_when_none() {
+        // Custom matcher: exactly limit + offset, nothing else on the wire.
+        fn only_limit_and_offset(req: &HttpMockRequest) -> bool {
+            let params = req.query_params.clone().unwrap_or_default();
+            let mut keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
+            keys.sort_unstable();
+            keys == ["limit", "offset"]
+        }
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls")
+                .matches(only_limit_and_offset);
+            then.status(200).json_body(json!([]));
+        });
+        let calls = client(&server).calls().list(None, 50, 0, None).unwrap();
+        mock.assert();
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn list_is_blocked_false_is_sent_as_false() {
+        // Tri-state: Some(false) must serialize as is_blocked=false, not vanish.
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls")
+                .query_param("is_blocked", "false");
+            then.status(200).json_body(json!([]));
+        });
+        client(&server)
+            .calls()
+            .list(None, 50, 0, Some(false))
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn get_fetches_call_by_id() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls/22222222-2222-2222-2222-222222222222");
+            then.status(200).json_body(call_json());
+        });
+        let call = client(&server)
+            .calls()
+            .get("22222222-2222-2222-2222-222222222222")
+            .unwrap();
+        mock.assert();
+        assert_eq!(call.status, "completed");
+        assert_eq!(call.local_phone_number.as_deref(), Some("+15550001111"));
+    }
+
+    #[test]
+    fn transcripts_fetches_segments_for_call() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls/22222222-2222-2222-2222-222222222222/transcripts");
+            then.status(200).json_body(json!([
+                {
+                    "id": "55555555-5555-5555-5555-555555555555",
+                    "call_id": "22222222-2222-2222-2222-222222222222",
+                    "seq": 0,
+                    "ts_ms": 0,
+                    "party": "remote",
+                    "text": "Hi",
+                    "created_at": "2026-06-01T00:00:02+00:00"
+                },
+                {
+                    "id": "66666666-6666-6666-6666-666666666666",
+                    "call_id": "22222222-2222-2222-2222-222222222222",
+                    "seq": 1,
+                    "ts_ms": 900,
+                    "party": "agent",
+                    "text": "Hello!",
+                    "created_at": "2026-06-01T00:00:03+00:00"
+                }
+            ]));
+        });
+        let segments = client(&server)
+            .calls()
+            .transcripts("22222222-2222-2222-2222-222222222222")
+            .unwrap();
+        mock.assert();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].seq, 0);
+        assert_eq!(segments[1].text, "Hello!");
+    }
+
+    #[test]
+    fn tool_invocations_fetches_paginated_safe_activity() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls/22222222-2222-2222-2222-222222222222/tool-invocations")
+                .query_param("limit", "25")
+                .query_param("offset", "50");
+            then.status(200).json_body(json!({
+                "items": [{
+                    "id": "77777777-7777-7777-7777-777777777777",
+                    "call_id": "22222222-2222-2222-2222-222222222222",
+                    "tool_name": "send_email",
+                    "status": "succeeded",
+                    "result": {"status": "sent"},
+                    "started_at": "2026-07-29T01:02:03+00:00",
+                    "completed_at": "2026-07-29T01:02:04+00:00"
+                }],
+                "limit": 25,
+                "offset": 50,
+                "has_more": true
+            }));
+        });
+        let page = client(&server)
+            .calls()
+            .tool_invocations("22222222-2222-2222-2222-222222222222", 25, 50)
+            .unwrap();
+        mock.assert();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].tool_name, "send_email");
+        assert_eq!(
+            page.items[0].status,
+            crate::phone::types::HostedAgentToolInvocationStatus::Succeeded
+        );
+        assert_eq!(page.limit, 25);
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn hangup_posts_and_returns_call() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/calls/22222222-2222-2222-2222-222222222222/hangup");
+            // Teardown is async at the carrier: the row can come back still live.
+            then.status(200).json_body(json!({
+                "id": "22222222-2222-2222-2222-222222222222",
+                "local_phone_number": "+15550001111",
+                "remote_phone_number": "+15550002222",
+                "direction": "outbound",
+                "status": "answered",
+                "hangup_reason": "local",
+                "created_at": "2026-06-01T00:00:00+00:00",
+                "updated_at": "2026-06-01T00:00:01+00:00",
+                "is_blocked": false,
+                "origin": "dedicated_number"
+            }));
+        });
+        let call = client(&server)
+            .calls()
+            .hangup("22222222-2222-2222-2222-222222222222")
+            .unwrap();
+        mock.assert();
+        assert_eq!(call.status, "answered");
+        assert_eq!(call.hangup_reason.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn hangup_409_already_ended_maps_to_api_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/calls/22222222-2222-2222-2222-222222222222/hangup");
+            then.status(409).json_body(json!({
+                "detail": {
+                    "error": "call_already_ended",
+                    "message": "Call has already ended."
+                }
+            }));
+        });
+        let err = client(&server)
+            .calls()
+            .hangup("22222222-2222-2222-2222-222222222222")
+            .unwrap_err();
+        match err {
+            InkboxError::Api {
+                status_code,
+                detail,
+                ..
+            } => {
+                assert_eq!(status_code, 409);
+                let obj = detail.as_object().expect("structured detail");
+                assert_eq!(obj["error"], "call_already_ended");
+            }
+            other => panic!("expected InkboxError::Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn place_dedicated_sends_from_number() {
+        let server = MockServer::start();
+        // Exact json_body match: guarantees no stray keys in the request body.
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "from_number": "+15550001111"
+                }));
+            then.status(200)
+                .json_body(placed_json("dedicated_number", json!("+15550001111")));
+        });
+        let placed = client(&server)
+            .calls()
+            .place(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                Some("+15550001111"),
+                None,
+                None,
+            )
+            .unwrap();
+        mock.assert();
+        assert_eq!(placed.call.origin, CallOrigin::DedicatedNumber);
+        assert_eq!(
+            placed.call.local_phone_number.as_deref(),
+            Some("+15550001111")
+        );
+        let rl = placed.rate_limit.expect("rate_limit present");
+        assert_eq!(rl.calls_remaining, 9);
+        assert_eq!(rl.minutes_remaining, 58.5);
+    }
+
+    #[test]
+    fn place_shared_sends_identity_and_no_from_number_key() {
+        let server = MockServer::start();
+        // Exact body: agent_identity_id in, from_number key never serialized.
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "shared_imessage_number",
+                    "agent_identity_id": "33333333-3333-3333-3333-333333333333"
+                }));
+            then.status(200).json_body(placed_json(
+                "shared_imessage_number",
+                serde_json::Value::Null,
+            ));
+        });
+        let placed = client(&server)
+            .calls()
+            .place(
+                "+15550002222",
+                CallOrigin::SharedImessageNumber,
+                None,
+                Some("33333333-3333-3333-3333-333333333333"),
+                None,
+            )
+            .unwrap();
+        mock.assert();
+        assert_eq!(placed.call.origin, CallOrigin::SharedImessageNumber);
+        assert_eq!(placed.call.local_phone_number, None);
+    }
+
+    #[test]
+    fn place_sends_client_websocket_url_when_set() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "from_number": "+15550001111",
+                    "client_websocket_url": "wss://example.com/audio"
+                }));
+            then.status(200)
+                .json_body(placed_json("dedicated_number", json!("+15550001111")));
+        });
+        client(&server)
+            .calls()
+            .place(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                Some("+15550001111"),
+                None,
+                Some("wss://example.com/audio"),
+            )
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn place_with_options_sends_disabled_voicemail_detection() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "from_number": "+15550001111",
+                    "voicemail_detection": "disabled"
+                }));
+            then.status(200)
+                .json_body(placed_json("dedicated_number", json!("+15550001111")));
+        });
+        client(&server)
+            .calls()
+            .place_with_options(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                Some("+15550001111"),
+                None,
+                None,
+                &CallPlacementOptions {
+                    voicemail_detection: Some(VoicemailDetection::Disabled),
+                    on_voicemail: None,
+                    voicemail_message: None,
+                },
+            )
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn place_with_options_sends_on_voicemail_and_omits_message_when_unset() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "from_number": "+15550001111",
+                    "on_voicemail": "ignore"
+                }));
+            then.status(200)
+                .json_body(placed_json("dedicated_number", json!("+15550001111")));
+        });
+        client(&server)
+            .calls()
+            .place_with_options(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                Some("+15550001111"),
+                None,
+                None,
+                &CallPlacementOptions {
+                    on_voicemail: Some(OnVoicemail::Ignore),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn place_body_never_carries_mode_key() {
+        // The classic `place` preserves its established wire body.
+        fn body_has_no_mode(req: &HttpMockRequest) -> bool {
+            let body = req.body.clone().unwrap_or_default();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            v.get("mode").is_none()
+                && v.get("reason").is_none()
+                && v.get("hosted_agent_authority_mode").is_none()
+        }
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .matches(body_has_no_mode);
+            then.status(200)
+                .json_body(placed_json("dedicated_number", json!("+15550001111")));
+        });
+        client(&server)
+            .calls()
+            .place(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                Some("+15550001111"),
+                None,
+                None,
+            )
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn place_hosted_omits_authority_and_parses_inherited_default() {
+        let server = MockServer::start();
+        // Exact body omits authority; the resolved response may still be Yolo.
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "mode": "hosted_agent",
+                    "reason": "Book a cleaning next week, mornings preferred",
+                    "from_number": "+15550001111"
+                }));
+            then.status(200).json_body({
+                let mut v = placed_json("dedicated_number", json!("+15550001111"));
+                v["mode"] = json!("hosted_agent");
+                v["reason"] = json!("Book a cleaning next week, mornings preferred");
+                v["hosted_agent_authority_mode"] = json!("yolo");
+                v
+            });
+        });
+        let placed = client(&server)
+            .calls()
+            .place_hosted(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                Some("+15550001111"),
+                None,
+                "Book a cleaning next week, mornings preferred",
+            )
+            .unwrap();
+        mock.assert();
+        assert_eq!(placed.call.mode, "hosted_agent");
+        assert_eq!(
+            placed.call.reason.as_deref(),
+            Some("Book a cleaning next week, mornings preferred")
+        );
+        assert_eq!(
+            placed.call.hosted_agent_authority_mode,
+            HostedAgentAuthorityMode::Yolo
+        );
+    }
+
+    #[test]
+    fn place_hosted_with_authority_sends_yolo() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "mode": "hosted_agent",
+                    "reason": "Coordinate the appointment",
+                    "hosted_agent_authority_mode": "yolo",
+                    "from_number": "+15550001111"
+                }));
+            then.status(200).json_body({
+                let mut v = placed_json("dedicated_number", json!("+15550001111"));
+                v["mode"] = json!("hosted_agent");
+                v["hosted_agent_authority_mode"] = json!("yolo");
+                v
+            });
+        });
+
+        let placed = client(&server)
+            .calls()
+            .place_hosted_with_authority(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                Some("+15550001111"),
+                None,
+                "Coordinate the appointment",
+                HostedAgentAuthorityMode::Yolo,
+            )
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(
+            placed.call.hosted_agent_authority_mode,
+            HostedAgentAuthorityMode::Yolo
+        );
+    }
+
+    #[test]
+    fn place_hosted_with_authority_sends_contact_scoped() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "mode": "hosted_agent",
+                    "reason": "Confirm this caller's appointment",
+                    "hosted_agent_authority_mode": "contact_scoped",
+                    "from_number": "+15550001111"
+                }));
+            then.status(200).json_body({
+                let mut v = placed_json("dedicated_number", json!("+15550001111"));
+                v["mode"] = json!("hosted_agent");
+                v
+            });
+        });
+
+        client(&server)
+            .calls()
+            .place_hosted_with_authority(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                Some("+15550001111"),
+                None,
+                "Confirm this caller's appointment",
+                HostedAgentAuthorityMode::ContactScoped,
+            )
+            .unwrap();
+
+        mock.assert();
+    }
+
+    #[test]
+    fn place_hosted_with_options_combines_authority_and_voicemail_detection() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "mode": "hosted_agent",
+                    "reason": "Leave the appointment details in a voicemail",
+                    "hosted_agent_authority_mode": "yolo",
+                    "voicemail_detection": "disabled",
+                    "from_number": "+15550001111"
+                }));
+            then.status(200).json_body({
+                let mut v = placed_json("dedicated_number", json!("+15550001111"));
+                v["mode"] = json!("hosted_agent");
+                v["hosted_agent_authority_mode"] = json!("yolo");
+                v
+            });
+        });
+
+        client(&server)
+            .calls()
+            .place_hosted_with_options(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                Some("+15550001111"),
+                None,
+                "Leave the appointment details in a voicemail",
+                &HostedCallPlacementOptions {
+                    authority_mode: Some(HostedAgentAuthorityMode::Yolo),
+                    voicemail_detection: Some(VoicemailDetection::Disabled),
+                    on_voicemail: None,
+                    voicemail_message: None,
+                },
+            )
+            .unwrap();
+
+        mock.assert();
+    }
+
+    #[test]
+    fn place_hosted_with_options_sends_on_voicemail_and_message() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "mode": "hosted_agent",
+                    "reason": "Confirm the appointment",
+                    "on_voicemail": "leave_message",
+                    "voicemail_message": "Please call us back.",
+                    "from_number": "+15550001111"
+                }));
+            then.status(200).json_body({
+                let mut v = placed_json("dedicated_number", json!("+15550001111"));
+                v["mode"] = json!("hosted_agent");
+                v["on_voicemail"] = json!("leave_message");
+                v
+            });
+        });
+
+        let placed = client(&server)
+            .calls()
+            .place_hosted_with_options(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                Some("+15550001111"),
+                None,
+                "Confirm the appointment",
+                &HostedCallPlacementOptions {
+                    authority_mode: None,
+                    voicemail_detection: None,
+                    on_voicemail: Some(OnVoicemail::LeaveMessage),
+                    voicemail_message: Some("Please call us back.".to_string()),
+                },
+            )
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(placed.call.on_voicemail, OnVoicemail::LeaveMessage);
+    }
+
+    #[test]
+    fn place_hosted_shared_scopes_by_identity() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "shared_imessage_number",
+                    "mode": "hosted_agent",
+                    "reason": "Confirm the appointment",
+                    "agent_identity_id": "33333333-3333-3333-3333-333333333333"
+                }));
+            then.status(200).json_body(placed_json(
+                "shared_imessage_number",
+                serde_json::Value::Null,
+            ));
+        });
+        client(&server)
+            .calls()
+            .place_hosted(
+                "+15550002222",
+                CallOrigin::SharedImessageNumber,
+                None,
+                Some("33333333-3333-3333-3333-333333333333"),
+                "Confirm the appointment",
+            )
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn place_hosted_503_at_capacity_maps_to_api_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/phone/place-call");
+            then.status(503).json_body(json!({
+                "detail": {"error": "hosted_agent_at_capacity"}
+            }));
+        });
+        let err = client(&server)
+            .calls()
+            .place_hosted(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                Some("+15550001111"),
+                None,
+                "Confirm the appointment",
+            )
+            .unwrap_err();
+        match err {
+            InkboxError::Api {
+                status_code,
+                detail,
+                ..
+            } => {
+                assert_eq!(status_code, 503);
+                let obj = detail.as_object().expect("structured detail");
+                assert_eq!(obj["error"], "hosted_agent_at_capacity");
+            }
+            other => panic!("expected InkboxError::Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_exposes_inline_post_call_action_items() {
+        let server = MockServer::start();
+        // A call carrying open action items inline on the resource.
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls/22222222-2222-2222-2222-222222222222");
+            then.status(200).json_body({
+                let mut v = call_json();
+                v["post_call_action_items"] = json!([
+                    {
+                        "id": "44444444-4444-4444-4444-444444444444",
+                        "seq": 1,
+                        "action": "Book cleaning Tue 9:30am",
+                        "details": "Office confirmed availability.",
+                        "status": "open"
+                    },
+                    {
+                        "id": "55555555-5555-5555-5555-555555555555",
+                        "seq": 2,
+                        "action": "Send pricing PDF",
+                        "details": null,
+                        "status": "open"
+                    }
+                ]);
+                v
+            });
+        });
+        let call = client(&server)
+            .calls()
+            .get("22222222-2222-2222-2222-222222222222")
+            .unwrap();
+        mock.assert();
+        assert_eq!(call.post_call_action_items.len(), 2);
+        assert_eq!(call.post_call_action_items[0].seq, 1);
+        assert_eq!(
+            call.post_call_action_items[0].action,
+            "Book cleaning Tue 9:30am"
+        );
+        assert_eq!(call.post_call_action_items[1].details, None);
+    }
+
+    #[test]
+    fn post_call_action_items_default_empty_when_key_absent() {
+        // The base fixture omits the key: it must parse to an empty Vec.
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls/22222222-2222-2222-2222-222222222222");
+            then.status(200).json_body(call_json());
+        });
+        let call = client(&server)
+            .calls()
+            .get("22222222-2222-2222-2222-222222222222")
+            .unwrap();
+        mock.assert();
+        assert!(call.post_call_action_items.is_empty());
+    }
+
+    #[test]
+    fn place_409_no_shared_connection_maps_to_api_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/phone/place-call");
+            then.status(409).json_body(json!({
+                "detail": {
+                    "error": "no_shared_connection",
+                    "detail": "No active shared iMessage connection for this identity"
+                }
+            }));
+        });
+        let err = client(&server)
+            .calls()
+            .place(
+                "+15550002222",
+                CallOrigin::SharedImessageNumber,
+                None,
+                Some("33333333-3333-3333-3333-333333333333"),
+                None,
+            )
+            .unwrap_err();
+        match err {
+            InkboxError::Api {
+                status_code,
+                detail,
+                ..
+            } => {
+                assert_eq!(status_code, 409);
+                // Structured detail keeps the machine-readable error field.
+                let obj = detail.as_object().expect("structured detail");
+                assert_eq!(obj["error"], "no_shared_connection");
+            }
+            other => panic!("expected InkboxError::Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn place_422_maps_to_api_error_with_message_detail() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/phone/place-call");
+            then.status(422).json_body(json!({
+                "detail": "from_number is required for dedicated_number origination"
+            }));
+        });
+        let err = client(&server)
+            .calls()
+            .place(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        match err {
+            InkboxError::Api {
+                status_code,
+                detail,
+                ..
+            } => {
+                assert_eq!(status_code, 422);
+                match detail {
+                    ApiErrorDetail::Message(m) => assert!(m.contains("from_number")),
+                    other => panic!("expected message detail, got {other:?}"),
+                }
+            }
+            other => panic!("expected InkboxError::Api, got {other:?}"),
+        }
+    }
+}

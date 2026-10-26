@@ -1,0 +1,423 @@
+"""
+sdk/python/tests/test_identities.py
+
+Tests for IdentitiesResource.
+"""
+
+from datetime import UTC, datetime
+from unittest.mock import MagicMock
+from uuid import UUID
+
+import pytest
+
+from sample_data_identities import (
+    IDENTITY_DICT,
+    IDENTITY_DETAIL_DICT,
+    IDENTITY_LIST_DETAIL_DICT,
+)
+from inkbox.identities.resources.identities import IdentitiesResource
+from inkbox.identities.types import (
+    IdentityMailboxCreateOptions,
+    IdentityPhoneNumber,
+    IdentityPhoneNumberCreateOptions,
+    IdentityTunnelCreateOptions,
+    _AgentIdentityData,
+)
+from inkbox.mail.types import FilterMode
+from inkbox.phone.types import ForwardingTargetType, SmsStatus
+
+
+def _resource():
+    http = MagicMock()
+    return IdentitiesResource(http), http
+
+
+HANDLE = "sales-agent"
+
+
+def test_identity_phone_number_preserves_existing_direct_constructor():
+    timestamp = datetime.now(UTC)
+
+    number = IdentityPhoneNumber(
+        id=UUID("aaaa1111-0000-0000-0000-000000000001"),
+        number="+18335794607",
+        type="local",
+        status="active",
+        sms_status=SmsStatus.READY,
+        incoming_call_action="auto_reject",
+        client_websocket_url=None,
+        incoming_call_webhook_url=None,
+        filter_mode=FilterMode.BLACKLIST,
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+
+    assert number.forwarding_target_type is None
+    assert number.forwarding_phone_number is None
+    assert number.forwarding_sip_uri is None
+
+
+class TestIdentitiesCreate:
+    def test_creates_identity(self):
+        res, http = _resource()
+        http.post.return_value = IDENTITY_DETAIL_DICT
+
+        identity = res.create(agent_handle=HANDLE)
+
+        http.post.assert_called_once_with("/", json={"agent_handle": HANDLE})
+        assert isinstance(identity, _AgentIdentityData)
+        assert identity.agent_handle == HANDLE
+        assert identity.tunnel is not None
+
+    def test_creates_identity_with_mailbox_phone_number_and_secret_access(self):
+        res, http = _resource()
+        http.post.return_value = {**IDENTITY_DETAIL_DICT, "email_address": "sales.team@inkboxmail.com"}
+
+        identity = res.create(
+            agent_handle=HANDLE,
+            display_name="Sales Team",
+            description="Sales outreach",
+            mailbox=IdentityMailboxCreateOptions(
+                email_local_part="sales.team",
+            ),
+            tunnel=IdentityTunnelCreateOptions(tls_mode="passthrough"),
+            phone_number=IdentityPhoneNumberCreateOptions(
+                type="local",
+                state="NY",
+                incoming_call_action="webhook",
+                incoming_call_webhook_url="https://example.com/calls",
+            ),
+            vault_secret_ids=[
+                UUID("11111111-1111-1111-1111-111111111111"),
+                UUID("22222222-2222-2222-2222-222222222222"),
+            ],
+        )
+
+        http.post.assert_called_once_with(
+            "/",
+            json={
+                "agent_handle": HANDLE,
+                "display_name": "Sales Team",
+                "description": "Sales outreach",
+                "mailbox": {
+                    "email_local_part": "sales.team",
+                },
+                "tunnel": {"tls_mode": "passthrough"},
+                "phone_number": {
+                    "type": "local",
+                    "state": "NY",
+                    "incoming_call_action": "webhook",
+                    "incoming_call_webhook_url": "https://example.com/calls",
+                },
+                "vault_secret_ids": [
+                    "11111111-1111-1111-1111-111111111111",
+                    "22222222-2222-2222-2222-222222222222",
+                ],
+            },
+        )
+        assert identity.email_address == "sales.team@inkboxmail.com"
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            IdentityPhoneNumberCreateOptions(
+                incoming_call_action="forward",
+                forwarding_target_type=ForwardingTargetType.PHONE,
+            ),
+            IdentityPhoneNumberCreateOptions(
+                incoming_call_action="forward",
+                forwarding_target_type=ForwardingTargetType.SIP,
+            ),
+            IdentityPhoneNumberCreateOptions(
+                forwarding_phone_number="+14155550100",
+            ),
+            IdentityPhoneNumberCreateOptions(
+                incoming_call_action="forward",
+                forwarding_target_type=ForwardingTargetType.PHONE,
+                forwarding_phone_number="+14155550100",
+                forwarding_sip_uri="sip:line@voice.example.com",
+            ),
+        ],
+    )
+    def test_rejects_incoherent_forwarding_targets(self, options):
+        with pytest.raises(ValueError):
+            options.to_wire()
+
+    def test_claims_imessage_number_atomically(self):
+        res, http = _resource()
+        http.post.return_value = IDENTITY_DETAIL_DICT
+
+        identity = res.create(
+            agent_handle=HANDLE,
+            imessage_enabled=True,
+            claim_imessage_number=True,
+        )
+
+        http.post.assert_called_once_with(
+            "/",
+            json={
+                "agent_handle": HANDLE,
+                "imessage_enabled": True,
+                "claim_imessage_number": True,
+            },
+        )
+        assert identity.imessage_number is not None
+
+    def test_number_claim_requires_imessage_enabled_true(self):
+        res, http = _resource()
+
+        with pytest.raises(ValueError, match="imessage_enabled=True"):
+            res.create(
+                agent_handle=HANDLE,
+                claim_imessage_number=True,
+            )
+
+        http.post.assert_not_called()
+
+    def test_false_number_claim_is_rejected(self):
+        res, http = _resource()
+
+        with pytest.raises(ValueError, match="must be True when supplied"):
+            res.create(
+                agent_handle=HANDLE,
+                claim_imessage_number=False,  # type: ignore[arg-type]
+            )
+
+        http.post.assert_not_called()
+
+    def test_creates_identity_with_single_vault_secret_id(self):
+        res, http = _resource()
+        http.post.return_value = IDENTITY_DICT
+
+        secret_id = UUID("11111111-1111-1111-1111-111111111111")
+        res.create(agent_handle=HANDLE, vault_secret_ids=secret_id)
+
+        http.post.assert_called_once_with(
+            "/",
+            json={
+                "agent_handle": HANDLE,
+                "vault_secret_ids": "11111111-1111-1111-1111-111111111111",
+            },
+        )
+
+
+class TestIdentitiesList:
+    def test_preserves_hydrated_fields(self):
+        res, http = _resource()
+        http.get.return_value = [IDENTITY_LIST_DETAIL_DICT]
+
+        identities = res.list()
+
+        http.get.assert_called_once_with("/")
+        assert len(identities) == 1
+        assert identities[0].agent_handle == HANDLE
+        assert identities[0].mailbox.email_address == "sales-agent@inkbox.ai"
+        assert identities[0].tunnel.tunnel_name == HANDLE
+
+    def test_accepts_older_summary_response(self):
+        res, http = _resource()
+        http.get.return_value = [IDENTITY_DICT]
+
+        identity = res.list()[0]
+
+        assert identity.agent_handle == HANDLE
+        assert identity.mailbox is None
+        assert identity.tunnel is None
+
+    def test_empty_list(self):
+        res, http = _resource()
+        http.get.return_value = []
+
+        assert res.list() == []
+
+
+class TestIdentitiesGet:
+    def test_returns_detail(self):
+        res, http = _resource()
+        http.get.return_value = IDENTITY_DETAIL_DICT
+
+        detail = res.get(HANDLE)
+
+        http.get.assert_called_once_with(f"/{HANDLE}")
+        assert isinstance(detail, _AgentIdentityData)
+        assert detail.mailbox.email_address == "sales-agent@inkbox.ai"
+        assert detail.phone_number.number == "+18335794607"
+
+
+class TestIdentitiesUpdate:
+    @pytest.mark.parametrize("handle", ["new-handle", HANDLE, None])
+    def test_update_rejects_handle_before_http(self, handle):
+        res, http = _resource()
+        with pytest.raises(TypeError, match="new_handle"):
+            res.update(HANDLE, new_handle=handle)
+        http.patch.assert_not_called()
+
+    def test_omitted_fields_not_sent(self):
+        res, http = _resource()
+        http.patch.return_value = IDENTITY_DETAIL_DICT
+
+        result = res.update(HANDLE, display_name="New display")
+
+        _, kwargs = http.patch.call_args
+        assert kwargs["json"] == {"display_name": "New display"}
+        assert result.agent_handle == HANDLE
+
+    def test_claims_new_imessage_number(self):
+        res, http = _resource()
+        http.patch.return_value = IDENTITY_DETAIL_DICT
+
+        res.update(
+            HANDLE,
+            claim_imessage_number=True,
+            idempotency_key="identity-claim-1",
+        )
+
+        http.patch.assert_called_once_with(
+            f"/{HANDLE}",
+            json={"claim_imessage_number": True},
+            headers={"Idempotency-Key": "identity-claim-1"},
+        )
+
+    def test_false_number_claim_is_rejected(self):
+        res, http = _resource()
+
+        with pytest.raises(ValueError, match="must be True when supplied"):
+            res.update(
+                HANDLE,
+                claim_imessage_number=False,  # type: ignore[arg-type]
+            )
+
+        http.patch.assert_not_called()
+
+    def test_attaches_owned_imessage_number(self):
+        res, http = _resource()
+        http.patch.return_value = IDENTITY_DETAIL_DICT
+        number_id = UUID("99999999-0000-0000-0000-000000000001")
+
+        res.update(HANDLE, imessage_number_id=number_id)
+
+        http.patch.assert_called_once_with(
+            f"/{HANDLE}", json={"imessage_number_id": str(number_id)}
+        )
+
+    def test_explicit_null_moves_to_shared_service(self):
+        res, http = _resource()
+        http.patch.return_value = IDENTITY_DETAIL_DICT
+
+        res.update(HANDLE, imessage_number_id=None)
+
+        http.patch.assert_called_once_with(
+            f"/{HANDLE}", json={"imessage_number_id": None}
+        )
+
+    def test_omits_imessage_number_id_by_default(self):
+        res, http = _resource()
+        http.patch.return_value = IDENTITY_DETAIL_DICT
+
+        res.update(HANDLE, display_name="Sales")
+
+        assert "imessage_number_id" not in http.patch.call_args.kwargs["json"]
+
+    def test_rejects_number_claim_with_number_id(self):
+        res, http = _resource()
+
+        with pytest.raises(ValueError, match="cannot be set together"):
+            res.update(
+                HANDLE,
+                claim_imessage_number=True,
+                imessage_number_id=None,
+            )
+
+        http.patch.assert_not_called()
+
+    def test_number_claim_requires_idempotency_key(self):
+        res, http = _resource()
+
+        with pytest.raises(ValueError, match="idempotency_key is required"):
+            res.update(
+                HANDLE,
+                claim_imessage_number=True,
+            )
+
+        http.patch.assert_not_called()
+
+    def test_explicit_null_can_be_combined_with_disable(self):
+        res, http = _resource()
+        http.patch.return_value = IDENTITY_DETAIL_DICT
+
+        res.update(
+            HANDLE,
+            imessage_enabled=False,
+            imessage_number_id=None,
+        )
+
+        http.patch.assert_called_once_with(
+            f"/{HANDLE}",
+            json={"imessage_enabled": False, "imessage_number_id": None},
+        )
+
+
+class TestIdentitiesDelete:
+    def test_deletes_identity(self):
+        res, http = _resource()
+
+        res.delete(HANDLE)
+
+        http.delete.assert_called_once_with(f"/{HANDLE}")
+
+
+class TestIdentitiesReleasePhoneNumber:
+    def test_releases_phone_number(self):
+        res, http = _resource()
+
+        res.release_phone_number(HANDLE)
+
+        http.delete.assert_called_once_with(f"/{HANDLE}/phone_number")
+
+
+class TestIdentitiesIMessageFields:
+    def test_create_sends_imessage_enabled(self):
+        res, http = _resource()
+        http.post.return_value = IDENTITY_DICT
+
+        res.create(agent_handle=HANDLE, imessage_enabled=True)
+
+        _, kwargs = http.post.call_args
+        assert kwargs["json"]["imessage_enabled"] is True
+
+    def test_create_omits_imessage_enabled_by_default(self):
+        res, http = _resource()
+        http.post.return_value = IDENTITY_DICT
+
+        res.create(agent_handle=HANDLE)
+
+        _, kwargs = http.post.call_args
+        assert "imessage_enabled" not in kwargs["json"]
+
+    def test_update_sends_imessage_fields(self):
+        res, http = _resource()
+        http.patch.return_value = IDENTITY_DICT
+
+        res.update(
+            HANDLE,
+            imessage_enabled=True,
+            imessage_filter_mode="whitelist",
+        )
+
+        http.patch.assert_called_once_with(
+            f"/{HANDLE}",
+            json={"imessage_enabled": True, "imessage_filter_mode": "whitelist"},
+        )
+
+    def test_create_and_update_send_contact_sharing_toggle(self):
+        res, http = _resource()
+        http.post.return_value = IDENTITY_DICT
+        http.patch.return_value = IDENTITY_DICT
+
+        res.create(agent_handle=HANDLE, contact_sharing_enabled=False)
+        assert http.post.call_args.kwargs["json"]["contact_sharing_enabled"] is False
+
+        res.update(HANDLE, contact_sharing_enabled=True)
+        http.patch.assert_called_once_with(
+            f"/{HANDLE}", json={"contact_sharing_enabled": True}
+        )

@@ -1,0 +1,105 @@
+//! # inkbox
+//!
+//! Rust SDK for the [Inkbox](https://inkbox.ai) API — email, SMS/MMS,
+//! iMessage, voice, contacts, notes, an encrypted vault, and inbound tunnels
+//! for AI agents.
+//!
+//! This is a faithful port of the Python (`inkbox` on PyPI) and TypeScript
+//! (`@inkbox/sdk` on npm) SDKs. The public surface is **blocking** (built on
+//! `reqwest::blocking`) to match those SDKs. The tunnels data-plane runtime
+//! lives behind the optional `tunnels-runtime` feature.
+//!
+//! ```no_run
+//! use inkbox::Inkbox;
+//!
+//! # fn main() -> inkbox::Result<()> {
+//! let inkbox = Inkbox::new("ApiKey_...")?;
+//! let identity = inkbox.get_identity("support-bot")?;
+//! identity.send_email(
+//!     &["customer@example.com".into()],
+//!     "Hello!",
+//!     Some("Hi there"),
+//!     None, None, None, None, None, false,
+//! )?;
+//! # Ok(())
+//! # }
+//! ```
+
+// Internal infrastructure.
+mod config;
+mod cookies;
+pub mod error;
+pub mod filters;
+pub mod http;
+pub mod response_metadata;
+
+// Org-level entry point + per-identity facade.
+pub mod agent_identity;
+pub mod client;
+pub mod credentials;
+pub mod signing_keys;
+
+// API domains (mirror the Python package layout).
+pub mod a2a;
+pub mod agent_signup;
+pub mod api_keys;
+pub mod companion;
+pub mod sender_access;
+pub use sender_access::SenderAccess;
+#[cfg(test)]
+mod companion_tests;
+pub mod contact_rules;
+pub mod contacts;
+pub mod identities;
+pub mod imessage;
+pub mod mail;
+pub mod message_sends;
+pub mod notes;
+pub mod phone;
+pub mod tunnels;
+pub mod vault;
+pub mod webhooks;
+pub mod whoami;
+
+// Canonical re-exports.
+pub use a2a::{
+    extract_a2a_invitation_token, extract_a2a_invitation_token_with_base_url, A2AInvitation,
+    A2AInvitationAcceptResult, A2AInvitationCreateOptions, A2AInvitationCreateResult,
+    A2AInvitationEmailStatus, A2AInvitationListOptions, A2AInvitationPage, A2AInvitationParseError,
+    A2AInvitationPreview, A2AInvitationStatus,
+};
+pub use agent_identity::AgentIdentity;
+pub use client::{Inkbox, InkboxBuilder, DEFAULT_BASE_URL};
+pub use contact_rules::{
+    ContactRuleApplyTo, ContactRuleCreateOptions, ContactRuleDirection, ContactRuleListOptions,
+    ContactRuleUpdateOptions, DirectionalContactRule,
+};
+pub use credentials::Credentials;
+pub use error::{ApiErrorDetail, InkboxError, Result};
+pub use filters::DateRangeFilter;
+pub use response_metadata::{APIResponse, ResponseMetadata, ResponseNotice, ResponseObserver};
+
+pub mod organization_domains;
+pub use organization_domains::{
+    DomainAffiliation, DomainTxtRecord, IdentityDomainAffiliation, OrganizationDomain,
+    OrganizationDomainListOptions, OrganizationDomainPage, OrganizationDomainsResource,
+};
+
+#[cfg(test)]
+mod directional_tests;
+#[cfg(test)]
+mod response_metadata_tests;
+
+pub mod slack;
+pub use slack::*;
+pub mod slack_cache;
+pub mod slack_operations;
+pub use slack_cache::*;
+pub use slack_operations::*;
+pub use webhooks::types::{
+    SlackActorProfile, SlackUserProfile, SlackWebhookData, SlackWebhookEventType,
+    SlackWebhookPayload,
+};
+
+pub mod slack_rules;
+pub use slack_rules::*;

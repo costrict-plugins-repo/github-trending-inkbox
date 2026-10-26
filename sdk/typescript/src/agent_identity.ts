@@ -1,0 +1,1629 @@
+/**
+ * inkbox/src/agent.ts
+ *
+ * AgentIdentity — a domain object representing one agent identity.
+ * Returned by inkbox.createIdentity() and inkbox.getIdentity().
+ *
+ * Convenience methods (sendEmail, placeCall, etc.) are scoped to this
+ * identity's assigned channels so callers never need to pass an email
+ * address or phone number ID explicitly.
+ */
+
+import { InkboxAPIError, InkboxError } from "./_http.js";
+import { Credentials } from "./credentials.js";
+import type { ContactCommunicationPolicyPage } from "./contacts/resources/communicationPolicy.js";
+import type { TOTPCode, TOTPConfig } from "./vault/totp.js";
+import type { DecryptedVaultSecret, SecretPayload, VaultSecret } from "./vault/types.js";
+import { ForwardMode, MessageDirection } from "./mail/types.js";
+import type {
+  DraftDetail,
+  DraftSummary,
+  FilterMode,
+  MailAttachmentInput,
+  MailIdentityContactRule,
+  Message,
+  MessageDetail,
+  ThreadDetail,
+} from "./mail/types.js";
+import type {
+  CreateDraftOptions,
+  UpdateDraftOptions,
+} from "./mail/resources/drafts.js";
+import type {
+  PhoneIdentityContactRule,
+  IncomingCallActionConfig,
+  HostedAgentConfig,
+} from "./phone/types.js";
+import {
+  CallMode,
+  CallOrigin,
+  HostedAgentAuthorityMode,
+  IncomingCallAction,
+  ForwardingTargetType,
+  OnVoicemail,
+  VoicemailDetection,
+} from "./phone/types.js";
+import type {
+  CreateMailIdentityContactRuleOptions,
+  ListMailIdentityContactRulesOptions,
+  UpdateMailIdentityContactRuleOptions,
+} from "./mail/resources/identityContactRules.js";
+import type {
+  CreatePhoneIdentityContactRuleOptions,
+  ListPhoneIdentityContactRulesOptions,
+  UpdatePhoneIdentityContactRuleOptions,
+} from "./phone/resources/identityContactRules.js";
+import type { SigningKey, SigningKeyStatus } from "./signing_keys.js";
+import type {
+  IMessage,
+  IMessageThread,
+  IMessageAssignment,
+  IMessageConversation,
+  IMessageConversationSummary,
+  IdentityIMessageNumber,
+  IMessageMarkReadResult,
+  IMessageMediaUpload,
+  IMessageReaction,
+  IMessageReactionType,
+  IMessageSendStyle,
+} from "./imessage/types.js";
+import type {
+  PhoneCall,
+  PhoneCallWithRateLimit,
+  HostedAgentToolInvocationPage,
+  PhoneTranscript,
+  TextConversationSummary,
+  TextConversationUpdateResult,
+  TextMessage,
+} from "./phone/types.js";
+import type {
+  _AgentIdentityData,
+  IdentityMailbox,
+  IdentityPhoneNumber,
+  UpdateIdentityOptions,
+} from "./identities/types.js";
+import type { TunnelSummary } from "./tunnels/types.js";
+import type { Inkbox } from "./inkbox.js";
+import { A2AClient } from "./a2a/client.js";
+import type {
+  A2AContactRule,
+  A2AContext,
+  A2AContextListOptions,
+  A2AContextPage,
+  A2AHistoryMessage,
+  A2AHistoryMessagePage,
+  A2AMessageListOptions,
+  A2AReplyIntent,
+  A2ARuleAction,
+  A2ARuleDirection,
+  A2ASettings,
+  A2ASkill,
+  A2ATask,
+  A2ATaskListOptions,
+  A2ATaskPage,
+  A2ASentTaskListOptions,
+  A2ASentContextListOptions,
+} from "./a2a/types.js";
+
+export class AgentIdentity {
+  private _data: _AgentIdentityData;
+  private readonly _inkbox: Inkbox;
+  private _mailbox: IdentityMailbox | null;
+  private _phoneNumber: IdentityPhoneNumber | null;
+  private _imessageNumber: IdentityIMessageNumber | null;
+  private _tunnel: TunnelSummary | null;
+  private _credentials: Credentials | null = null;
+  private _credentialsVaultRef: object | null = null; // tracks which _unlocked built the cache
+
+  constructor(data: _AgentIdentityData, inkbox: Inkbox) {
+    this._data              = data;
+    this._inkbox            = inkbox;
+    this._mailbox           = data.mailbox;
+    this._phoneNumber       = data.phoneNumber;
+    this._imessageNumber    = data.imessageNumber;
+    this._tunnel            = data.tunnel;
+  }
+
+  // ------------------------------------------------------------------
+  // Identity properties
+  // ------------------------------------------------------------------
+
+  get agentHandle(): string { return this._data.agentHandle; }
+  get id(): string           { return this._data.id; }
+
+  /** Human-readable display name. Defaults server-side to `agentHandle` if unset. */
+  get displayName(): string | null { return this._data.displayName; }
+
+  /** Free-form org-internal description, or `null` if unset. Never surfaces in outbound mail. */
+  get description(): string | null { return this._data.description; }
+
+  /** Email address assigned at creation time. Always trust this value — do not derive it from `agentHandle`. */
+  get emailAddress(): string | null { return this._data.emailAddress; }
+
+  /** Whether this identity can be reached over iMessage. */
+  get imessageEnabled(): boolean { return this._data.imessageEnabled; }
+
+  /** Whether an attached dedicated iMessage line automatically shares this profile. */
+  get contactSharingEnabled(): boolean { return this._data.contactSharingEnabled; }
+
+  /** Whitelist/blacklist mode for this identity's iMessage contact rules. */
+  get imessageFilterMode(): FilterMode { return this._data.imessageFilterMode; }
+
+  /** Whitelist/blacklist mode for this identity's mail contact rules. */
+  get mailFilterMode(): FilterMode { return this._data.mailFilterMode; }
+
+  /** Whitelist/blacklist mode for this identity's Slack contact rules. */
+  get slackFilterMode(): FilterMode { return (this._data.slackFilterMode ?? "blacklist") as FilterMode; }
+  get slackInboundFilterMode(): FilterMode { return this._data.slackInboundFilterMode ?? this.slackFilterMode; }
+  get slackOutboundFilterMode(): FilterMode { return this._data.slackOutboundFilterMode ?? this.slackFilterMode; }
+  /** Whitelist/blacklist mode for this identity's phone contact rules. */
+  get phoneFilterMode(): FilterMode { return this._data.phoneFilterMode; }
+  get mailInboundFilterMode(): FilterMode { return this._data.mailInboundFilterMode ?? this.mailFilterMode; }
+  get mailOutboundFilterMode(): FilterMode { return this._data.mailOutboundFilterMode ?? this.mailFilterMode; }
+  get phoneInboundFilterMode(): FilterMode { return this._data.phoneInboundFilterMode ?? this.phoneFilterMode; }
+  get phoneOutboundFilterMode(): FilterMode { return this._data.phoneOutboundFilterMode ?? this.phoneFilterMode; }
+
+  /** Whether this identity has a webhook signing key configured. Status only — never the secret. */
+  get signingKeyConfigured(): boolean { return this._data.signingKeyConfigured; }
+
+  /** When this identity's signing key was created, or `null` if none is configured. */
+  get signingKeyCreatedAt(): Date | null { return this._data.signingKeyCreatedAt; }
+
+  /** The mailbox currently assigned to this identity, when included. */
+  get mailbox(): IdentityMailbox | null { return this._mailbox; }
+
+  /** The phone number currently assigned to this identity, or `null` if none. */
+  get phoneNumber(): IdentityPhoneNumber | null { return this._phoneNumber; }
+
+  /** Dedicated iMessage line attached to this identity, or `null` on shared service. */
+  get imessageNumber(): IdentityIMessageNumber | null { return this._imessageNumber; }
+
+  /**
+   * Summary of this identity's tunnel. For connection state and certificate
+   * material, fetch the full tunnel with `tunnels.get(id)`.
+   */
+  get tunnel(): TunnelSummary | null { return this._tunnel; }
+
+  /**
+   * Identity-scoped credential access.
+   *
+   * Returns a {@link Credentials} object filtered to the secrets this
+   * identity has been granted access to. The vault must be unlocked
+   * first via `inkbox.vault.unlock(vaultKey)`.
+   *
+   * The result is cached and automatically invalidated when the
+   * vault is re-unlocked.  Call {@link refresh} to manually clear
+   * the cache (e.g. after access-rule changes).
+   *
+   * @throws Error if the vault has not been unlocked.
+   */
+  async getCredentials(): Promise<Credentials> {
+    // If the vault was unlocked via constructor vaultKey, wait for it.
+    if (this._inkbox._vaultUnlockPromise !== null) {
+      await this._inkbox._vaultUnlockPromise;
+    }
+    const vault = this._inkbox._vaultResource;
+    // Invalidate cache if the vault was re-unlocked since we last built it.
+    if (this._credentials !== null && vault._unlocked === this._credentialsVaultRef) {
+      return this._credentials;
+    }
+    this._requireVaultUnlocked();
+    const unlocked = vault._unlocked!;
+    this._credentials = new Credentials(unlocked.secrets);
+    this._credentialsVaultRef = unlocked;
+    return this._credentials;
+  }
+
+  /**
+   * Revoke this identity's access to a vault secret.
+   *
+   * Also clears the credentials cache so the next call to
+   * {@link getCredentials} reflects the change.
+   *
+   * @param secretId - UUID of the secret to revoke access from.
+   */
+  async revokeCredentialAccess(secretId: string): Promise<void> {
+    await this._inkbox._vaultResource.revokeAccess(secretId, this.id);
+    this._credentials = null;
+  }
+
+  // ------------------------------------------------------------------
+  // Vault secret management
+  // ------------------------------------------------------------------
+
+  /**
+   * Create a vault secret and grant this identity access to it.
+   *
+   * The vault must be unlocked first.
+   *
+   * @param options.name - Display name (max 255 characters).
+   * @param options.payload - The secret payload.
+   * @param options.description - Optional description.
+   * @returns {@link VaultSecret} metadata.
+   */
+  async createSecret(options: {
+    name: string;
+    payload: SecretPayload;
+    description?: string;
+  }): Promise<VaultSecret> {
+    this._requireVaultUnlocked();
+    const unlocked = this._inkbox._vaultResource._unlocked!;
+    const secret = await unlocked.createSecret(options);
+    await this._inkbox._vaultResource.grantAccess(secret.id, this.id);
+    this._credentials = null;
+    return secret;
+  }
+
+  /**
+   * Fetch and decrypt a vault secret this identity has access to.
+   *
+   * @param secretId - UUID of the secret.
+   */
+  async getSecret(secretId: string): Promise<DecryptedVaultSecret> {
+    this._requireVaultUnlocked();
+    return this._inkbox._vaultResource._unlocked!.getSecret(secretId);
+  }
+
+  /**
+   * Add or replace TOTP on a login secret this identity has access to.
+   *
+   * @param secretId - UUID of the login secret.
+   * @param totp - A {@link TOTPConfig} or an `otpauth://totp/...` URI string.
+   * @returns Updated {@link VaultSecret} metadata.
+   */
+  async setTotp(secretId: string, totp: TOTPConfig | string): Promise<VaultSecret> {
+    this._requireVaultUnlocked();
+    const result = await this._inkbox._vaultResource._unlocked!.setTotp(secretId, totp);
+    this._credentials = null;
+    return result;
+  }
+
+  /**
+   * Remove TOTP from a login secret this identity has access to.
+   *
+   * @param secretId - UUID of the login secret.
+   * @returns Updated {@link VaultSecret} metadata.
+   */
+  async removeTotp(secretId: string): Promise<VaultSecret> {
+    this._requireVaultUnlocked();
+    const result = await this._inkbox._vaultResource._unlocked!.removeTotp(secretId);
+    this._credentials = null;
+    return result;
+  }
+
+  /**
+   * Generate the current TOTP code for a login secret.
+   *
+   * Uses cached credentials if available, otherwise fetches fresh.
+   *
+   * @param secretId - UUID of the login secret.
+   * @returns A {@link TOTPCode}.
+   */
+  async getTotpCode(secretId: string): Promise<TOTPCode> {
+    this._requireVaultUnlocked();
+    return this._inkbox._vaultResource._unlocked!.getTotpCode(secretId);
+  }
+
+  /**
+   * Delete a vault secret.
+   *
+   * @param secretId - UUID of the secret to delete.
+   */
+  async deleteSecret(secretId: string): Promise<void> {
+    this._requireVaultUnlocked();
+    await this._inkbox._vaultResource._unlocked!.deleteSecret(secretId);
+    this._credentials = null;
+  }
+
+  // ------------------------------------------------------------------
+  // Channel management
+  // ------------------------------------------------------------------
+
+  /**
+   * Provision a new phone number and link it to this identity.
+   *
+   * @param options.type - Number type to provision. Only `"local"` is supported. Defaults to `"local"`.
+   * @param options.state - US state abbreviation (e.g. `"NY"`) to request a number in that state.
+   * @returns The newly provisioned and linked {@link IdentityPhoneNumber}.
+   */
+  async provisionPhoneNumber(
+    options: { type?: string; state?: string } = {},
+  ): Promise<IdentityPhoneNumber> {
+    await this._inkbox._numbers.provision({ agentHandle: this.agentHandle, ...options });
+    const data = await this._inkbox._idsResource.get(this.agentHandle);
+    this._phoneNumber = data.phoneNumber;
+    this._data        = data;
+    return this._phoneNumber!;
+  }
+
+  /**
+   * Release this identity's phone number (vendor + local).
+   */
+  async releasePhoneNumber(): Promise<void> {
+    this._requirePhone();
+    await this._inkbox._idsResource.releasePhoneNumber(this.agentHandle);
+    this._phoneNumber = null;
+  }
+
+  // ------------------------------------------------------------------
+  // Mail helpers
+  // ------------------------------------------------------------------
+
+  /**
+   * Send an email from this identity's mailbox.
+   *
+   * @param options.to - Primary recipient addresses (at least one required).
+   * @param options.subject - Email subject line.
+   * @param options.bodyText - Plain-text body.
+   * @param options.bodyHtml - HTML body.
+   * @param options.cc - Carbon-copy recipients.
+   * @param options.bcc - Blind carbon-copy recipients.
+   * @param options.inReplyToMessageId - RFC 5322 Message-ID to thread a reply.
+   * @param options.attachments - File attachments.
+   *
+   * @throws {@link StorageLimitExceededError} 402 — the mailbox is at its
+   *   plan's storage cap. Delete messages/threads to free space (reclaim is
+   *   immediate), or upgrade the plan.
+   *
+   * On the **Free plan** a footer is appended to the *stored* body, so the
+   * body read back from the API is not byte-for-byte what you sent.
+   */
+  async sendEmail(options: {
+    to: string[];
+    subject: string;
+    bodyText?: string;
+    bodyHtml?: string;
+    cc?: string[];
+    bcc?: string[];
+    inReplyToMessageId?: string;
+    /** `contentId` on an entry renders it inline in the HTML body (`cid:<contentId>`); requires `bodyHtml` + `image/*`. */
+    attachments?: MailAttachmentInput[];
+    /** Embed an open-tracking pixel when `bodyHtml` is present; opens surface as `firstOpenedAt`/`openCount`. */
+    trackOpens?: boolean;
+    /**
+     * Reuse this key and input across calls to replay the original response.
+     * Omitted keys are generated per call and preserved during bounded retries.
+     */
+    idempotencyKey?: string;
+  }): Promise<Message> {
+    this._requireMailbox();
+    return this._inkbox._messages.send(this._mailbox!.emailAddress, options);
+  }
+
+  /**
+   * Reply to everyone on a stored message from this identity's mailbox.
+   *
+   * @param messageId - UUID of the message being replied to.
+   * @param options.subject - Optional subject override.
+   * @param options.bodyText - Plain-text reply body.
+   * @param options.bodyHtml - HTML reply body.
+   * @param options.attachments - File attachments.
+   * @param options.replyTo - Optional Reply-To address.
+   *
+   * @throws {@link StorageLimitExceededError} 402 — the mailbox is at its
+   *   plan's storage cap (see {@link AgentIdentity.sendEmail}).
+   */
+  async replyAllEmail(
+    messageId: string,
+    options: {
+      subject?: string;
+      bodyText?: string;
+      bodyHtml?: string;
+      /** `contentId` on an entry renders it inline in the HTML body (`cid:<contentId>`); requires `bodyHtml` + `image/*`. */
+      attachments?: MailAttachmentInput[];
+      replyTo?: string;
+      /** Makes this reply safe to retry — see {@link AgentIdentity.sendEmail}. */
+      idempotencyKey?: string;
+    } = {},
+  ): Promise<Message> {
+    this._requireMailbox();
+    return this._inkbox._messages.replyAll(
+      this._mailbox!.emailAddress,
+      messageId,
+      options,
+    );
+  }
+
+  /**
+   * Forward a stored message out from this identity's mailbox.
+   *
+   * @param messageId - UUID of the message being forwarded.
+   * @param options.to - Primary recipient addresses.
+   * @param options.cc - Carbon-copy recipients.
+   * @param options.bcc - Blind carbon-copy recipients. At least one address
+   *   is required across `to`, `cc`, and `bcc`.
+   * @param options.mode - `"inline"` (default) or `"wrapped"`.
+   * @param options.subject - Optional override; defaults to
+   *   `"Fwd: " + original.subject`.
+   * @param options.bodyText - Optional caller note prepended above the
+   *   original body (inline) or as a top-level note (wrapped).
+   * @param options.bodyHtml - Optional HTML caller note.
+   * @param options.additionalAttachments - Optional caller-authored
+   *   attachments alongside the forwarded content.
+   * @param options.includeOriginalAttachments - `inline` mode only. When
+   *   `true` (default), original attachments are re-attached. Ignored in
+   *   `wrapped` mode.
+   * @param options.replyTo - Optional Reply-To address.
+   *
+   * @throws {@link StorageLimitExceededError} 402 — the mailbox is at its
+   *   plan's storage cap (see {@link AgentIdentity.sendEmail}).
+   */
+  async forwardEmail(
+    messageId: string,
+    options: {
+      to?: string[];
+      cc?: string[];
+      bcc?: string[];
+      mode?: ForwardMode | "inline" | "wrapped";
+      subject?: string;
+      bodyText?: string;
+      bodyHtml?: string;
+      additionalAttachments?: Array<{
+        filename: string;
+        contentType: string;
+        contentBase64: string;
+      }>;
+      includeOriginalAttachments?: boolean;
+      replyTo?: string;
+      /** Embed an open-tracking pixel (requires an HTML part on the forward). */
+      trackOpens?: boolean;
+      /** Makes this forward safe to retry — see {@link AgentIdentity.sendEmail}. */
+      idempotencyKey?: string;
+    },
+  ): Promise<Message> {
+    this._requireMailbox();
+    return this._inkbox._messages.forward(
+      this._mailbox!.emailAddress,
+      messageId,
+      options,
+    );
+  }
+
+  /** Iterate over this identity's email drafts, newest first. */
+  iterEmailDrafts(options?: { pageSize?: number }): AsyncGenerator<DraftSummary> {
+    this._requireMailbox();
+    return this._inkbox._drafts.list(this._mailbox!.emailAddress, options);
+  }
+
+  /** Create an email draft in this identity's mailbox. */
+  async createEmailDraft(options: CreateDraftOptions = {}): Promise<DraftDetail> {
+    this._requireMailbox();
+    return this._inkbox._drafts.create(this._mailbox!.emailAddress, options);
+  }
+
+  /** Get one email draft. */
+  async getEmailDraft(draftId: string): Promise<DraftDetail> {
+    this._requireMailbox();
+    return this._inkbox._drafts.get(this._mailbox!.emailAddress, draftId);
+  }
+
+  /** Update an email draft using its current generation. */
+  async updateEmailDraft(
+    draftId: string,
+    options: UpdateDraftOptions,
+  ): Promise<DraftDetail> {
+    this._requireMailbox();
+    return this._inkbox._drafts.update(this._mailbox!.emailAddress, draftId, options);
+  }
+
+  /** Duplicate an email draft using its current generation. */
+  async duplicateEmailDraft(draftId: string, generation: number): Promise<DraftDetail> {
+    this._requireMailbox();
+    return this._inkbox._drafts.duplicate(this._mailbox!.emailAddress, draftId, generation);
+  }
+
+  /** Delete an email draft using its current generation. */
+  async deleteEmailDraft(draftId: string, generation: number): Promise<void> {
+    this._requireMailbox();
+    await this._inkbox._drafts.delete(this._mailbox!.emailAddress, draftId, generation);
+  }
+
+  /** Send an email draft using its current generation. */
+  async sendEmailDraft(draftId: string, generation: number): Promise<Message> {
+    this._requireMailbox();
+    return this._inkbox._drafts.send(this._mailbox!.emailAddress, draftId, generation);
+  }
+
+  /**
+   * Iterate over emails in this identity's inbox, newest first.
+   *
+   * Pagination is handled automatically.
+   *
+   * @param options.pageSize - Messages fetched per API call (1–100). Defaults to 50.
+   * @param options.direction - Filter by `"inbound"` or `"outbound"`.
+   */
+  iterEmails(options: { pageSize?: number; direction?: MessageDirection; startDatetime?: string; endDatetime?: string; tz?: string } = {}): AsyncGenerator<Message> {
+    this._requireMailbox();
+    return this._inkbox._messages.list(this._mailbox!.emailAddress, options);
+  }
+
+  /**
+   * Iterate over unread emails in this identity's inbox, newest first.
+   *
+   * Fetches all messages and filters client-side. Pagination is handled automatically.
+   *
+   * @param options.pageSize - Messages fetched per API call (1–100). Defaults to 50.
+   * @param options.direction - Filter by `"inbound"` or `"outbound"`.
+   */
+  async *iterUnreadEmails(options: { pageSize?: number; direction?: MessageDirection; startDatetime?: string; endDatetime?: string; tz?: string } = {}): AsyncGenerator<Message> {
+    for await (const msg of this.iterEmails(options)) {
+      if (!msg.isRead) yield msg;
+    }
+  }
+
+  /**
+   * Mark a list of messages as read.
+   *
+   * @param messageIds - IDs of the messages to mark as read.
+   */
+  async markEmailsRead(messageIds: string[]): Promise<void> {
+    this._requireMailbox();
+    for (const id of messageIds) {
+      await this._inkbox._messages.markRead(this._mailbox!.emailAddress, id);
+    }
+  }
+
+  /**
+   * Mark a list of messages as unread.
+   *
+   * @param messageIds - IDs of the messages to mark as unread.
+   */
+  async markEmailsUnread(messageIds: string[]): Promise<void> {
+    this._requireMailbox();
+    for (const id of messageIds) {
+      await this._inkbox._messages.markUnread(this._mailbox!.emailAddress, id);
+    }
+  }
+
+  /**
+   * Get a single message with full body content.
+   *
+   * @param messageId - UUID of the message to fetch. Obtain via `msg.id`
+   *   on any {@link Message}.
+   */
+  async getMessage(messageId: string): Promise<MessageDetail> {
+    this._requireMailbox();
+    return this._inkbox._messages.get(this._mailbox!.emailAddress, messageId);
+  }
+
+  /**
+   * Get a thread with all its messages inlined (oldest-first).
+   *
+   * @param threadId - UUID of the thread to fetch. Obtain via `msg.threadId`
+   *   on any {@link Message}.
+   */
+  async getThread(threadId: string): Promise<ThreadDetail> {
+    this._requireMailbox();
+    return this._inkbox._threads.get(this._mailbox!.emailAddress, threadId);
+  }
+
+  // ------------------------------------------------------------------
+  // Phone helpers
+  // ------------------------------------------------------------------
+
+  /**
+   * Place an outbound call for this identity.
+   *
+   * For `dedicated_number` origination (the default) the call is placed
+   * from this identity's own phone number (requires one to be assigned).
+   * For either iMessage origination the call is scoped by this identity's id.
+   *
+   * @param options.toNumber - E.164 destination number.
+   * @param options.origination - Where the call originates. Defaults to
+   *   `dedicated_number`.
+   * @param options.clientWebsocketUrl - WebSocket URL (wss://) for audio bridging.
+   * @param options.mode - Who drives the call. Defaults to `client_websocket`.
+   * @param options.hostedAgentAuthorityMode - Voice AI authority override.
+   *   Omit to inherit this identity's saved Voice AI authority. Explicit
+   *   `contact_scoped` downscopes the call. Explicit `yolo` requires an admin
+   *   credential unless the saved authority is already `yolo`.
+   * @param options.voicemailDetection - Deprecated alias for `onVoicemail`
+   *   (`enabled` = `hang_up`, `disabled` = `ignore`).
+   * @param options.onVoicemail - What to do when voicemail answers. Omit for
+   *   the server default (`leave_message` for hosted-agent calls, `hang_up`
+   *   otherwise).
+   * @param options.voicemailMessage - What Voice AI says on the voicemail
+   *   (max 1000 characters); requires `onVoicemail=leave_message`.
+   * @param options.reason - Voice AI's task brief for the call.
+   *   Required with `mode=hosted_agent`, invalid otherwise (server 422).
+   */
+  async placeCall(options: {
+    toNumber: string;
+    origination?: CallOrigin;
+    clientWebsocketUrl?: string;
+    mode?: CallMode;
+    hostedAgentAuthorityMode?: HostedAgentAuthorityMode;
+    voicemailDetection?: VoicemailDetection;
+    onVoicemail?: OnVoicemail;
+    voicemailMessage?: string;
+    reason?: string;
+  }): Promise<PhoneCallWithRateLimit> {
+    const origination = options.origination ?? CallOrigin.DEDICATED_NUMBER;
+    if (origination === CallOrigin.DEDICATED_NUMBER) {
+      // Dedicated calls need this identity's own number as the sender.
+      this._requirePhone();
+      return this._inkbox._calls.place({
+        toNumber:            options.toNumber,
+        origination,
+        fromNumber:          this._phoneNumber!.number,
+        clientWebsocketUrl:  options.clientWebsocketUrl,
+        mode:                options.mode,
+        hostedAgentAuthorityMode: options.hostedAgentAuthorityMode,
+        voicemailDetection: options.voicemailDetection,
+        onVoicemail:         options.onVoicemail,
+        voicemailMessage:    options.voicemailMessage,
+        reason:              options.reason,
+      });
+    }
+    // iMessage-line calls scope by identity id; no from_number.
+    return this._inkbox._calls.place({
+      toNumber:            options.toNumber,
+      origination,
+      agentIdentityId:     this.id,
+      clientWebsocketUrl:  options.clientWebsocketUrl,
+      mode:                options.mode,
+      hostedAgentAuthorityMode: options.hostedAgentAuthorityMode,
+      voicemailDetection: options.voicemailDetection,
+      onVoicemail:         options.onVoicemail,
+      voicemailMessage:    options.voicemailMessage,
+      reason:              options.reason,
+    });
+  }
+
+  /**
+   * List calls for this identity, newest first.
+   *
+   * Identity-scoped credentials never see contact-rule-blocked rows
+   * regardless of `isBlocked` (server-side access policy).
+   *
+   * @param options.limit - Maximum number of results. Defaults to 50.
+   * @param options.offset - Pagination offset. Defaults to 0.
+   * @param options.isBlocked - Tri-state filter. `true` for only blocked,
+   *   `false` for only non-blocked, omit for all.
+   */
+  async listCalls(
+    options: { limit?: number; offset?: number; isBlocked?: boolean; startDatetime?: string; endDatetime?: string; tz?: string } = {},
+  ): Promise<PhoneCall[]> {
+    // Scope by identity id — no phone number required (a shared-only
+    // identity can still have calls).
+    return this._inkbox._calls.list({ agentIdentityId: this.id, ...options });
+  }
+
+  /**
+   * List transcript segments for a specific call.
+   *
+   * @param callId - ID of the call to fetch transcripts for.
+   */
+  async listTranscripts(callId: string): Promise<PhoneTranscript[]> {
+    return this._inkbox._calls.transcripts(callId);
+  }
+
+  /** List a page of Voice AI tool activity for a specific call. */
+  async listToolInvocations(
+    callId: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<HostedAgentToolInvocationPage> {
+    return this._inkbox._calls.toolInvocations(callId, options);
+  }
+
+  /**
+   * Hang up one of this identity's live calls, from outside the call.
+   *
+   * @param callId - ID of the call to hang up.
+   */
+  async hangupCall(callId: string): Promise<PhoneCall> {
+    return this._inkbox._calls.hangup(callId);
+  }
+
+  /** Get this identity's Inkbox Voice AI config. */
+  async getHostedAgentConfig(): Promise<HostedAgentConfig> {
+    return this._inkbox._hostedAgent.getConfig({ agentIdentityId: this.id });
+  }
+
+  /**
+   * Set this identity's Inkbox Voice AI config (full replace).
+   *
+   * Voice and instructions left undefined reset to their defaults. The
+   * deprecated `model` option remains accepted but is ignored.
+   *
+   * @param options.voice - Voice override; omit for the server default.
+   * @param options.model - Deprecated compatibility option; accepted but ignored.
+   * @param options.instructions - Per-identity steering prompt; omit for none.
+   */
+  async setHostedAgentConfig(options?: {
+    voice?: string;
+    /** @deprecated Accepted for compatibility but ignored. */
+    model?: string;
+    instructions?: string;
+  }): Promise<HostedAgentConfig> {
+    return this._inkbox._hostedAgent.setConfig({
+      voice: options?.voice,
+      model: options?.model,
+      instructions: options?.instructions,
+      agentIdentityId: this.id,
+    });
+  }
+
+  /**
+   * Set the saved Voice AI authority with an admin API key.
+   * Incoming calls use this value. Outbound calls inherit it when
+   * `hostedAgentAuthorityMode` is omitted.
+   */
+  async setHostedAgentAuthorityMode(options: {
+    authorityMode: HostedAgentAuthorityMode;
+  }): Promise<HostedAgentConfig> {
+    return this._inkbox._hostedAgent.setAuthorityMode({
+      agentIdentityId: this.id,
+      authorityMode: options.authorityMode,
+    });
+  }
+
+  /** Get this identity's inbound-call handling config. */
+  async getIncomingCallAction(): Promise<IncomingCallActionConfig> {
+    return this._inkbox._incomingCallAction.get({ agentIdentityId: this.id });
+  }
+
+  /** Set this identity's inbound-call handling config. */
+  async setIncomingCallAction(options: {
+    incomingCallAction: IncomingCallAction;
+    clientWebsocketUrl?: string;
+    incomingCallWebhookUrl?: string;
+    forwardingTargetType?: ForwardingTargetType | null;
+    forwardingPhoneNumber?: string | null;
+    forwardingSipUri?: string | null;
+  }): Promise<IncomingCallActionConfig> {
+    const request: {
+      incomingCallAction: IncomingCallAction;
+      agentIdentityId: string;
+      clientWebsocketUrl?: string;
+      incomingCallWebhookUrl?: string;
+      forwardingTargetType?: ForwardingTargetType | null;
+      forwardingPhoneNumber?: string | null;
+      forwardingSipUri?: string | null;
+    } = {
+      incomingCallAction: options.incomingCallAction,
+      agentIdentityId: this.id,
+      clientWebsocketUrl: options.clientWebsocketUrl,
+      incomingCallWebhookUrl: options.incomingCallWebhookUrl,
+    };
+    if (options.forwardingTargetType !== undefined) {
+      request.forwardingTargetType = options.forwardingTargetType;
+    }
+    if (options.forwardingPhoneNumber !== undefined) {
+      request.forwardingPhoneNumber = options.forwardingPhoneNumber;
+    }
+    if (options.forwardingSipUri !== undefined) {
+      request.forwardingSipUri = options.forwardingSipUri;
+    }
+    return this._inkbox._incomingCallAction.set(request);
+  }
+
+  // ------------------------------------------------------------------
+  // Text message helpers
+  // ------------------------------------------------------------------
+
+  /**
+   * Send an outbound SMS/MMS from this identity's phone number.
+   *
+   * The returned message is in `queued` state. The full outbound
+   * lifecycle (`text.sent` → `text.delivered` / `text.delivery_failed`
+   * / `text.delivery_unconfirmed`) arrives via any webhook
+   * subscription on the sender's identity whose `eventTypes`
+   * include those lifecycle events
+   * (`inkbox.webhooks.subscriptions.create({ agentIdentityId: this.id, url,
+   * eventTypes })`). See `TextWebhookEventType` and `TextWebhookPayload`
+   * for the typed receiver-side shapes.
+   *
+   * @param options.to - E.164 destination number, or numbers for a group send.
+   *   Mutually exclusive with `conversationId`.
+   * @param options.conversationId - Existing conversation UUID to reply into.
+   *   The server resolves it to that conversation's participants.
+   * @param options.text - Message body.
+   * @param options.mediaUrls - MMS media URLs.
+   *
+   * @throws {InkboxError} when this identity has no phone number.
+   * @throws {RecipientBlockedError} when the destination is blocked by an
+   *   outbound contact rule.
+   * @throws {InkboxAPIError} for other send failures.
+   */
+  async sendText(options: {
+    to?: string | string[] | null;
+    conversationId?: string | null;
+    text?: string | null;
+    mediaUrls?: string[] | null;
+    idempotencyKey?: string;
+  }): Promise<TextMessage> {
+    this._requirePhone();
+    return this._inkbox._texts.send(this._phoneNumber!.id, options);
+  }
+
+  /**
+   * List text messages for this identity's phone number.
+   *
+   * Identity-scoped credentials never see contact-rule-blocked rows
+   * regardless of `isBlocked` (server-side access policy).
+   *
+   * @param options.limit - Maximum number of results. Defaults to 50.
+   * @param options.offset - Pagination offset. Defaults to 0.
+   * @param options.isRead - Filter by read state.
+   * @param options.isBlocked - Tri-state filter. `true` for only blocked,
+   *   `false` for only non-blocked, omit for all.
+   */
+  async listTexts(
+    options?: {
+      limit?: number;
+      offset?: number;
+      isRead?: boolean;
+      isBlocked?: boolean;
+      startDatetime?: string;
+      endDatetime?: string;
+      tz?: string;
+    },
+  ): Promise<TextMessage[]> {
+    this._requirePhone();
+    return this._inkbox._texts.list(this._phoneNumber!.id, options);
+  }
+
+  /**
+   * Get a single text message by ID.
+   *
+   * @param textId - UUID of the text message to fetch.
+   */
+  async getText(textId: string): Promise<TextMessage> {
+    this._requirePhone();
+    return this._inkbox._texts.get(this._phoneNumber!.id, textId);
+  }
+
+  /**
+   * List text conversations.
+   *
+   * Identity-scoped credentials never see blocked rows in conversation
+   * summaries; admin/JWT can pass `isBlocked=false` to hide spam-only
+   * counterparties or `isBlocked=true` to narrow to conversations made
+   * up of blocked rows.
+   *
+   * @param options.limit - Maximum number of results. Defaults to 50.
+   * @param options.offset - Pagination offset. Defaults to 0.
+   * @param options.isBlocked - Tri-state filter. `true` for only blocked,
+   *   `false` for only non-blocked, omit for all.
+   * @param options.includeGroups - Include group conversations. Defaults to
+   *   false so old clients continue to see one-to-one rows only.
+   */
+  async listTextConversations(
+    options?: {
+      limit?: number;
+      offset?: number;
+      isBlocked?: boolean;
+      includeGroups?: boolean;
+      startDatetime?: string;
+      endDatetime?: string;
+      tz?: string;
+    },
+  ): Promise<TextConversationSummary[]> {
+    this._requirePhone();
+    return this._inkbox._texts.listConversations(this._phoneNumber!.id, options);
+  }
+
+  /**
+   * Get all messages in a conversation.
+   *
+   * @param conversationKey - E.164 one-to-one remote number, or conversation UUID.
+   * @param options.limit - Maximum number of results. Defaults to 50.
+   * @param options.offset - Pagination offset. Defaults to 0.
+   */
+  async getTextConversation(
+    conversationKey: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<TextMessage[]> {
+    this._requirePhone();
+    return this._inkbox._texts.getConversation(
+      this._phoneNumber!.id,
+      conversationKey,
+      options,
+    );
+  }
+
+  /**
+   * Mark a single text message as read.
+   *
+   * @param textId - UUID of the text message.
+   */
+  async markTextRead(textId: string): Promise<TextMessage> {
+    this._requirePhone();
+    return this._inkbox._texts.update(this._phoneNumber!.id, textId, {
+      isRead: true,
+    });
+  }
+
+  /**
+   * Mark all messages in a conversation as read.
+   *
+   * @param conversationKey - E.164 one-to-one remote number, or conversation UUID.
+   * @returns Object with `conversationId`, `remotePhoneNumber`, `isRead`, and `updatedCount`.
+   */
+  async markTextConversationRead(
+    conversationKey: string,
+  ): Promise<TextConversationUpdateResult> {
+    this._requirePhone();
+    return this._inkbox._texts.updateConversation(
+      this._phoneNumber!.id,
+      conversationKey,
+      { isRead: true },
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // iMessage helpers
+  // ------------------------------------------------------------------
+
+  async getIMessage(messageId: string): Promise<IMessage> {
+    this._requireIMessage();
+    return this._inkbox._imessages.get(messageId, { agentIdentityId: this.id });
+  }
+
+  /** Read a chronological thread page using any message belonging to this identity. */
+  async getIMessageThread(messageId: string, options?: { limit?: number; cursor?: string }): Promise<IMessageThread> {
+    this._requireIMessage();
+    return this._inkbox._imessages.getThread(messageId, { ...options, agentIdentityId: this.id });
+  }
+
+  /** Read a thread by its opaque ID within this identity's conversation. */
+  async getIMessageConversationThread(conversationId: string, threadId: string, options?: {
+    limit?: number; cursor?: string;
+  }): Promise<IMessageThread> {
+    this._requireIMessage();
+    return this._inkbox._imessages.getConversationThread(conversationId, threadId, {
+      ...options, agentIdentityId: this.id,
+    });
+  }
+
+  /**
+   * Send an outbound iMessage as this identity.
+   *
+   * Shared service requires the recipient to connect first. A dedicated
+   * iMessage line may initiate a conversation, subject
+   * to server-side consent and rate limits. Inbound replies and reactions arrive via
+   * identity-owned webhook subscriptions
+   * (`inkbox.webhooks.subscriptions.create({ agentIdentityId, url,
+   * eventTypes: ["imessage.received", ...] })`).
+   *
+   * @param options.to - One E.164 recipient or 1–8 distinct recipients. Two
+   *   or more recipients select or create a dedicated-line group.
+   *   Mutually exclusive with `conversationId`.
+   * @param options.conversationId - Existing conversation UUID to reply into.
+   * @param options.replyToMessageId - Message to reply to in that conversation. Requires
+   *   `conversationId` and cannot be combined with `to`.
+   * @param options.plainReplyFallback - Allow an ordinary message in the same
+   *   conversation when native threading is unsupported (default true). False
+   *   requires a native reply. Ignored without `replyToMessageId`.
+   * @param options.text - Message body.
+   * @param options.mediaUrls - Media URLs (at most one). Use
+   *   {@link uploadIMessageMedia} to create one from bytes.
+   * @param options.sendStyle - Optional expressive send style. The same
+   *   `IMessageSendStyle` values work for one-to-one sends, new groups, and
+   *   replies by group `conversationId`, including sends with one media URL.
+   *
+   * @throws {InkboxError} when this identity is not iMessage-enabled.
+   * @throws {InkboxAPIError} 403 when the recipient is blocked by a
+   *   contact rule; other send failures.
+   */
+  async sendIMessage(options: {
+    to?: string | string[] | null;
+    conversationId?: string | null;
+    replyToMessageId?: string | null;
+    plainReplyFallback?: boolean;
+    text?: string | null;
+    mediaUrls?: string[] | null;
+    sendStyle?: IMessageSendStyle | string | null;
+    idempotencyKey?: string;
+  }): Promise<IMessage> {
+    this._requireIMessage();
+    return this._inkbox._imessages.send({
+      ...options,
+      agentIdentityId: this.id,
+    });
+  }
+
+  /**
+   * List this identity's iMessages, newest first.
+   *
+   * Identity-scoped credentials never see contact-rule-blocked rows
+   * regardless of `isBlocked` (server-side access policy).
+   *
+   * @param options.conversationId - Narrow to one conversation.
+   * @param options.threadId - Narrow to a thread; requires `conversationId`.
+   * @param options.limit - Maximum number of results. Defaults to 50.
+   * @param options.offset - Pagination offset. Defaults to 0.
+   * @param options.isRead - Filter by read state.
+   * @param options.isBlocked - Tri-state filter. `true` for only blocked,
+   *   `false` for only non-blocked, omit for all.
+   */
+  async listIMessages(
+    options?: {
+      conversationId?: string;
+      threadId?: string;
+      limit?: number;
+      offset?: number;
+      isRead?: boolean;
+      isBlocked?: boolean;
+      includeGroups?: boolean;
+      startDatetime?: string;
+      endDatetime?: string;
+      tz?: string;
+    },
+  ): Promise<IMessage[]> {
+    this._requireIMessage();
+    return this._inkbox._imessages.list({
+      ...options,
+      agentIdentityId: this.id,
+    });
+  }
+
+  /**
+   * List recipients actively connected to this identity, newest first.
+   *
+   * @param options.limit - Maximum number of results. Defaults to 50.
+   * @param options.offset - Pagination offset. Defaults to 0.
+   */
+  async listIMessageAssignments(
+    options?: { limit?: number; offset?: number },
+  ): Promise<IMessageAssignment[]> {
+    this._requireIMessage();
+    return this._inkbox._imessages.listAssignments({
+      ...options,
+      agentIdentityId: this.id,
+    });
+  }
+
+  /**
+   * Disconnect a recipient from this identity.
+   *
+   * Requires an admin API key; identity-scoped keys are rejected. Inbound
+   * from them stops routing here and the shared line can be reassigned.
+   * They are not notified and can reconnect by texting the triage number
+   * again.
+   *
+   * @param assignmentId - UUID of the connection, from `listIMessageAssignments`.
+   */
+  async releaseIMessageAssignment(assignmentId: string): Promise<void> {
+    this._requireIMessage();
+    await this._inkbox._imessages.releaseAssignment(assignmentId);
+  }
+
+  /**
+   * List this identity's iMessage conversations.
+   *
+   * @param options.limit - Maximum number of results. Defaults to 50.
+   * @param options.offset - Pagination offset. Defaults to 0.
+   * @param options.isBlocked - Tri-state filter applied to the
+   *   underlying messages. `true` for only blocked, `false` for only
+   *   non-blocked, omit for all.
+   */
+  async listIMessageConversations(
+    options?: {
+      limit?: number;
+      offset?: number;
+      isBlocked?: boolean;
+      includeGroups?: boolean;
+      startDatetime?: string;
+      endDatetime?: string;
+      tz?: string;
+    },
+  ): Promise<IMessageConversationSummary[]> {
+    this._requireIMessage();
+    return this._inkbox._imessages.listConversations({
+      ...options,
+      agentIdentityId: this.id,
+    });
+  }
+
+  /**
+   * Get one of this identity's iMessage conversations by ID.
+   *
+   * @param conversationId - UUID of the conversation.
+   */
+  async getIMessageConversation(
+    conversationId: string,
+  ): Promise<IMessageConversation> {
+    this._requireIMessage();
+    return this._inkbox._imessages.getConversation(conversationId, {
+      agentIdentityId: this.id,
+    });
+  }
+
+  /**
+   * React to an inbound one-to-one or group message owned by this identity.
+   *
+   * @param options.messageId - UUID of the message being reacted to.
+   * @param options.reaction - Tapback kind (see {@link IMessageReactionType}).
+   * @param options.partIndex - Part of a multi-part message to react to.
+   *   Defaults to 0.
+   */
+  async sendIMessageReaction(options: {
+    messageId: string;
+    reaction: IMessageReactionType | string;
+    partIndex?: number;
+  }): Promise<IMessageReaction> {
+    this._requireIMessage();
+    return this._inkbox._imessages.sendReaction(options);
+  }
+
+  /**
+   * Take back a tapback this identity sent.
+   *
+   * Only the sender can remove a tapback, so one the other party sent is
+   * rejected. A tapback Inkbox already shows as gone succeeds without contacting
+   * the messaging network, and a failed removal leaves it in place rather than
+   * clearing it locally, so the call can be retried.
+   *
+   * @param reactionId - UUID of the reaction to take back.
+   */
+  async removeIMessageReaction(reactionId: string): Promise<void> {
+    this._requireIMessage();
+    await this._inkbox._imessages.removeReaction(reactionId);
+  }
+
+  /**
+   * Send a one-to-one read receipt and mark inbound messages read.
+   * Group conversations return 409.
+   *
+   * @param conversationId - UUID of the conversation.
+   * @returns Object with `conversationId` and `updatedCount`.
+   */
+  async markIMessageConversationRead(
+    conversationId: string,
+  ): Promise<IMessageMarkReadResult> {
+    this._requireIMessage();
+    return this._inkbox._imessages.markConversationRead(conversationId);
+  }
+
+  /**
+   * Show a typing indicator to a one-to-one recipient.
+   * Group conversations return 409.
+   *
+   * @param conversationId - UUID of the conversation.
+   */
+  async sendIMessageTyping(conversationId: string): Promise<void> {
+    this._requireIMessage();
+    await this._inkbox._imessages.sendTyping(conversationId);
+  }
+
+  /**
+   * Upload media and get back a URL usable in `mediaUrls`.
+   *
+   * @param options.content - Raw file bytes (max 10 MiB).
+   * @param options.filename - Original filename, used for type inference.
+   * @param options.contentType - Optional MIME type.
+   */
+  async uploadIMessageMedia(options: {
+    content: Uint8Array | Blob;
+    filename: string;
+    contentType?: string;
+  }): Promise<IMessageMediaUpload> {
+    this._requireIMessage();
+    return this._inkbox._imessages.uploadMedia(options);
+  }
+
+  // ------------------------------------------------------------------
+  // Mail contact rules
+  // ------------------------------------------------------------------
+
+  /** List this identity's mail allow/block rules, newest first. */
+  async listMailContactRules(
+    options: ListMailIdentityContactRulesOptions = {},
+  ): Promise<MailIdentityContactRule[]> {
+    return this._inkbox._mailIdentityContactRules.list(this.agentHandle, options);
+  }
+
+  /** Get one of this identity's mail contact rules by id. */
+  async getMailContactRule(ruleId: string): Promise<MailIdentityContactRule> {
+    return this._inkbox._mailIdentityContactRules.get(this.agentHandle, ruleId);
+  }
+
+  /** Create a mail allow/block rule for this identity. */
+  async createMailContactRule(
+    options: CreateMailIdentityContactRuleOptions,
+  ): Promise<MailIdentityContactRule> {
+    return this._inkbox._mailIdentityContactRules.create(this.agentHandle, options);
+  }
+
+  /** Update a mail rule's `action` (admin-only). */
+  async updateMailContactRule(
+    ruleId: string,
+    options: UpdateMailIdentityContactRuleOptions,
+  ): Promise<MailIdentityContactRule> {
+    return this._inkbox._mailIdentityContactRules.update(this.agentHandle, ruleId, options);
+  }
+
+  /** Delete one of this identity's mail contact rules (admin-only). */
+  async deleteMailContactRule(ruleId: string): Promise<void> {
+    await this._inkbox._mailIdentityContactRules.delete(this.agentHandle, ruleId);
+  }
+
+  // ------------------------------------------------------------------
+  // Phone contact rules
+  // ------------------------------------------------------------------
+
+  /**
+   * List this identity's phone allow/block rules, newest first.
+   *
+   * Rules also apply to iMessage and do not require a dedicated phone number.
+   */
+  async listPhoneContactRules(
+    options: ListPhoneIdentityContactRulesOptions = {},
+  ): Promise<PhoneIdentityContactRule[]> {
+    return this._inkbox._phoneIdentityContactRules.list(this.agentHandle, options);
+  }
+
+  /** Get one of this identity's phone contact rules by id. */
+  async getPhoneContactRule(ruleId: string): Promise<PhoneIdentityContactRule> {
+    return this._inkbox._phoneIdentityContactRules.get(this.agentHandle, ruleId);
+  }
+
+  /**
+   * Create a phone allow/block rule for this identity.
+   *
+   * Requires admin credentials; channel provisioning is not required.
+   */
+  async createPhoneContactRule(
+    options: CreatePhoneIdentityContactRuleOptions,
+  ): Promise<PhoneIdentityContactRule> {
+    return this._inkbox._phoneIdentityContactRules.create(this.agentHandle, options);
+  }
+
+  /** Update a phone rule's `action` (admin-only). */
+  async updatePhoneContactRule(
+    ruleId: string,
+    options: UpdatePhoneIdentityContactRuleOptions,
+  ): Promise<PhoneIdentityContactRule> {
+    return this._inkbox._phoneIdentityContactRules.update(this.agentHandle, ruleId, options);
+  }
+
+  /** Delete one of this identity's phone contact rules (admin-only). */
+  async deletePhoneContactRule(ruleId: string): Promise<void> {
+    await this._inkbox._phoneIdentityContactRules.delete(this.agentHandle, ruleId);
+  }
+
+  /** List this identity's permission-filtered contact views. */
+  async listContactCommunicationPolicies(
+    options: { limit?: number; offset?: number } = {},
+  ): Promise<ContactCommunicationPolicyPage> {
+    return this._inkbox.contacts.communicationPolicy.listForIdentity(this.agentHandle, options);
+  }
+
+  // ------------------------------------------------------------------
+  // Signing key
+  // ------------------------------------------------------------------
+
+  /** Report whether this identity has a webhook signing key. */
+  async getSigningKeyStatus(): Promise<SigningKeyStatus> {
+    return this._inkbox._signingKeys.getStatus(this.agentHandle);
+  }
+
+  /**
+   * Create or rotate this identity's webhook signing key.
+   *
+   * The plaintext `signingKey` is returned **once** — store it securely,
+   * it cannot be retrieved again.
+   */
+  async createSigningKey(): Promise<SigningKey> {
+    return this._inkbox._signingKeys.createOrRotate(this.agentHandle);
+  }
+
+  // ------------------------------------------------------------------
+  // Identity management
+  // ------------------------------------------------------------------
+
+  /**
+   * Update this identity's display name, description, iMessage
+   * reachability, and/or contact-rule filter modes.
+   *
+   * Only provided fields are applied; omitted fields are left unchanged.
+   * For `displayName` and `description`, explicit `null` clears the column;
+   * omitting the key leaves it untouched.
+   *
+   * @param options.displayName - New display name, or `null` to clear.
+   * @param options.description - New description, or `null` to clear.
+   * @param options.imessageEnabled - Toggle identity-level iMessage reachability.
+   * @param options.contactSharingEnabled - Toggle automatic name and optional
+   *   photo sharing for an attached dedicated iMessage line.
+   * @param options.imessageNumberId - Attach an already-owned dedicated line,
+   *   or pass `null` to return to shared service.
+   * @param options.claimIMessageNumber - Claim and atomically attach or swap to
+   *   a new dedicated iMessage line.
+   * @param options.idempotencyKey - Stable caller-generated key required with
+   *   `claimIMessageNumber`; reuse it for an ambiguous retry.
+   * @param options.imessageFilterMode - `"whitelist"` or `"blacklist"`
+   *   for iMessage contact rules (admin-only).
+   * @param options.mailFilterMode - `"whitelist"` or `"blacklist"` for this
+   *   identity's mail contact rules (admin-only). Unlike the deprecated
+   *   `mailboxes.update({ filterMode })`, this does not return a
+   *   `FilterModeChangeNotice`.
+   * @param options.phoneFilterMode - `"whitelist"` or `"blacklist"` for this
+   *   identity's phone contact rules (admin-only). Rejected with a 422 when
+   *   the identity has no phone number.
+   */
+  async update(options: UpdateIdentityOptions): Promise<void> {
+    const data = await this._inkbox._idsResource.update(this.agentHandle, options);
+    this._data = data;
+    this._mailbox = data.mailbox;
+    this._phoneNumber = data.phoneNumber;
+    this._imessageNumber = data.imessageNumber;
+    this._tunnel = data.tunnel;
+  }
+
+  /**
+   * Re-fetch this identity from the API and update cached channels.
+   *
+   * Also clears the credentials filter cache so the next call to
+   * {@link getCredentials} re-evaluates access rules.  (The cache is
+   * also automatically invalidated when the vault is re-unlocked.)
+   *
+   * @returns `this` for chaining.
+   */
+  async refresh(): Promise<AgentIdentity> {
+    const data             = await this._inkbox._idsResource.get(this.agentHandle);
+    this._data             = data;
+    this._mailbox          = data.mailbox;
+    this._phoneNumber      = data.phoneNumber;
+    this._imessageNumber   = data.imessageNumber;
+    this._tunnel           = data.tunnel;
+    this._credentials      = null;
+    return this;
+  }
+
+  /**
+   * Delete this identity.
+   *
+   * Cascades: flips the linked mailbox to `deleted`, force-finalizes the
+   * linked tunnel to `deleted`, revokes any identity-scoped API keys, and
+   * releases any linked phone number (vendor + local).
+   */
+  async delete(): Promise<void> {
+    await this._inkbox._idsResource.delete(this.agentHandle);
+  }
+
+  // ------------------------------------------------------------------
+  // A2A
+  // ------------------------------------------------------------------
+
+  /** Enable this identity's A2A receiver. */
+  a2aEnable(): Promise<A2ASettings> {
+    return this._inkbox._a2a.updateSettings(this.agentHandle, { enabled: true });
+  }
+
+  /** Disable this identity's A2A receiver. */
+  a2aDisable(): Promise<A2ASettings> {
+    return this._inkbox._a2a.updateSettings(this.agentHandle, { enabled: false });
+  }
+
+  /** Return this identity's A2A channel settings. */
+  a2aSettings(): Promise<A2ASettings> {
+    return this._inkbox._a2a.settings(this.agentHandle);
+  }
+
+  /** Set public directory visibility (admin-only). */
+  a2aSetPubliclyDiscoverable(enabled: boolean): Promise<A2ASettings> {
+    return this._inkbox._a2a.updateSettings(
+      this.agentHandle,
+      { publicly_discoverable: enabled },
+    );
+  }
+
+  /** Allow or deny A2A calls to publicly discoverable agents. */
+  a2aSetAllowPublicEgress(enabled: boolean): Promise<A2ASettings> {
+    return this._inkbox._a2a.updateSettings(
+      this.agentHandle,
+      { allow_public_egress: enabled },
+    );
+  }
+
+  /** Replace the skills advertised on this identity's Agent Card. */
+  a2aSetSkills(skills: A2ASkill[]): Promise<A2ASettings> {
+    return this._inkbox._a2a.updateSettings(this.agentHandle, { skills });
+  }
+
+  /** Restore the receiver's default advertised skills. */
+  a2aResetSkills(): Promise<A2ASettings> {
+    return this._inkbox._a2a.updateSettings(this.agentHandle, { skills: null });
+  }
+
+  /** Set A2A admission to whitelist or blacklist mode (admin-only). */
+  a2aSetFilterMode(filterMode: FilterMode): Promise<A2ASettings> {
+    return this._inkbox._a2a.updateSettings(
+      this.agentHandle,
+      { filter_mode: filterMode },
+    );
+  }
+
+  /** Return this identity's Agent Card preview. */
+  a2aCard(): Promise<Record<string, unknown>> {
+    return this._inkbox._a2a.card(this.agentHandle);
+  }
+
+  /** List the receiver-side A2A task inbox. */
+  a2aTasks(options: A2ATaskListOptions = {}): Promise<A2ATaskPage> {
+    return this._inkbox._a2a.tasks(this.agentHandle, options);
+  }
+
+  /** Drain every page in the receiver-side A2A inbox. */
+  iterA2ATasks(
+    options: Omit<A2ATaskListOptions, "cursor"> = {},
+  ): AsyncGenerator<A2ATask> {
+    return this._inkbox._a2a.iterTasks(this.agentHandle, options);
+  }
+
+  /** Get an A2A task with its message history. */
+  a2aTask(taskId: string): Promise<A2ATask> {
+    return this._inkbox._a2a.task(this.agentHandle, taskId);
+  }
+
+  /** List A2A tasks sent by this identity. */
+  a2aSentTasks(options: A2ASentTaskListOptions = {}): Promise<A2ATaskPage> {
+    return this._inkbox._a2a.sentTasks(this.agentHandle, options);
+  }
+
+  /** Drain every page of A2A tasks sent by this identity. */
+  iterA2ASentTasks(
+    options: Omit<A2ASentTaskListOptions, "cursor"> = {},
+  ): AsyncGenerator<A2ATask> {
+    return this._inkbox._a2a.iterSentTasks(this.agentHandle, options);
+  }
+
+  /** Get a full A2A task sent by this identity. */
+  a2aSentTask(taskId: string): Promise<A2ATask> {
+    return this._inkbox._a2a.sentTask(this.agentHandle, taskId);
+  }
+
+  /** List this identity's inbound and outbound A2A messages. */
+  a2aMessages(
+    options: A2AMessageListOptions = {},
+  ): Promise<A2AHistoryMessagePage> {
+    return this._inkbox._a2a.messages(this.agentHandle, options);
+  }
+
+  /** Drain every page of this identity's A2A message history. */
+  iterA2AMessages(
+    options: Omit<A2AMessageListOptions, "cursor"> = {},
+  ): AsyncGenerator<A2AHistoryMessage> {
+    return this._inkbox._a2a.iterMessages(this.agentHandle, options);
+  }
+
+  /** Reply to an inbound A2A task and choose its next state. */
+  a2aReply(
+    taskId: string,
+    options: {
+      intent: A2AReplyIntent;
+      text?: string;
+      parts?: Record<string, unknown>[];
+    },
+  ): Promise<A2ATask> {
+    return this._inkbox._a2a.reply(this.agentHandle, taskId, options);
+  }
+
+  /** List receiver-side A2A contexts. */
+  a2aContexts(options: A2AContextListOptions = {}): Promise<A2AContextPage> {
+    return this._inkbox._a2a.contexts(this.agentHandle, options);
+  }
+
+  /** Get a context this identity originally received and its tasks. */
+  a2aContext(contextId: string): Promise<A2AContext> {
+    return this._inkbox._a2a.context(this.agentHandle, contextId);
+  }
+
+  /** Rename a context shared with this identity. */
+  a2aUpdateContext(
+    contextId: string,
+    options: { name: string },
+  ): Promise<A2AContext> {
+    return this._inkbox._a2a.updateContext(
+      this.agentHandle,
+      contextId,
+      options,
+    );
+  }
+
+  /** List A2A contexts started by this identity. */
+  a2aSentContexts(
+    options: A2ASentContextListOptions = {},
+  ): Promise<A2AContextPage> {
+    return this._inkbox._a2a.sentContexts(this.agentHandle, options);
+  }
+
+  /** Get a context originally opened by this identity. */
+  a2aSentContext(contextId: string): Promise<A2AContext> {
+    return this._inkbox._a2a.sentContext(this.agentHandle, contextId);
+  }
+
+  /** List this identity's directional A2A contact rules. */
+  a2aContactRules(): Promise<A2AContactRule[]> {
+    return this._inkbox._a2a.contactRules(this.agentHandle);
+  }
+
+  /** Add a directional A2A contact rule (admin-only). */
+  a2aAddContactRule(options: {
+    handle: string;
+    action: A2ARuleAction;
+    direction?: A2ARuleDirection;
+  }): Promise<A2AContactRule> {
+    return this._inkbox._a2a.addContactRule(this.agentHandle, options);
+  }
+
+  /** Update a directional A2A contact rule (admin-only). */
+  a2aUpdateContactRule(
+    ruleId: string,
+    options: {
+      action?: A2ARuleAction;
+      direction?: A2ARuleDirection;
+    },
+  ): Promise<A2AContactRule> {
+    return this._inkbox._a2a.updateContactRule(
+      this.agentHandle,
+      ruleId,
+      options,
+    );
+  }
+
+  /** Delete a directional A2A contact rule (admin-only). */
+  a2aDeleteContactRule(ruleId: string): Promise<void> {
+    return this._inkbox._a2a.deleteContactRule(this.agentHandle, ruleId);
+  }
+
+  /**
+   * Create an A2A client bound to this claimed identity's agent-scoped key.
+   */
+  async a2aClient(): Promise<A2AClient> {
+    const principal = await this._inkbox.whoami();
+    if (
+      principal.authType !== "api_key"
+      || principal.authSubtype !== "api_key.agent_scoped.claimed"
+      || principal.scope !== `agent_identity:${this.id}`
+    ) {
+      throw new InkboxError(
+        "A2A calls require this claimed identity's agent-scoped API key",
+      );
+    }
+    return new A2AClient(
+      this._inkbox._apiKey,
+      this._inkbox._baseUrl,
+      { requestTimeoutMs: this._inkbox._timeoutMs, onResponse: this._inkbox._rootApiHttp.responseObserver },
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Internal guards
+  // ------------------------------------------------------------------
+
+  private _requireVaultUnlocked(): void {
+    if (this._inkbox._vaultResource._unlocked === null) {
+      throw new InkboxError(
+        "Vault must be unlocked before accessing credentials. Call inkbox.vault.unlock(vaultKey) first.",
+      );
+    }
+  }
+
+  private _requireMailbox(): void {
+    if (!this._mailbox) {
+      throw new InkboxError(
+        `Identity '${this.agentHandle}' has no mailbox — this should only be reachable on a deleted identity.`,
+      );
+    }
+  }
+
+  private _requirePhone(): void {
+    if (!this._phoneNumber) {
+      throw new InkboxError(
+        `Identity '${this.agentHandle}' has no phone number assigned. Call identity.provisionPhoneNumber() first, or pass phoneNumber to createIdentity().`,
+      );
+    }
+  }
+
+  private _requireIMessage(): void {
+    if (!this._data.imessageEnabled) {
+      throw new InkboxError(
+        `Identity '${this.agentHandle}' is not iMessage-enabled. Call identity.update({ imessageEnabled: true }) first, or pass imessageEnabled to createIdentity().`,
+      );
+    }
+  }
+
+}

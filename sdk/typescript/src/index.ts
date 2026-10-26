@@ -1,0 +1,547 @@
+export { Inkbox } from "./inkbox.js";
+export { VERSION } from "./version.js";
+export { AgentIdentity } from "./agent_identity.js";
+export { A2AClient, A2AProtocolError } from "./a2a/client.js";
+export {
+  A2AInvitationParseError,
+  A2AInvitationsResource,
+  extractA2AInvitationToken,
+} from "./a2a/invitations.js";
+export type {
+  A2AInvitation,
+  A2AInvitationAcceptResult,
+  A2AInvitationCreateOptions,
+  A2AInvitationCreateResult,
+  A2AInvitationEmailStatus,
+  A2AInvitationListOptions,
+  A2AInvitationPage,
+  A2AInvitationPreview,
+  A2AInvitationStatus,
+} from "./a2a/invitations.js";
+export type {
+  A2ACard,
+  A2ACaller,
+  A2AContactRule,
+  A2AContext,
+  A2AContextListOptions,
+  A2AContextPage,
+  A2ADirectoryItem,
+  A2ADirectoryListOptions,
+  A2ADirectoryPage,
+  A2ADirectoryVisibility,
+  A2AHistoryDirection,
+  A2AHistoryMessage,
+  A2AHistoryMessagePage,
+  A2AMessage,
+  A2AMessageListOptions,
+  A2AMessageRole,
+  A2AReplyIntent,
+  A2AResolvedTarget,
+  A2ARuleAction,
+  A2ARuleDirection,
+  A2ASendResult,
+  A2ASettings,
+  A2ASkill,
+  A2ATask,
+  A2ATaskListOptions,
+  A2ATaskPage,
+  A2ATaskState,
+  A2ASentTaskListOptions,
+  A2ASentContextListOptions,
+  A2ATarget,
+  A2AWireMessage,
+  A2AWireTask,
+  A2AWireTaskPage,
+  A2AWireTaskState,
+} from "./a2a/types.js";
+export { Credentials } from "./credentials.js";
+export type { InkboxOptions, SignupOptions } from "./inkbox.js";
+export type {
+  AgentSignupRequest,
+  AgentSignupInvitationSummary,
+  AgentSignupResponse,
+  AgentSignupVerifyRequest,
+  AgentSignupVerifyResponse,
+  AgentSignupResendResponse,
+  SignupRestrictions,
+  AgentSignupStatusResponse,
+} from "./agent_signup/types.js";
+export {
+  DuplicateContactRuleError,
+  DedicatedIMessageNumberInventoryPendingError,
+  DedicatedIMessageNumberQuotaExceededError,
+  IdempotencyKeyReusedError,
+  InkboxAPIError,
+  InkboxConnectionError,
+  InkboxError,
+  InkboxVaultKeyError,
+  MailImportQuotaExceededError,
+  MailImportUploadError,
+  RecipientBlockedError,
+  RedundantContactAccessGrantError,
+  StorageLimitExceededError,
+} from "./_http.js";
+export type { InkboxAPIErrorDetail } from "./_http.js";
+export type {
+  WhoamiApiKeyResponse,
+  WhoamiJwtResponse,
+  WhoamiResponse,
+} from "./whoami/types.js";
+export {
+  AUTH_SUBTYPE_API_KEY_ADMIN_SCOPED,
+  AUTH_SUBTYPE_API_KEY_AGENT_SCOPED_CLAIMED,
+  AUTH_SUBTYPE_API_KEY_AGENT_SCOPED_UNCLAIMED,
+} from "./whoami/types.js";
+export type { SigningKey, SigningKeyStatus } from "./signing_keys.js";
+export { verifyWebhook } from "./signing_keys.js";
+export type {
+  A2AWebhookCaller,
+  A2AWebhookData,
+  A2AWebhookEventType,
+  A2AWebhookPayload,
+  WebhookContact,
+  WebhookMailContact,
+  WebhookAgentIdentity,
+  WebhookMailAgentIdentity,
+  MailContactBucket,
+  MailWebhookPayload,
+  MailWebhookEventType,
+  MailWebhookMessage,
+  MessageStatus,
+  MessageDirectionWire,
+  TextWebhookPayload,
+  TextWebhookEventType,
+  TextWebhookMessage,
+  TextDirectionWire,
+  TextTypeWire,
+  SmsDeliveryStatusWire,
+  TextMessageOriginWire,
+  IMessageWebhookPayload,
+  IMessageWebhookEventType,
+  IMessageWebhookMessage,
+  IMessageWebhookReaction,
+  IMessageDirectionWire,
+  IMessageServiceWire,
+  IMessageTypeWire,
+  IMessageDeliveryStatusWire,
+  IMessageReactionTypeWire,
+  IMessageSendStyleWire,
+  IMessageMediaItemWire,
+  IMessageMessageReactionWire,
+  IMessageRecipientWire,
+  PhoneIncomingCallWebhookPayload,
+  CallStatusWire,
+  HangupReasonWire,
+  CallDirectionWire,
+  CallOriginWire,
+  CallLifecycleWebhookEventType,
+  CallModeWire,
+  HostedAgentAuthorityModeWire,
+  VoicemailDetectionWire,
+  OnVoicemailWire,
+  CallOutcomeWire,
+  WebhookPhoneCall,
+  WebhookPhoneCallConnection,
+  WebhookPhoneCallForwarding,
+  WebhookCallTranscript,
+  WebhookPostCallActionItem,
+  CallEndedWebhookData,
+  CallEndedWebhookPayload,
+  WebhookContext,
+  WebhookContextBlock,
+  WebhookContextMailItem,
+  WebhookContextTextItem,
+  WebhookContextCallItem,
+  WebhookTranscriptEntry,
+  WebhookContextScopeWire,
+  WebhookContextModeWire,
+  WebhookContextSkipReasonWire,
+  WebhookContextTextChannelWire,
+} from "./webhooks/types.js";
+export type {
+  WebhookSubscription,
+  WebhookSubscriptionCreateResponse,
+  WebhookSubscriptionStatus,
+  WebhookContextConfig,
+  WebhookContextClassConfig,
+  CreateWebhookSubscriptionOptions,
+  UpdateWebhookSubscriptionOptions,
+  ListWebhookSubscriptionsOptions,
+} from "./webhooks/subscriptions.js";
+export type { WebhookSubscriptionsResource } from "./webhooks/subscriptions.js";
+export type {
+  WebhookDelivery,
+  ListWebhookDeliveriesOptions,
+} from "./webhooks/deliveries.js";
+export type { WebhookDeliveriesResource } from "./webhooks/deliveries.js";
+// Snake_case wire shapes referenced by the webhook payload types above.
+// Re-exported from the root entry because package.json#exports only
+// publishes `"."` and `"./tunnels/connect"` — deep imports of
+// `phone/types.js` are not a valid public API.
+export type {
+  RawRateLimitInfo,
+  RawTextMediaItem,
+  RawTextMessageRecipient,
+} from "./phone/types.js";
+export {
+  ContactRuleStatus,
+  FilterMode,
+  DraftSendState,
+  ForwardMode,
+  MailRuleAction,
+  MailRuleMatchType,
+  MessageDirection,
+  MailImportFormat,
+  MailImportJobStatus,
+  SendingDomainStatus,
+  ThreadFolder,
+} from "./mail/types.js";
+export type {
+  Domain,
+  DraftAttachment,
+  DraftAttachmentContent,
+  DraftDetail,
+  DraftRecipients,
+  DraftSummary,
+  FilterModeChangeNotice,
+  Mailbox,
+  MailAttachmentInput,
+  MailImportCreateResult,
+  MailImportJob,
+  MailImportJobPage,
+  MailImportUploadTarget,
+  MailContactRule,
+  MailIdentityContactRule,
+  Message,
+  MessageDetail,
+  ReplyAllRecipients,
+  Thread,
+  ThreadDetail,
+} from "./mail/types.js";
+export type {
+  CreateDraftOptions,
+  UpdateDraftOptions,
+} from "./mail/resources/drafts.js";
+export { DraftsResource } from "./mail/resources/drafts.js";
+export type {
+  MailboxImportsResource,
+  CreateMailImportOptions,
+  ListMailImportsOptions,
+  UploadMailImportOptions,
+  WaitForMailImportOptions,
+} from "./mail/resources/imports.js";
+export type {
+  MailIdentityContactRulesResource,
+  CreateMailIdentityContactRuleOptions,
+  ListMailIdentityContactRulesOptions,
+  ListAllMailIdentityContactRulesOptions,
+  UpdateMailIdentityContactRuleOptions,
+} from "./mail/resources/identityContactRules.js";
+export {
+  CallMode,
+  CallOrigin,
+  HostedAgentAuthorityMode,
+  HostedAgentToolInvocationStatus,
+  IncomingCallAction,
+  ForwardingTargetType,
+  CallConnectionKind,
+  CallConnectionTrigger,
+  CallConnectionStatus,
+  CallForwardingTrigger,
+  CallForwardingStatus,
+  VoicemailDetection,
+  OnVoicemail,
+  PhoneRuleAction,
+  PhoneRuleMatchType,
+  SmsDeliveryStatus,
+  SmsOptInSource,
+  SmsOptInStatus,
+  SmsStatus,
+  TextMessageOrigin,
+} from "./phone/types.js";
+export type {
+  PhoneNumber,
+  PhoneCall,
+  PhoneCallConnection,
+  PhoneCallForwarding,
+  PhoneCallWithRateLimit,
+  PhoneContactRule,
+  PhoneIdentityContactRule,
+  IncomingCallActionConfig,
+  HostedAgentConfig,
+  HostedAgentVoiceOption,
+  HostedAgentVoiceCatalog,
+  HostedAgentToolInvocation,
+  HostedAgentToolInvocationPage,
+  HostedAgentToolResultValue,
+  PostCallActionItem,
+  RateLimitInfo,
+  PhoneTranscript,
+  SmsOptIn,
+  TextMediaItem,
+  TextMessage,
+  TextMessageRecipient,
+  TextConversationSummary,
+  TextConversationUpdateResult,
+} from "./phone/types.js";
+export type { IncomingCallActionResource } from "./phone/resources/incomingCallAction.js";
+export type { HostedAgentConfigResource } from "./phone/resources/hostedAgent.js";
+export type {
+  PhoneIdentityContactRulesResource,
+  CreatePhoneIdentityContactRuleOptions,
+  ListPhoneIdentityContactRulesOptions,
+  ListAllPhoneIdentityContactRulesOptions,
+  UpdatePhoneIdentityContactRuleOptions,
+} from "./phone/resources/identityContactRules.js";
+export {
+  IMessageAssignmentStatus,
+  IMessageNumberStatus,
+  IMessageDeliveryStatus,
+  IMessageGroupCreationStatus,
+  IMessageReactionType,
+  IMessageRuleAction,
+  IMessageRuleMatchType,
+  IMessageSendStyle,
+  IMessageService,
+} from "./imessage/types.js";
+export type {
+  IMessage,
+  IMessageThread,
+  IMessageAssignment,
+  IMessageContactRule,
+  IMessageConversation,
+  IMessageConversationSummary,
+  IMessageNumber,
+  IdentityIMessageNumber,
+  IMessageMarkReadResult,
+  IMessageMediaItem,
+  IMessageMediaUpload,
+  IMessageMessageReaction,
+  IMessageReaction,
+  IMessageRecipient,
+  IMessageTriageNumber,
+} from "./imessage/types.js";
+export type { IMessagesResource } from "./imessage/resources/imessages.js";
+export type {
+  IMessageContactRulesResource,
+  CreateIMessageContactRuleOptions,
+  ListIMessageContactRulesOptions,
+  ListAllIMessageContactRulesOptions,
+  UpdateIMessageContactRuleOptions,
+} from "./imessage/resources/contactRules.js";
+export type {
+  AgentIdentitySummary,
+  CreateIdentityOptions,
+  IdentityMailboxCreateOptions,
+  IdentityMailbox,
+  IdentityPhoneNumberCreateOptions,
+  IdentityPhoneNumber,
+  IdentityTunnelCreateOptions,
+  UpdateIdentityOptions,
+} from "./identities/types.js";
+export {
+  HandleUnavailableError,
+  type BlockingNamespace,
+} from "./identities/exceptions.js";
+export {
+  validateAgentHandle,
+  validateTunnelName,
+  normalizeAgentHandle,
+} from "./tunnels/_validation.js";
+export type {
+  Contact,
+  ContactAccess,
+  ContactAddress,
+  ContactBulkDeleteResult,
+  ContactBulkDeleteResultItem,
+  ContactBulkDeleteStatus,
+  ContactCustomField,
+  ContactSlackAccount,
+  ContactDate,
+  ContactEmail,
+  ContactImportResult,
+  ContactImportResultItem,
+  ContactImportStatus,
+  ContactMemorySummary,
+  ContactPhone,
+  ContactVCardExportResult,
+  ContactWebsite,
+  ContactCreationSource,
+  ContactReviewStatus,
+  ContactNameSource,
+  ContactFact,
+  ContactFactCitation,
+  ContactFactCitationAvailability,
+  ContactFactCitationDetail,
+  ContactFactDeleteResult,
+  ContactFactKind,
+  ContactFactOrigin,
+  CreateContactFactOptions,
+  ListContactFactsOptions,
+  UpdateContactFactOptions,
+  ContactCorrespondence,
+  ContactCorrespondenceOptions,
+  CorrespondenceAttachmentMetadata,
+  CorrespondenceChannel,
+  CorrespondenceChannelResult,
+  CorrespondenceChannelStatus,
+  CorrespondenceContentMode,
+  CorrespondenceDirection,
+  CorrespondenceItem,
+  CorrespondenceMediaMetadata,
+  CorrespondenceOrder,
+  CorrespondenceTranscriptEntry,
+  CorrespondenceTranscriptMode,
+  EmailCorrespondenceItem,
+  SmsCorrespondenceItem,
+  SlackCorrespondenceItem,
+  IMessageCorrespondenceItem,
+  CallCorrespondenceItem,
+  CreateContactOptions,
+  ContactCreatePermissions,
+  ContactCreateAddressPermissions,
+  CreateContactWithAddressPermissionsOptions,
+  GetContactCorrespondenceOptions,
+  ListContactsOptions,
+  LookupContactsOptions,
+  ContactMergeField,
+  MergeContactsOptions,
+  UpdateContactOptions,
+} from "./contacts/index.js";
+export * from "./contacts/resources/communicationPolicy.js";
+export * from "./contacts/resources/permissions.js";
+export * from "./contacts/resources/contactAccess.js";
+export type { Note, NoteAccess } from "./notes/types.js";
+export type {
+  CreateNoteOptions,
+  ListNotesOptions,
+  UpdateNoteOptions,
+} from "./notes/resources/notes.js";
+export type {
+  AccessRule,
+  VaultInfo,
+  VaultInitializeResult,
+  VaultKey,
+  VaultSecret,
+  VaultSecretDetail,
+  DecryptedVaultSecret,
+  LoginPayload,
+  OtherPayload,
+  SSHKeyPayload,
+  APIKeyPayload,
+  KeyPairPayload,
+  SecretPayload,
+} from "./vault/types.js";
+export { VaultSecretType, VaultKeyType } from "./vault/types.js";
+export type { TOTPConfig, TOTPCode } from "./vault/totp.js";
+export { TOTPAlgorithm, generateTotp, parseTotpUri } from "./vault/totp.js";
+export type { VaultKeyMaterial } from "./vault/crypto.js";
+export { UnlockedVault } from "./vault/resources/vault.js";
+export {
+  generateOrgEncryptionKey,
+  generateVaultKeyMaterial,
+  generateRecoveryCode,
+  vaultKeyMaterialToWire,
+} from "./vault/crypto.js";
+
+// API keys
+export type { ApiKey, ApiKeyStatus, CreatedApiKey } from "./api_keys/types.js";
+export type { CreateApiKeyOptions } from "./api_keys/resources/apiKeys.js";
+
+// Tunnels
+export { TLSMode, TunnelStatus } from "./tunnels/types.js";
+export type { SignedCert, Tunnel, TunnelSummary } from "./tunnels/types.js";
+export type { UpdateTunnelOptions } from "./tunnels/resources/tunnels.js";
+export {
+  TunnelCSRStateConflict,
+  TunnelError,
+  TunnelNameInvalid,
+  TunnelNotProvisioned,
+  TunnelRemoved,
+  TunnelStateConflict,
+  TunnelTLSModeMismatch,
+} from "./tunnels/exceptions.js";
+export type { RuleDirection } from "./contact_rules.js";
+export type { ResponseNotice, ResponseMetadata, ResponseObserver, APIResponse } from "./response_metadata.js";
+export * from "./companion.js";
+
+export type { SenderAccess } from "./sender_access.js";
+export { OrganizationDomainsResource } from "./organization_domains/resource.js";
+export type { DomainAffiliation, DomainClaimState, DomainTxtRecord, IdentityDomainAffiliation, OrganizationDomain, OrganizationDomainPage, SetDomainAffiliationOptions } from "./organization_domains/types.js";
+export type { A2APublicDirectoryListOptions } from "./a2a/types.js";
+export { MessageSendsResource, getMessageRequestKey, type MessageSendLookupOptions } from "./message_sends.js";
+
+
+export { SlackResource } from "./slack.js";
+export type {
+  SlackContactImportOptions, SlackContactImportResponse,
+  SlackMessageKind,
+  SlackConnection,
+  SlackConnectionsResponse,
+  SlackSetupStatus,
+  SlackProvisioningWorkspace,
+  SlackInstallation,
+  SlackAction,
+  SlackConversationsResponse,
+  SlackMessagesResponse,
+  SlackFile,
+  SlackSendMessageOptions,
+  SlackPageOptions,
+  SlackMessagesOptions,
+} from "./slack.js";
+export type {
+  SlackWebhookEventType,
+  SlackWebhookData,
+  SlackActorProfile,
+  SlackUserProfile,
+  SlackWebhookPayload,
+} from "./webhooks/types.js";
+
+export type {
+  SlackProcessingStatus,
+  SlackOperationKind,
+  SlackTaskStatus,
+  SlackTaskDisplayMode,
+  SlackTaskUpdate,
+  SlackPlanUpdate,
+  SlackTaskChunk,
+  SlackStreamStartOptions,
+  SlackStreamAppendOptions,
+  SlackStreamStopOptions,
+  SlackOperation,
+  SlackCapability,
+  SlackCapabilitiesResponse,
+  SlackUsersResponse,
+  SlackMembersResponse,
+  SlackPinsResponse,
+  SlackReactionsResponse,
+  SlackMessageContextResponse,
+  SlackPermalinkResponse,
+  SlackArchiveSettings,
+  SlackArchiveSettingsOptions,
+  SlackArchivedMessage,
+  SlackArchivePageBoundary,
+  SlackArchiveMessagesResponse,
+  SlackArchiveCoverage,
+  SlackArchiveCoverageResponse,
+  SlackArchiveMessagesOptions,
+  SlackArchiveSearchOptions,
+  SlackSearchMessagesOptions,
+  SlackUploadFileOptions,
+  SlackMutationOptions,
+} from "./slack-operations.js";
+
+export * from "./slack-rules.js";
+
+export type {
+  SlackArchiveInclude,
+  SlackArchiveIncluded,
+  SlackCachedActor,
+  SlackCachedConversation,
+  SlackCachedEmoji,
+  SlackCachedEmojiPage,
+  SlackCachedFile,
+  SlackCachedMediaKind,
+  SlackCachedReaction,
+  SlackCachedEmojiOptions,
+} from "./slack-cache.js";

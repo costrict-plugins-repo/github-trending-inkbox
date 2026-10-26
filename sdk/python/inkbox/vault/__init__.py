@@ -1,0 +1,67 @@
+"""
+inkbox.vault — encrypted vault types and exceptions.
+"""
+
+from inkbox.vault.types import (
+    AccessRule,
+    APIKeyPayload,
+    DecryptedVaultSecret,
+    KeyPairPayload,
+    LoginPayload,
+    OtherPayload,
+    SSHKeyPayload,
+    VaultInfo,
+    VaultInitializeResult,
+    VaultKey,
+    VaultKeyType,
+    VaultSecret,
+    VaultSecretDetail,
+    VaultSecretType,
+)
+from inkbox.vault.totp import (
+    TOTPAlgorithm,
+    TOTPCode,
+    TOTPConfig,
+    generate_totp,
+    parse_totp_uri,
+)
+from inkbox.vault.crypto import (
+    VaultKeyMaterial,
+    generate_org_encryption_key,
+    generate_recovery_code,
+    generate_vault_key_material,
+)
+from inkbox.vault.exceptions import InkboxVaultKeyError
+
+__all__ = [
+    # API response types
+    "AccessRule",
+    "VaultInfo",
+    "VaultKey",
+    "VaultSecret",
+    "VaultSecretDetail",
+    "DecryptedVaultSecret",
+    "VaultInitializeResult",
+    # Enums
+    "VaultSecretType",
+    "VaultKeyType",
+    # Structured payloads
+    "LoginPayload",
+    "SSHKeyPayload",
+    "APIKeyPayload",
+    "KeyPairPayload",
+    "OtherPayload",
+    # Key generation helpers
+    "VaultKeyMaterial",
+    "generate_org_encryption_key",
+    "generate_vault_key_material",
+    "generate_recovery_code",
+    # TOTP
+    "TOTPAlgorithm",
+    "TOTPCode",
+    "TOTPConfig",
+    "generate_totp",
+    "parse_totp_uri",
+    # Exceptions
+    "InkboxVaultKeyError",
+]

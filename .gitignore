@@ -1,0 +1,51 @@
+# .gitignore
+
+*PLAN.md
+
+*.npmrc
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+*.egg
+.eggs/
+
+# TypeScript / JavaScript
+node_modules/
+coverage/
+*.tsbuildinfo
+*.js.map
+*.ts.map
+
+# Lockfiles are tracked only for the published packages (the two SDKs +
+# the CLI). Ignore them in example apps and integration-test scaffolding.
+examples/**/package-lock.json
+examples/**/uv.lock
+tests/integration/**/package-lock.json
+
+# Python testing asnd linting
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

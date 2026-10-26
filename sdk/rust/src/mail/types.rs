@@ -1,0 +1,639 @@
+//! Structs/enums mirroring the Inkbox Mail API response models.
+//!
+//! Field names are already snake_case and match the wire JSON, so no rename is
+//! needed. Timestamps arrive as ISO-8601 strings and are kept as `String`
+//! (the Python parses them into `datetime`; we leave them as the raw wire
+//! value per the porting contract). Enum string values match the Python
+//! `StrEnum` `.value`s exactly.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
+
+/// Whether a message was received by or sent from a mailbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDirection {
+    /// Email received from an external sender.
+    Inbound,
+    /// Email sent by the mailbox.
+    Outbound,
+}
+
+/// Strategy for embedding the original message in a forward.
+///
+/// `Inline` renders the original body inline below a Gmail-style preamble; it
+/// may not perfectly preserve inline images or complex layouts. `Wrapped`
+/// attaches the original raw MIME as a single `message/rfc822` part —
+/// semantically preserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardMode {
+    Inline,
+    Wrapped,
+}
+
+/// Delivery state of a saved email draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftSendState {
+    Draft,
+    Sending,
+    Uncertain,
+}
+
+/// Contact-rule filter mode on a mailbox or phone number.
+///
+/// `Whitelist` delivers only contacts matching an `allow` rule; everything
+/// else is blocked. `Blacklist` delivers everything except contacts matching a
+/// `block` rule — this is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterMode {
+    Whitelist,
+    Blacklist,
+}
+
+/// Logical folder a thread lives in.
+///
+/// `Blocked` is server-assigned; clients cannot move a thread into `Blocked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadFolder {
+    Inbox,
+    Spam,
+    Blocked,
+    Archive,
+}
+
+/// Whether a matching address is allowed through or blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailRuleAction {
+    Allow,
+    Block,
+}
+
+/// What a mail contact rule matches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailRuleMatchType {
+    #[serde(rename = "exact_email")]
+    ExactEmail,
+    #[serde(rename = "domain")]
+    Domain,
+}
+
+/// Whether a contact rule is currently enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactRuleStatus {
+    Active,
+    Paused,
+}
+
+/// Lifecycle status of a custom sending domain.
+///
+/// Only `Verified` rows are usable for sending; the remaining states are
+/// transitional (`NotStarted`, `AwaitingOwnership`, `Pending`, `Verifying`),
+/// recoverable error states (`DnsInvalid`, `Degraded`), in-flight admin
+/// operations (`PendingDkimRotation`, `PendingDeletion`), or terminal
+/// (`Failed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendingDomainStatus {
+    NotStarted,
+    AwaitingOwnership,
+    Pending,
+    DnsInvalid,
+    Verifying,
+    Verified,
+    Failed,
+    PendingDkimRotation,
+    Degraded,
+    PendingDeletion,
+}
+
+/// Container format for a mailbox import upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailImportFormat {
+    Auto,
+    Mbox,
+    Eml,
+    Zip,
+}
+
+impl MailImportFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Mbox => "mbox",
+            Self::Eml => "eml",
+            Self::Zip => "zip",
+        }
+    }
+}
+
+/// Lifecycle status of a mailbox import job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailImportJobStatus {
+    PendingUpload,
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl MailImportJobStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+impl SendingDomainStatus {
+    /// The exact wire string for this status, used when building query params.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SendingDomainStatus::NotStarted => "not_started",
+            SendingDomainStatus::AwaitingOwnership => "awaiting_ownership",
+            SendingDomainStatus::Pending => "pending",
+            SendingDomainStatus::DnsInvalid => "dns_invalid",
+            SendingDomainStatus::Verifying => "verifying",
+            SendingDomainStatus::Verified => "verified",
+            SendingDomainStatus::Failed => "failed",
+            SendingDomainStatus::PendingDkimRotation => "pending_dkim_rotation",
+            SendingDomainStatus::Degraded => "degraded",
+            SendingDomainStatus::PendingDeletion => "pending_deletion",
+        }
+    }
+}
+
+impl MailRuleAction {
+    /// The exact wire string for this action, used when building query params.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MailRuleAction::Allow => "allow",
+            MailRuleAction::Block => "block",
+        }
+    }
+}
+
+impl MailRuleMatchType {
+    /// The exact wire string for this match type, used when building query
+    /// params.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MailRuleMatchType::ExactEmail => "exact_email",
+            MailRuleMatchType::Domain => "domain",
+        }
+    }
+}
+
+impl ContactRuleStatus {
+    /// The exact wire string for this status.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContactRuleStatus::Active => "active",
+            ContactRuleStatus::Paused => "paused",
+        }
+    }
+}
+
+impl FilterMode {
+    /// The exact wire string for this filter mode.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FilterMode::Whitelist => "whitelist",
+            FilterMode::Blacklist => "blacklist",
+        }
+    }
+}
+
+impl ThreadFolder {
+    /// The exact wire string for this folder.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThreadFolder::Inbox => "inbox",
+            ThreadFolder::Spam => "spam",
+            ThreadFolder::Blocked => "blocked",
+            ThreadFolder::Archive => "archive",
+        }
+    }
+}
+
+impl ForwardMode {
+    /// The exact wire string for this forward mode.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ForwardMode::Inline => "inline",
+            ForwardMode::Wrapped => "wrapped",
+        }
+    }
+}
+
+/// Summary returned on PATCH when `filter_mode` actually changed.
+///
+/// Reports how many existing active rules are now redundant under the new mode
+/// so the caller can prompt for cleanup. The blacklist <-> whitelist flip does
+/// not touch the contact-rules table — redundant rules still evaluate
+/// correctly, they just match the new default verdict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilterModeChangeNotice {
+    /// The mode the resource was just flipped to.
+    pub new_filter_mode: FilterMode,
+    /// The action whose rules are now redundant — `"block"` under whitelist,
+    /// `"allow"` under blacklist. Kept as a free-form string to tolerate new
+    /// server values; match against [`MailRuleAction`] values.
+    pub redundant_rule_action: String,
+    /// Count of active rules whose action equals `redundant_rule_action`. `0`
+    /// is a clean flip. Paused and deleted rules are not counted.
+    pub redundant_rule_count: i64,
+}
+
+/// An Inkbox mailbox (an email address owned by your organisation).
+///
+/// `agent_identity_id` is the UUID of the owning agent identity, or `None` if
+/// the mailbox is standalone (not tied to any agent).
+///
+/// `sending_domain` is the bare domain the mailbox sends from, derived from
+/// `email_address` when the server omits it. Either the platform default or a
+/// verified custom domain registered to your org.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Mailbox {
+    #[serde(default)]
+    pub signature_html: Option<String>,
+    #[serde(default)]
+    pub signature_text: Option<String>,
+    #[serde(default)]
+    pub signature_enabled: bool,
+    pub id: Uuid,
+    pub email_address: String,
+    /// Bare domain the mailbox sends from. Server may omit it, in which case
+    /// it is derived from the local part of `email_address`.
+    #[serde(default)]
+    pub sending_domain: String,
+    /// Defaults to `Blacklist` when the server omits the field.
+    #[serde(default = "default_filter_mode")]
+    pub filter_mode: FilterMode,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_mode_change_notice: Option<FilterModeChangeNotice>,
+    /// Stored mail counted against the mailbox's cap. `0` on servers that
+    /// predate storage caps. Deleting messages/threads frees space immediately.
+    #[serde(default)]
+    pub storage_used_bytes: u64,
+    /// The plan's storage cap, or `None` when the server did not resolve one.
+    /// Binary bytes (Free is 2 GiB = 2_147_483_648): divide by 1024 and label
+    /// GiB/MiB when displaying. Exceeding it fails sends with
+    /// [`InkboxError::StorageLimitExceeded`](crate::error::InkboxError).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_limit_bytes: Option<u64>,
+}
+
+fn default_filter_mode() -> FilterMode {
+    FilterMode::Blacklist
+}
+
+impl Mailbox {
+    /// Backfill `sending_domain` from `email_address` when the server left it
+    /// blank, mirroring the Python `_from_dict` partition on `"@"`.
+    fn normalize(mut self) -> Self {
+        if self.sending_domain.is_empty() {
+            if let Some((_, domain)) = self.email_address.split_once('@') {
+                self.sending_domain = domain.to_string();
+            }
+        }
+        self
+    }
+
+    /// Deserialize a mailbox from a raw transport value, applying the
+    /// `sending_domain` backfill.
+    pub(crate) fn from_value(v: Value) -> crate::error::Result<Self> {
+        let mailbox: Mailbox = serde_json::from_value(v)?;
+        Ok(mailbox.normalize())
+    }
+}
+
+/// A custom sending domain registered to your organisation.
+///
+/// Returned by `Inkbox::domains().list()`. Only `Verified` rows are usable for
+/// sending mail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Domain {
+    /// Sending-domain row id (e.g. `"sending_domain_<uuid>"`).
+    pub id: String,
+    /// Bare registered domain (e.g. `"mail.acme.com"`).
+    pub domain: String,
+    /// Current lifecycle status.
+    pub status: SendingDomainStatus,
+    /// True if this is the org's default sending domain.
+    pub is_default: bool,
+    /// First time this domain reached `Verified`, or `None` if never verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<String>,
+}
+
+/// Email message metadata.
+///
+/// Body content is excluded from list responses. Call
+/// [`crate::mail::resources::messages::MessagesResource::get`] to retrieve the
+/// full message with body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub id: Uuid,
+    pub mailbox_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<Uuid>,
+    pub message_id: String,
+    pub from_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_display_name: Option<String>,
+    pub to_addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc_addresses: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    pub direction: MessageDirection,
+    pub status: String,
+    pub is_read: bool,
+    pub is_starred: bool,
+    pub has_attachments: bool,
+    pub created_at: String,
+    // Open tracking (outbound sends with `track_opens`). `first_opened_at` is
+    // the reliable "was it ever opened" signal; `open_count` is approximate.
+    // Old servers omit both, so default them.
+    #[serde(default)]
+    pub open_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_opened_at: Option<String>,
+    /// Import job that created this historical message, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_job_id: Option<Uuid>,
+}
+
+/// Optional recipient groups for an incomplete draft.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftRecipients {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bcc: Option<Vec<String>>,
+}
+
+/// Attachment metadata for the current draft generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftAttachment {
+    pub part_index: usize,
+    pub filename: String,
+    pub content_type: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_id: Option<String>,
+    #[serde(default)]
+    pub is_inline: bool,
+}
+
+/// Draft fields returned by list operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftSummary {
+    pub id: Uuid,
+    pub mailbox_id: Uuid,
+    pub from_address: String,
+    #[serde(default)]
+    pub to_addresses: Vec<String>,
+    #[serde(default)]
+    pub cc_addresses: Vec<String>,
+    #[serde(default)]
+    pub bcc_addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(default)]
+    pub has_attachments: bool,
+    #[serde(default)]
+    pub attachment_count: usize,
+    pub generation: u64,
+    pub send_state: DraftSendState,
+    #[serde(default)]
+    pub track_opens: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Complete representation of one saved draft.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftDetail {
+    #[serde(flatten)]
+    pub summary: DraftSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_html: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_source_message_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_note_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_note_html: Option<String>,
+    #[serde(default)]
+    pub attachment_metadata: Vec<DraftAttachment>,
+}
+
+/// Downloaded draft attachment bytes and response metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftAttachmentContent {
+    pub content: Vec<u8>,
+    pub filename: String,
+    pub content_type: String,
+}
+
+/// Unauthenticated multipart upload destination for an import file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailImportUploadTarget {
+    pub url: String,
+    pub fields: std::collections::BTreeMap<String, String>,
+    pub expires_in_seconds: u64,
+}
+
+/// A mailbox import job and its processing counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailImportJob {
+    pub id: Uuid,
+    pub mailbox_id: Uuid,
+    pub status: MailImportJobStatus,
+    pub source_format: MailImportFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_addresses: Option<Vec<String>>,
+    pub mark_as_read: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub messages_processed: u64,
+    #[serde(default)]
+    pub messages_imported: u64,
+    #[serde(default)]
+    pub messages_skipped_duplicate: u64,
+    #[serde(default)]
+    pub messages_failed: u64,
+    #[serde(default)]
+    pub messages_rejected_unsafe: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+/// Result of creating an import job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailImportCreateResult {
+    pub job: MailImportJob,
+    pub upload: MailImportUploadTarget,
+}
+
+/// Cursor page of mailbox import jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailImportJobPage {
+    pub items: Vec<MailImportJob>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+/// Full message including body content.
+///
+/// Server-suggested To/Cc for a reply-all (sending mailbox and BCC excluded).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplyAllRecipients {
+    #[serde(default)]
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+}
+
+/// Carries the [`Message`] metadata plus the body and extended headers. The
+/// Python models this as a subclass of `Message`; here the base fields are
+/// flattened in so the wire shape is identical.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageDetail {
+    #[serde(flatten)]
+    pub message: Message,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_html: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bcc_addresses: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_metadata: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ses_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_all_recipients: Option<ReplyAllRecipients>,
+}
+
+/// A conversation thread grouping related messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Thread {
+    pub id: Uuid,
+    pub mailbox_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// Defaults to `Inbox` when the server omits the field.
+    #[serde(default = "default_thread_folder")]
+    pub folder: ThreadFolder,
+    pub message_count: i64,
+    pub last_message_at: String,
+    pub created_at: String,
+}
+
+fn default_thread_folder() -> ThreadFolder {
+    ThreadFolder::Inbox
+}
+
+/// Thread with all messages inlined, ordered oldest-first.
+///
+/// The Python models this as a subclass of `Thread`; the base fields are
+/// flattened in so the wire shape is identical.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadDetail {
+    #[serde(flatten)]
+    pub thread: Thread,
+    #[serde(default)]
+    pub messages: Vec<Message>,
+}
+
+/// An inbound/outbound allow/block rule scoped to a mailbox.
+///
+/// Returned by the **legacy** per-mailbox routes
+/// ([`crate::mail::resources::contact_rules::MailContactRulesResource`]). The
+/// forward-looking, identity-keyed shape is [`MailIdentityContactRule`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailContactRule {
+    pub id: Uuid,
+    pub mailbox_id: Uuid,
+    pub action: MailRuleAction,
+    pub match_type: MailRuleMatchType,
+    pub match_target: String,
+    /// Defaults to `Active` when the server omits the field.
+    #[serde(default = "default_contact_rule_status")]
+    pub status: ContactRuleStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A mail allow/block rule scoped to an **agent identity**.
+///
+/// Returned by the identity-keyed routes
+/// ([`crate::mail::resources::identity_contact_rules::MailIdentityContactRulesResource`]
+/// / `identity.list_mail_contact_rules()`). Same shape as [`MailContactRule`]
+/// but keyed by `agent_identity_id` instead of `mailbox_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailIdentityContactRule {
+    #[serde(default)]
+    pub contact: Option<crate::contacts::types::Contact>,
+    pub id: Uuid,
+    pub agent_identity_id: Uuid,
+    pub action: MailRuleAction,
+    pub match_type: MailRuleMatchType,
+    pub match_target: String,
+    /// Defaults to `Active` when the server omits the field.
+    #[serde(default = "default_contact_rule_status")]
+    pub status: ContactRuleStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn default_contact_rule_status() -> ContactRuleStatus {
+    ContactRuleStatus::Active
+}

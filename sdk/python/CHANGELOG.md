@@ -1,0 +1,469 @@
+# Changelog
+
+## Unreleased
+
+## 0.7.14 - Slack contact rules (unreleased)
+
+See the [canonical SDK and CLI changelog](../../CHANGELOG.md#0714---slack-contact-rules-unreleased) for the complete upcoming release.
+
+## 0.7.13 — Threaded iMessage replies (2026-10-03)
+
+See the [canonical SDK and CLI changelog](../../CHANGELOG.md#0713--threaded-imessage-replies-2026-10-03) for the complete release.
+
+## 0.7.11 - Slack workspace connections (2026-09-30)
+
+See the [canonical SDK and CLI changelog](../../CHANGELOG.md#0711---slack-workspace-connections-2026-09-30) for the complete release.
+
+## 0.7.9 — Media WebSocket keypad guidance
+
+- Documented the media WebSocket `dtmf` event for live client-driven calls:
+  `{"event": "dtmf", "digits": "1"}` sends one to 30 keypad keys from `0-9`,
+  `*`, and `#`, in order. At most 20 bursts per call can be outstanding,
+  including the one being sent; further bursts are ignored.
+- Server-side call admission and quota changes affect older SDK and CLI versions:
+  `429 concurrent_calls_limit` means the live outbound-call limit is reached
+  (default: 3 across an organization's phone numbers or on one dedicated iMessage
+  line). `503 call_capacity_busy` means capacity is temporarily busy. Honor
+  `Retry-After` before retrying either response.
+- Daily call quotas count active calls, including `initiated` calls, provisionally.
+  Canceled outbound calls still count when dialing reached the phone network.
+  Failed placements, pre-dial outbound cancellations, and inbound calls that end
+  unanswered are excluded.
+
+## 0.7.8 — Identity-owned webhook subscriptions
+
+- Combine all notification families on one identity, regardless of configured channels;
+  legacy mailbox/phone selectors remain accepted and resolve to the owning identity.
+- Event-list updates remain full replacement. Incoming-call actions remain separate.
+- Event-family/owner and A2A context checks now follow server capability. Unsupported
+  combinations raise an API 422 instead of a local `ValueError`.
+- Expose delivery replayability without changing original history IDs.
+  Conversation context applies only to received mail, text and iMessage events.
+
+## 0.7.4 - Native Windows Python tunnels
+
+- Python `tunnels.connect()` now supports native Windows as well as Linux and macOS, without requiring WSL.
+- Preserve tunnel certificate and private-key bytes on Windows when creating or replacing files.
+- Exercise tunnel startup, HTTP/2 forwarding, reconnect, shutdown, and persistence in Windows CI.
+- Bump Python, TypeScript, Rust, CLI, and bundled plugin versions together to 0.7.4. TypeScript, Rust, and CLI runtime behavior is unchanged.
+
+## 0.7.2 — Voicemail handling on outbound calls
+
+- Added `OnVoicemail` (`leave_message`, `hang_up`, `ignore`). `calls.place()`
+  and `AgentIdentity.place_call()` accept `on_voicemail` and
+  `voicemail_message`; both are omitted from the request when unset, so the
+  server default applies (`leave_message` for hosted-agent calls, `hang_up`
+  otherwise). `voicemail_message` requires `on_voicemail=leave_message`.
+- `PhoneCall.on_voicemail` and the `call.ended` webhook `WebhookPhoneCall`
+  expose the persisted choice (`OnVoicemailWire`). Missing, null, or unknown
+  values parse as `hang_up`.
+- `VoicemailDetection` is deprecated in favor of `OnVoicemail`; it remains
+  accepted (`enabled` = `hang_up`, `disabled` = `ignore`) and call responses
+  keep reporting it.
+- Outbound calls now ring for up to 60 seconds before `no_answer`.
+- Bump the Python package to 0.7.2.
+
+## 0.7.1 — Custom email signatures
+
+- `mailboxes.update()` accepts `signature_html`, `signature_text`, and
+  `signature_enabled`, preserving omitted fields and explicit `None` clears.
+- Mailbox and identity mailbox responses expose saved signatures, with defaults
+  for earlier API responses. README and Python skill include setup examples.
+- Bump the Python package to 0.7.1.
+
+## 0.6.8 — Voice AI voice discovery
+
+- Added `inkbox.hosted_agent.list_voices()` returning a typed
+  `HostedAgentVoiceCatalog` with `HostedAgentVoiceOption` entries and
+  `default_voice`. Entries include string IDs, names, descriptions,
+  availability, and optional preview URLs; unavailable entries are retained.
+- Discovery is organization-scoped and does not take an identity ID. Existing
+  string-based voice setters and configuration reads remain compatible.
+
+## 0.6.7 — Server-selected Voice AI model
+
+- Voice AI always uses the platform-selected model. The existing `model`
+  argument remains accepted for compatibility but is ignored.
+- Configuration responses retain `model` and `effective_model`; `model` is
+  unset and `effective_model` reports the active platform selection.
+
+## 0.6.6 — Webhook delivery auth token
+
+- `webhooks.subscriptions.create(...)` accepts `auth_token`, a bearer token
+  sent as `Authorization: Bearer <token>` on every delivery and replay
+  alongside the signature headers.
+- `update(...)` treats `auth_token` tri-state: omit to leave it unchanged,
+  pass `None` to clear it, or a string to replace it.
+- Reads return `WebhookSubscription.auth_token` (`None` when unset) plus the
+  `has_auth_token` flag; both default to unset on older servers.
+
+## 0.6.3 — Incoming call forwarding
+
+- Added `IncomingCallAction.FORWARD`, forwarding destination configuration,
+  and chronological `PhoneCall.forwardings` history.
+- Forwarding configuration keywords distinguish omission from explicit
+  `None`; phone-number updates expose the same fields.
+- Older strict action parsing requires this release before reading identities
+  configured for forwarding.
+
+## 0.6.2 — Undo an iMessage tapback
+
+### Added
+
+- `AgentIdentity.remove_imessage_reaction(reaction_id)` takes back a tapback the
+  identity sent. A failed removal leaves the tapback in place rather than
+  clearing it locally, so the call can be retried.
+
+## 0.6.1 — Automatic iMessage contact sharing
+
+- Identity create and update accept `contact_sharing_enabled`; dedicated lines
+  share the identity's display name or handle and optional avatar by default.
+
+## 0.6.0 — Dedicated iMessage lines
+
+- `imessages.claim_number()` now takes only `idempotency_key` and sends a
+  type-less claim body.
+- Identity create/update use `claim_imessage_number=True` for atomic dedicated
+  line claims.
+- Removed `IMessageNumberType`, all line-type arguments and exports, and the
+  now-unconditional `can_start_conversations` properties.
+- Dedicated-line responses retain the fixed compatibility field
+  `type="dedicated_outbound"`; structured error contracts are unchanged.
+
+## 0.5.16 — Support Agent discovery on API errors
+
+- `InkboxAPIError.agent_support` exposes the Support Agent instructions string
+  supplied by the API.
+- Specialized errors, identity/tunnel remappers, and one-shot requests preserve
+  the metadata without changing existing exception strings.
+- Missing or malformed instructions are ignored for compatibility with older
+  deployments.
+
+## 0.5.14 — A2A invitations
+
+- Added `inkbox.a2a_invitations` create, list, get, revoke, and accept methods.
+- Added `Inkbox.preview_a2a_invitation()` for review without an API key.
+- Agent signup accepts `invitation_token` and normalizes the optional
+  invitation summary on signup and verification responses.
+- Invitation acceptance and signup accept exact-origin share URLs only at
+  `/console/a2a/invitations/accept`; raw invitation tokens remain supported.
+- Invitation errors retain structured detail and expose `retry_after_seconds`
+  when the response includes `Retry-After`.
+- Package version moved in lockstep to 0.5.14.
+
+## 0.5.13 — A2A agent discovery
+
+### Added
+
+- `inkbox.a2a.public_directory()` and `organization_directory()` expose typed,
+  searchable Agent Card directories with cursor iterators.
+- A2A settings expose `publicly_discoverable` and `allow_public_egress`.
+
+### Changed
+
+- Same-platform Agent Card retrieval authenticates without forwarding the
+  Inkbox key to external origins.
+- Agent-scoped identity list and get operations return only the caller's own
+  identity. Use the A2A organization directory to discover peers.
+- Package version moved in lockstep to 0.5.13.
+
+### Removed
+
+- **Source-breaking:** `IdentityAccess`, identity visibility response fields,
+  and identity access methods have been removed. Use A2A directories and
+  contact rules instead.
+
+### Compatibility
+
+- New A2A settings fields preserve existing constructors through defaults.
+
+## 0.5.12 — Bidirectional A2A contexts
+
+### Added
+
+- `A2AContext.name` exposes the persisted name, and
+  `identity.a2a_update_context()` lets either participant rename a shared
+  context.
+
+### Changed
+
+- `A2AClient.send()` documents that `context_id` without `task_id` starts a
+  sibling task. Between Inkbox identities, either participant can use that
+  operation while tasks continue to preserve independent direction and state.
+- Package version moved in lockstep to 0.5.12.
+
+### Compatibility
+
+- Existing call signatures and wire keys are unchanged. Context parsing now
+  requires the matching API response with a persisted `name`.
+- Direct `A2AContext(...)` constructors must add `name`.
+- Received and sent context methods retain their original-open meanings.
+
+## 0.5.10 — Tunnel disconnect timestamps
+
+### Added
+
+- `Tunnel.last_disconnected_at` exposes the nullable, best-effort timestamp of
+  the last recorded disconnect as a `datetime`.
+
+### Changed
+
+- Package version moved in lockstep to 0.5.10.
+- Tunnel URL forwarding preserves multiple `Set-Cookie` response headers.
+
+### Compatibility
+
+- Missing and null timestamps parse as `None`. Use
+  `Tunnel.currently_connected`, not timestamp ordering, to determine liveness.
+- Existing direct `Tunnel(...)` constructors may omit the new field; it defaults
+  to `None`.
+
+## 0.5.9 — Voice AI authority inheritance
+
+### Changed
+
+- `calls.place()` and `identity.place_call()` continue to omit
+  `hosted_agent_authority_mode` when it is `None`, allowing Voice AI outbound
+  calls to inherit the identity's saved Voice AI authority.
+- Explicit `contact_scoped` downscopes one call. Explicit `yolo` requires an
+  admin credential only when it exceeds the saved authority.
+- Package version moved in lockstep to 0.5.9.
+
+### Compatibility
+
+- Method signatures and wire names are unchanged. Older API versions may still
+  resolve an omitted authority as `contact_scoped`.
+
+## 0.5.8 — Hosted-agent authority and voicemail detection
+
+### Added
+
+- `HostedAgentAuthorityMode` with `contact_scoped` and `yolo` values.
+- Authority mode fields on hosted-agent config, calls, and `call.ended`
+  webhook types.
+- `HostedAgentConfigResource.set_authority_mode()` and
+  `AgentIdentity.set_hosted_agent_authority_mode()` for setting future incoming
+  call authority with admin API keys. Outbound calls select authority per call.
+- Per-call `hosted_agent_authority_mode` selection on outbound placement;
+  `yolo` requires an admin API key.
+- Optional `voicemail_detection` control on outbound calls. It is omitted by
+  default; pass `disabled` to stay connected and leave a voicemail. Call reads
+  and lifecycle webhook types expose the persisted value.
+- `CallOrigin.DEDICATED_IMESSAGE_NUMBER` and the matching webhook wire value.
+- Paginated `calls.tool_invocations()` and
+  `identity.list_tool_invocations()` methods for safe Voice AI tool activity.
+
+### Compatibility
+
+- Existing methods default to `contact_scoped`; absent or null authority fields
+  parse as `contact_scoped`, and voicemail-detection fields parse as `enabled`.
+
+## 0.5.6 — A2A 1.0
+
+### Added
+
+- `AgentIdentity` receiver methods cover A2A settings, Agent Card skills, directional rules, task/context inboxes, and explicit task replies.
+- Task history supports direction, requester, worker, state, context, time, and keyword filters. Message history returns matching messages with task/context and participant provenance through opaque cursor pages and iterators.
+- `identity.a2a_client()` provides a stateless standard A2A 1.0 client with credential-less card discovery, canonical-origin credential pinning, exact wire tasks/messages, idempotent message IDs, polling, listing, and cancellation.
+- A2A webhook payload types and subscription channel validation.
+
+### Changed
+
+- The A2A client unwraps the standard task/message result envelope while retaining compatibility with direct task payloads.
+- Standard task lists accept `status_timestamp_after` for incremental polling.
+- Identity-created A2A clients inherit the parent SDK request timeout, and `wait()` caps each in-flight poll to its remaining deadline.
+- Contact rules support `inbound`, `outbound`, and `both` for bilateral requester/worker admission.
+- Task and context models preserve history-truncation signals. Task detail exposes messages and current state.
+- Webhook subscription create and update reject mixed event families and non-null conversation context on A2A subscriptions before sending the request.
+
+### Compatibility
+
+- Existing methods are unchanged. A2A requires the matching server rollout and a claimed identity-scoped key for remote calls.
+
+## 0.5.5 — Action-only contact-rule updates
+
+### Changed
+
+- Contact-rule update methods now require `action`.
+
+### Removed
+
+- **Source-breaking:** identity update methods and contact-rule update methods no longer accept lifecycle `status`. Remove those keyword arguments before upgrading.
+
+### Compatibility
+
+- Response models continue to parse existing `paused` rows.
+
+## 0.5.4 — Dedicated outbound iMessage groups
+
+### Added
+
+- `send_imessage` and `imessages.send` accept one recipient or a list of 1–8; two or more recipients select or create a dedicated-outbound group. Reply with the returned `conversation_id`.
+- Message and conversation lists accept `include_groups=False`; group models expose nullable assignment/remote fields, `sender_number`, `participants`, `is_group`, and per-recipient status.
+- Conversation list/detail models expose `group_creation_status`; failed creation stays on the same conversation and the next send retries.
+- Existing reaction methods support inbound group messages by `message_id`; REST and webhook reaction assignment fields are nullable.
+- Reaction types and webhook payloads include the named, sendable `eyes` tapback. Reaction sends reject `custom` and arbitrary emoji before making a request; inbound custom emoji remain available through `custom_emoji`.
+- Group creation and `conversation_id` replies accept the same 13 `IMessageSendStyle` values as one-to-one sends, including sends with one media URL.
+- iMessage webhook message types expose the additive group fields. Group read receipts and typing indicators remain unsupported.
+
+### Compatibility
+
+- Scalar sends, reaction method signatures, and default one-to-one listings are unchanged. Group sends and tapbacks require the matching API rollout.
+
+## 0.5.0 — Identity tunnel summaries and inlined access
+
+### Added
+
+- Identity lists preserve linked mailbox, phone, iMessage, tunnel, and access fields when included. Older summary-only responses remain supported with empty defaults.
+- Tunnel summaries expose routing fields without connection state or certificate material. Fetch the full tunnel when those fields are needed.
+- Vault secret reads can include access rules; omitted access defaults to an empty list.
+
+## 0.4.26 — Self-serve dedicated iMessage numbers
+
+### Added
+
+- **Dedicated iMessage numbers.** `inkbox.imessages.list_numbers()` returns every active or paused dedicated number owned by the organization, including unattached numbers. `claim_number(type=..., idempotency_key=...)` claims `dedicated_inbound` or `dedicated_outbound` inventory and preserves the caller's stable key across an ambiguous retry. New public types mirror the phone SDK: `IMessageNumber`, `IMessageNumberType`, and `IMessageNumberStatus`. `IMessageNumber.can_start_conversations` is true only for dedicated outbound numbers.
+- **Atomic identity claims and swaps.** `Inkbox.create_identity(..., imessage_enabled=True, imessage_number_type=...)` claims and attaches a number in the identity-create transaction. `identity.update(imessage_number_type=..., idempotency_key=...)` claims and swaps atomically; `imessage_number_id=<uuid>` attaches an already-owned number, while explicit `None` moves back to shared service. Detailed create and update responses expose the attached `IdentityIMessageNumber` through `identity.imessage_number`.
+- **Typed claim errors.** `DedicatedIMessageNumberQuotaExceededError` exposes the requested number type, limit, current usage, upgrade URL, and contact email. `DedicatedIMessageNumberInventoryPendingError` exposes the requested number type and `retry_after_seconds`, preferring the HTTP `Retry-After` value when present. `IdempotencyKeyReusedError` identifies a key reused with a different request.
+
+### Fixed
+
+- Identity update now consumes the detailed PATCH response directly, keeping its channel state current without a follow-up GET. Unrelated identity `409` responses are no longer misclassified as handle collisions.
+
+## 0.4.25 — Tunnel field tolerance
+
+### Changed
+
+- **Tunnel runtime/cert fields tolerate omission.** `Tunnel.organization_id` is now `str | None` and `Tunnel.currently_connected` is `bool | None`, using `None` when the response omits them. The certificate and last-connected fields were already nullable; missing `metadata` still becomes `{}`, and unknown keys are ignored. Fetch `tunnels.get(id)` when connection state or certificate material is needed.
+- Version bumped to 0.4.25 in lockstep with `@inkbox/sdk`, `@inkbox/cli`, and the Rust crate. The proxy-support work in this release is TS/CLI-only — httpx already honors `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`.
+
+## 0.4.24 — Mailbox storage caps, IMAP/SMTP
+
+### Added
+
+- **Mailbox storage fields.** `Mailbox` gains `storage_used_bytes` (bytes currently stored) and `storage_limit_bytes` (the plan cap, or `None` when the server didn't resolve it), populated by `mailboxes.list()` / `.get()` / `.update()`. Caps are **binary** — 2 GiB is `2 * 1024 ** 3` = 2,147,483,648 bytes; divide by 1024 and label GiB/MiB.
+- **`StorageLimitExceededError`.** New `InkboxAPIError` subclass raised on `402` with `detail["error"] == "storage_limit_exceeded"` — from `messages.send`, `messages.reply_all`, and `messages.forward` (and the `identity.send_email` / `reply_all_email` / `forward_email` delegators) when the send would push the mailbox past its cap. Exposes `message`, `upgrade_url`, and `limit_bytes`. Deleting messages (`messages.delete`) or threads (`threads.delete`) frees space immediately. A `402` whose `detail` is a plain string still surfaces as a plain `InkboxAPIError`.
+- **Mail clients (IMAP/SMTP).** README section covering the gateway settings (hosts/ports, username = the inbox address, password = an identity-scoped API key — revoking the key revokes mail-client access) and the constraints that bite: `From` must be the authenticated inbox address, and Free-plan sends of signed/encrypted mail over SMTP are refused. No SDK surface — the gateway speaks IMAP/SMTP, not HTTP.
+
+### Notes
+
+- **Free plan:** a footer is appended to the **stored** body of outgoing mail, so `messages.get(...)` does not return byte-for-byte what you sent — a `sent_body == fetched_body` round-trip assertion fails on Free plans. Documented on `send` / `reply_all` / `forward`.
+- A response that omits the storage fields parses as `0` / `None`, so both fields are always readable.
+
+## 0.4.23 — Inkbox Voice AI rebrand
+
+### Changed
+
+- **Prose-only rebrand: the hosted call agent is now "Inkbox Voice AI".** Docstrings now use the product name (short form "Voice AI"). No API changes: `CallMode.HOSTED_AGENT`, `IncomingCallAction.HOSTED_AGENT`, `inkbox.hosted_agent`, and `HostedAgentConfig` are all unchanged.
+
+## 0.4.22 — Hosted call agent
+
+### Added
+
+- **Hosted call mode.** `calls.place(...)` and `identity.place_call(...)` accept keyword-only `mode` (`CallMode.CLIENT_WEBSOCKET`, the default, or `CallMode.HOSTED_AGENT` — the platform-run voice agent drives the call, no WebSocket needed) and `reason` (the hosted agent's task brief; required with `mode=hosted_agent`, invalid otherwise). Nothing is client-gated — server 422s/503s (`hosted_agent_at_capacity`, `hosted_agent_unavailable`) surface verbatim. `PhoneCall` gains `mode` (older responses default to `"client_websocket"`) and `reason` (nullable).
+- **`IncomingCallAction.HOSTED_AGENT`.** The hosted agent answers inbound calls; the only action needing neither `client_websocket_url` nor `incoming_call_webhook_url`. Accepted by `incoming_call_action.set(...)` / `identity.set_incoming_call_action(...)` URL-less.
+- **Hosted agent config.** `inkbox.hosted_agent.get_config(agent_identity_id=None)` / `set_config(voice=None, model=None, instructions=None, agent_identity_id=None)` (`GET`/`PUT /phone/hosted-agent-config`; full-replace PUT — a field left `None` resets to the server default). New `HostedAgentConfig` type. Identity delegators `identity.get_hosted_agent_config()` / `set_hosted_agent_config(...)`.
+- **Post-call action items.** `PhoneCall` gains `post_call_action_items` — the hosted agent's recorded action items surfaced inline on every call response (`seq`-ascending, open items only; canceled items are withdrawn). Empty for `client_websocket` calls and hosted calls with no open items. New slim `PostCallActionItem` type: `id`, `seq`, `action`, `details`, `status` (`"open"`). Mirrors the `call.ended` webhook.
+- **`call.ended` receiver types.** `WebhookPhoneCall` gains `mode` / `reason` (on `data["call"]`); `CallEndedWebhookData` gains `outcome` (`"completed"|"no_answer"|"declined"|"failed"`, `None` iff client-driven) and `post_call_action_items` (open items only). All `NotRequired` — pre-hosted payloads parse unchanged. New exports: `CallModeWire`, `CallOutcomeWire`, `WebhookPostCallActionItemWire`.
+
+## 0.4.20 — Date-range filters, call.ended receivers, external hangup, spam-filter status
+
+### Added
+
+- **Date-range filters.** `messages.list(...)` / `identity.iter_emails(...)` (and `iter_unread_emails`), `calls.list(...)` / `identity.list_calls(...)`, `texts.list(...)` / `identity.list_texts(...)`, `texts.list_conversations(...)` / `identity.list_text_conversations(...)`, `imessages.list(...)` / `identity.list_imessages(...)`, and `imessages.list_conversations(...)` / `identity.list_imessage_conversations(...)` accept keyword-only `start_datetime` / `end_datetime` / `tz` (all `str | None = None`). They filter on the resource's `created_at`: bare dates resolve to calendar days in `tz` (default UTC) with `end_datetime` whole-day inclusive; datetimes with an explicit `Z`/offset are exact instants (`tz` ignored); naive datetimes are interpreted in `tz`. Params are sent only when non-`None`, so omitting all three preserves current behavior exactly (no filtering; ordering and pagination unchanged). The server owns resolution.
+- **`call.ended` webhook receivers + external hangup.** New receiver types `CallEndedWebhookPayload` / `CallEndedWebhookData` / `WebhookPhoneCall` / `WebhookCallTranscript` / `CallLifecycleWebhookEventType` / `CallOriginWire`; `webhooks.subscriptions.create(...)` accepts `call.ended` on an `agent_identity_id` owner; `calls.hangup(call_id)` and `identity.hangup_call(call_id)` end a live call from outside it (`POST /phone/calls/{id}/hangup`; already-ended calls surface the server's 409).
+
+### Fixed
+
+- **`SmsDeliveryStatus` gains `blocked_spam_filter`.** Stored rows blocked pre-carrier by the outbound spam filter crashed `texts.list` / `texts.get` hydration (`ValueError`); the enum now carries the variant. It appears on stored rows only — delivery webhooks never fire for blocked sends.
+
+
+## 0.4.16 — Configurable webhook context + open tracking
+
+### Added
+
+- **Conversation-context webhooks.** `webhooks.subscriptions.create(...)` / `update(...)` accept `context_config` — per class (`email` / `texts` / `calls`) a `{"mode": "count", "count": N}` (1..50) or `{"mode": "window", "hours": H}` (1..168). `update` is tri-state (omit = unchanged, `None` = clear, dict = replace). Received events carry the history under `data["context"]`. New exports: `WebhookContextConfig`, `WebhookContextClassConfig`, and the receiver wire shapes `WebhookContextWire`, `WebhookContextBlockWire`, `WebhookTranscriptEntryWire` (discriminate transcript entries on `"marker" in entry`), plus the item wire types; `data["context"]` is optional on `MailWebhookData` / `TextWebhookData` / `IMessageWebhookData`.
+- **Open tracking.** `messages.send(...)` / `forward(...)` and `identity.send_email(...)` / `forward_email(...)` accept `track_opens`. A plain-text `track_opens` send is rejected with 422; forwards need HTML on the outgoing message (inline forwards inherit the original's HTML, wrapped forwards need a caller body). `Message` gains `first_opened_at` and `open_count` (approximate/biased both ways — prefer `first_opened_at`; pixels can raise spam scores).
+
+### Changed
+
+- **`messages.get` marks inbound messages read.** Fetching a single inbound message by id with an API key now flips `is_read` server-side; list, thread, and attachment routes do not. `mark_read` remains for list-only workflows. `is_read` (agent consumed via API) is distinct from `first_opened_at` (recipient's client loaded the tracking pixel).
+
+## 0.4.12 — Tunnel DX
+
+### Added
+
+- **Config-file / env auth resolution.** `Inkbox()` resolves `api_key` / `base_url` / `vault_key` from the argument, then the env var, then `~/.inkbox/config` — so it works with no explicit key in background/agent processes.
+
+### Fixed
+
+- **macOS TLS verification.** The tunnel data plane falls back to certifi's CA bundle when the system trust store is empty (the python.org installer case), avoiding `SSL: CERTIFICATE_VERIFY_FAILED`.
+
+## 0.4.11 — Reply all
+
+### Added
+
+- **Email reply-all helpers.** `messages.reply_all(...)` and `identity.reply_all_email(...)` call the mailbox reply-all endpoint, with server-resolved recipients and optional subject/body/attachment fields.
+
+## 0.4.10 — Agent harness
+
+### Added
+
+- **Optional `harness` on agent self-signup.** `Inkbox.signup(...)` accepts a `harness` keyword identifying the agent harness/runtime (free-form string; unknown values accepted). When a plugin exists for the harness, post-verification guidance is folded into the verify response's `message`.
+
+## 0.4.8 — graceful tunnel reconnect on redeploy
+
+### Added
+
+- **Make-before-break tunnel reconnect.** When the tunnel server signals a graceful drain (a NO_ERROR `GOAWAY`) during a redeploy, the client now opens a new persistent connection and parks a fresh intake pool **before** closing the draining one, instead of tearing down and reconnecting cold. In-flight HTTP webhook replies are posted on the new connection so they round-trip across the handoff. The reconnect is in-band — it does not surface as a `reconnecting` status or wait out the backoff schedule.
+- **Typed `server_draining` WebSocket close.** When the draining connection drops a live WebSocket bridge, the handler now receives a `websocket.disconnect` carrying close code `4500` (the `server_draining` code) instead of a generic reset, so it can reconnect promptly.
+
+### Notes / limits
+
+- In-progress WebSocket and passthrough-TCP sessions **cannot** migrate across a redeploy — the third-party socket lives on the dying task, and the client's HTTP/2 connection closes the moment it receives the `GOAWAY`. The client surfaces a clean typed close and reconnects fast; the third-party peer reconnects onto the new task. Idempotent reconnect is the right client pattern.
+
+## 0.4.6 — webhook subscriptions refactor
+
+### Breaking
+
+- **`Mailbox.webhook_url` removed.** Mailbox PATCH no longer accepts `webhook_url`; sending it returns 422. Migration: create a `webhooks.subscriptions` row for each mailbox that needs delivery (see Added below).
+- **`PhoneNumber.incoming_text_webhook_url` removed** from every shape that carried it (`PhoneNumber`, `IdentityPhoneNumber`, `IdentityPhoneNumberCreateOptions`, `phone_numbers.update`, `phone_numbers.provision`, identity-create's nested `phone_number`). Sending it returns 422 server-side. Replace with a `text.*` subscription on the phone number.
+- **Phone-text webhook payload — `data["contact"]` → `data["contacts"]` + `data["agent_identities"]`.** `contact` is gone. `contacts` is always a list (possibly empty); `agent_identities` is a new always-present list of matched agent identities.
+- **Inbound-call webhook payload — top-level `contact` → `contacts` + `agent_identities`.** Same shape swap at the top level of the flat payload.
+- **Mail webhook payload — `data["agent_identities"]` is now required on the wire** alongside the existing `data["contacts"]` (both default `[]`). Receivers that did strict shape checks will see a new key.
+
+### Added
+
+- **`inkbox.webhooks.subscriptions` resource** — full CRUD for the new `/webhooks/subscriptions` endpoint surface. `list`, `get`, `create`, `update`, `delete`. The SDK runs structural + prefix validation client-side (exactly-one FK, non-empty distinct events, no `phone.incoming_call`, `message.` / `text.` prefix matching the owner's channel) so most shape mistakes surface as `ValueError` rather than 422 round-trips. The server remains authoritative for the exact event-name enum, so a typo with a valid prefix (e.g. `message.received_typo`) passes the SDK's check and is rejected as 422 by the server. New exports: `WebhookSubscription`, `WebhookSubscriptionsResource`, `WebhookSubscriptionStatus`.
+- **`WebhookAgentIdentity` / `WebhookMailAgentIdentity`** TypedDicts covering identity matches on text/call and mail payloads. Same shape as the contact types but with `agent_handle` / `display_name` instead of `name`. Mail variant also carries `bucket` + `address`.
+
+## 0.4.5
+
+### Added
+
+- **Conversation-centric text messaging.** `send_text()` /
+  `texts.send()` now accept a single destination, a list of
+  destinations, or `conversation_id` plus optional `media_urls`;
+  `list_text_conversations()` / `texts.list_conversations()` accept
+  `include_groups`; and conversation read/list helpers accept either
+  the legacy remote number or the new conversation UUID.
+- New additive text fields: `TextMessage.conversation_id`,
+  `sender_phone_number`, `recipients`, and
+  `TextConversationSummary.id`, `participants`, `is_group`,
+  `latest_has_media`. Existing one-to-one `remote_phone_number`
+  behavior is preserved.
+
+- **Identity visibility controls.** New `IdentityAccess` type and three methods on both `IdentitiesResource` and `AgentIdentity`:
+  - `list_access()` — list who can see an identity. Returns either a single wildcard row (`viewer_identity_id=None` — every active identity in the org sees it) or explicit per-viewer rows. An empty list means no scoped agent can see the identity.
+  - `grant_access(viewer_identity_id)` — grant a viewer identity visibility on the target. Pass `None` to reset the target to the org-wide wildcard.
+  - `revoke_access(viewer_identity_id)` — revoke one viewer's visibility, keyed by the viewer identity's UUID.
+
+  Granting a viewer against an already-wildcard target raises `RedundantContactAccessGrantError` (409); revoking a non-existent grant raises `InkboxAPIError` (404).
+
+## 0.4.3
+
+### Breaking
+
+- **`identity.unlink_phone_number()` / `IdentitiesResource.unlink_phone_number()` were renamed to `release_phone_number()`** and their behavior changed accordingly. The method now releases the number at the carrier and removes it locally; previously it only cleared the FK on the row and left the carrier-side number live. There is no "unlink without release" path anymore — once a number is released, it cannot be reattached.
+- **`identity.assign_phone_number()` (and the underlying `IdentitiesResource.assign_phone_number()`) were removed.** The server no longer supports cross-identity reassignment; phone numbers are bound to the identity they were provisioned on. To attach a number to an identity, either pass the nested `phone_number` payload to `inkbox.create_identity(...)`, or call `inkbox.phone_numbers.provision(agent_handle=..., ...)` for an existing identity.
+- **`identity.delete()` cascade now releases the linked phone number** (vendor + local), instead of clearing the FK and leaving the carrier-side number live.

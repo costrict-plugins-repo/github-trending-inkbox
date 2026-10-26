@@ -1,0 +1,715 @@
+# Inkbox
+
+https://inkbox.ai
+
+[![PyPI](https://img.shields.io/pypi/v/inkbox)](https://pypi.org/project/inkbox/)
+[![npm](https://img.shields.io/npm/v/@inkbox/sdk)](https://www.npmjs.com/package/@inkbox/sdk)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+API-first communication infrastructure for AI agents — email (with custom sending domains), phone, identities, encrypted vault (login credentials, API keys, key pairs, SSH keys, OTP, etc.), and tunnels (expose a local server at a public URL via outbound HTTP/2).
+
+| Package | Language | Install |
+|---|---|---|
+| [`inkbox`](./sdk/python/) | Python ≥ 3.11 | `pip install inkbox` |
+| [`@inkbox/sdk`](./sdk/typescript/) | TypeScript / Node ≥ 22 | `npm install @inkbox/sdk` |
+| [`@inkbox/cli`](./cli/) | CLI / Node ≥ 22 | `npm install -g @inkbox/cli` |
+
+## Companion mode
+
+Companion mode is off by default and separate from whitelist/blacklist settings.
+An eligible sender can introduce the agent to a group by sending a qualifying
+message there. Eligibility requires active exact email, number, or Slack-account allow rules for
+both inbound and outbound communication, either one Both rule or two applicable
+one-way allows. It is per normalized identifier and channel, not per saved contact;
+phone and iMessage share one policy. Domain allowances, default access, contact
+visibility, and access through another Companion conversation do not qualify.
+
+Multiple senders may qualify. The first qualifying message activates the group;
+listing an eligible participant is insufficient, and additional eligible senders
+do not repeat initialization. Continued access depends on the actual trigger
+sender's permissions and membership, without transferring to another participant.
+Blocks and existing sending requirements still apply. The SDKs load complete
+authorized history into one bounded initialization transcript before live turns.
+
+An administrator can set `enabled=true` before any eligible sender or channel
+resource exists. This saves the preference; per-channel readiness reports unmet
+prerequisites, including `bidirectional_allow_required`, independently of the
+enabled setting. Configuration contains enabled state, revision, readiness, and
+optional notices. See the [Companion mode guide](https://inkbox.ai/docs/capabilities/companion-mode).
+
+- [Python: `client.companion.load_initialization`](./sdk/python/README.md#companion-mode)
+- [TypeScript: `client.companion.loadInitialization`](./sdk/typescript/README.md#companion-mode)
+- [Rust: `client.companion().load_initialization`](./sdk/rust/README.md#companion-mode)
+- [CLI: `inkbox identity companion`](./cli/README.md#companion-mode)
+
+## Cursor plugin
+
+**Status:** Pre-release and under repository review; not yet submitted to or
+available in the Cursor Marketplace.
+
+This repository includes an MCP-only Cursor plugin package that connects to
+`https://inkbox.ai/mcp/cursor`. After Marketplace publication, install
+**Inkbox** from Cursor's **Customize** view, enable the Inkbox MCP server, and
+select **Connect** to authorize an organization and identity in the browser. No
+API key, client secret, local process, or bundled Cursor skills are required.
+
+---
+
+## Quick Start
+
+Get an API key from the [Inkbox Console](https://inkbox.ai/console), then:
+
+### Python
+
+```python
+from inkbox import Inkbox
+
+with Inkbox(api_key="ApiKey_...") as inkbox:
+    # Create an agent identity with a linked mailbox
+    identity = inkbox.create_identity("my-agent", display_name="My Agent")
+    identity.provision_phone_number()  # provisions a local number
+
+    # Send an email
+    identity.send_email(
+        to=["user@example.com"],
+        subject="Hello",
+        body_text="Hi from my agent!",
+    )
+
+    # List recent emails
+    for msg in identity.iter_emails():
+        print(msg.subject, msg.from_address)
+
+    # Place a phone call
+    call = identity.place_call(to_number="+15551234567")
+
+    # Send a text message (SMS/MMS); pass a list for group MMS.
+    identity.send_text(to="+15551234567", text="Hi from my agent!")
+
+    # Read text messages
+    for t in identity.list_texts():
+        print(t.remote_phone_number, t.text)
+
+    # Reply over iMessage (identity must be iMessage-enabled and the
+    # recipient connected to it via the shared triage line first)
+    identity.send_imessage(to="+15551234567", text="Hi over iMessage!")
+```
+
+### TypeScript
+
+```typescript
+import { Inkbox } from "@inkbox/sdk";
+
+const inkbox = new Inkbox({ apiKey: "ApiKey_..." });
+
+// Create an agent identity with a linked mailbox
+const identity = await inkbox.createIdentity("my-agent", { displayName: "My Agent" });
+const phone = await identity.provisionPhoneNumber(); // provisions a local number
+
+// Send an email
+await identity.sendEmail({
+  to: ["user@example.com"],
+  subject: "Hello",
+  bodyText: "Hi from my agent!",
+});
+
+// List recent emails
+for await (const msg of identity.iterEmails()) {
+  console.log(msg.subject, msg.fromAddress);
+}
+
+// Place a phone call
+const call = await identity.placeCall({ toNumber: "+15551234567" });
+
+// Send a text message (SMS/MMS); pass an array for group MMS.
+await identity.sendText({ to: "+15551234567", text: "Hi from my agent!" });
+
+// Read text messages
+const texts = await identity.listTexts();
+for (const t of texts) {
+  console.log(t.remotePhoneNumber, t.text);
+}
+
+// Reply over iMessage (identity must be iMessage-enabled and the
+// recipient connected to it via the shared triage line first)
+await identity.sendIMessage({ to: "+15551234567", text: "Hi over iMessage!" });
+```
+
+### CLI
+
+```bash
+# Create an agent identity (mailbox is created automatically)
+inkbox identity create my-agent
+
+# Send an email
+inkbox email send -i my-agent \
+  --to user@example.com \
+  --subject "Hello" \
+  --body-text "Hi from my agent!"
+
+# List recent emails
+inkbox email list -i my-agent --limit 10
+
+# Save an incomplete draft, then list it with its current generation
+inkbox email drafts create -i my-agent --subject "Work in progress" \
+  --idempotency-key draft-create-2026-08-19-1
+inkbox email drafts list -i my-agent
+
+# Place a phone call
+inkbox phone call -i my-agent --to +15551234567
+
+# Or call over an existing shared iMessage connection (no dedicated number)
+inkbox phone call -i my-agent --to +15551234567 \
+  --origination shared_imessage_number
+
+# Override one Voice AI call to use broader authority. This requires an admin
+# API key unless the identity's saved authority is already yolo.
+inkbox phone call -i my-agent --to +15551234567 \
+  --hosted --reason "Coordinate the appointment and send confirmations." \
+  --authority-mode yolo
+
+# Send a text message (SMS/MMS; comma-separate --to for groups)
+inkbox text send -i my-agent --to +15551234567 --text "Hi from my agent!"
+
+# Reply over iMessage (identity must be iMessage-enabled and the
+# recipient connected to it via the shared triage line first)
+inkbox imessage send -i my-agent --to +15551234567 --text "Hi over iMessage!"
+
+# Read text messages
+inkbox text list -i my-agent
+
+# Initialize vault (first time only — requires INKBOX_VAULT_KEY)
+inkbox vault init --vault-key "my-vault-key"
+
+# Manage vault secrets
+inkbox vault create --name "CRM Login" --type login --username bot@crm.com --password s3cret
+inkbox vault secrets
+inkbox vault get <secret-id>
+```
+
+### Voice AI voice discovery
+
+Discover the voice catalog for your organization, including the default voice,
+availability, and optional preview URLs. No identity ID is needed:
+
+| Client | Catalog |
+|---|---|
+| Python | `inkbox.hosted_agent.list_voices()` |
+| TypeScript | `await inkbox.hostedAgent.listVoices()` |
+| Rust | `client.hosted_agent().list_voices()?` |
+| CLI | `inkbox phone hosted-agent voices --json` |
+
+The response contains `voices` and `default_voice` (`defaultVoice` in
+TypeScript and CLI JSON). Each voice has `id`, `name`, `description`,
+`available`, and optional `preview_url` (`previewUrl`). Unavailable voices
+remain in the catalog; choose an entry with `available: true` and pass its
+string ID to the existing hosted-agent config setter. Setters replace the
+voice and instructions, so preserve the saved instructions when changing only
+the voice. Discovery requires an API that supports the catalog endpoint;
+existing string-based voice selection does not require this new method.
+
+### A2A discovery and history
+
+Each identity can inspect work it received, work it requested, or both without
+duplicating task records. Task lists are newest-first and cursor-paginated.
+Keyword search matches string and numeric content values from `text` and
+`data` parts; message metadata is not searched, and results remain
+newest-first. A message's `role` is its author (`caller` or `agent`),
+independent of task direction.
+
+Enabled same-organization identities can call each other without contact rules.
+Public agents accept enabled callers that allow public egress. Private
+cross-organization calls require the requester to allow the worker outbound and
+the worker to allow the requester inbound; explicit blocks always win.
+
+Search enabled agents in your organization or agents that opted into the public
+directory. Results include typed Agent Cards and opaque cursor pagination:
+
+```python
+public_agents = inkbox.a2a.public_directory(q="research", limit=25)
+organization_agents = inkbox.a2a.organization_directory(q="support")
+```
+
+An A2A context is a shared collaboration between its original two
+participants. Either participant can start another task in that context, and
+tasks in both directions may run concurrently. The context's top-level caller
+and target remain the original opener and recipient; each task's caller and
+target identify that task's direction. New contexts start as `New A2A Session`;
+that exact default may be replaced with a short name based on the first task
+message. Either participant can rename the persisted value at any time.
+
+```python
+identity = inkbox.get_identity("coordinator")
+
+page = identity.a2a_tasks(
+    direction="both",
+    worker_handle="researcher",
+    q="quarterly summary",
+)
+for task in page.items:
+    print(task.id, task.state)
+
+for message in identity.iter_a2a_messages(
+    direction="outbound",
+    worker_handle="researcher",
+    q="revenue",
+):
+    print(message.task_id, message.task_state, message.role, message.parts)
+
+for context in identity.a2a_contexts(direction="both").items:
+    print(context.name, context.id)
+
+identity.a2a_update_context(
+    "context-uuid",
+    name="Quarterly Research Review",
+)
+```
+
+```bash
+inkbox a2a directory --public --query research --limit 25
+inkbox a2a directory --query support
+inkbox a2a tasks -i coordinator --direction both --worker researcher
+inkbox a2a messages -i coordinator --direction outbound \
+  --worker researcher --query revenue --json
+```
+
+Task detail includes current state and message history.
+
+### Tunnels (Python)
+
+```python
+# Bring a local server online at https://my-app.inkboxwire.com.
+# Outbound HTTP/2 only — no inbound port to open. Linux, macOS, and Windows.
+listener = inkbox.tunnels.connect(name="my-app", forward_to="http://127.0.0.1:8080")
+print(listener.public_url)
+print(listener.status, listener.is_connected, listener.last_connected_at)
+listener.wait()
+```
+
+### Mailbox Imports
+
+Import MBOX and EML files, or a ZIP holding either (a Gmail Takeout ZIP imports
+as-is), through `mailboxes.imports`. Create a job, upload directly with the
+returned target, start it, then wait for any terminal state (`completed`,
+`failed`, or `cancelled`). Entries in a ZIP that are not mail, including nested
+archives, are ignored. Imported content that is unsafe may be rejected and
+counted separately.
+
+```bash
+inkbox mailbox imports run agent@inkboxmail.com ./archive.mbox \
+  --original-address old-address@example.com
+```
+
+Use `--no-wait` to return after queueing, or `inkbox mailbox imports wait
+<email> <job-id>` to resume watching later. Processing counters are cumulative
+and never go backwards, but they can sit unchanged while a large message is
+processed, and they do not yield a percentage. Jobs run one at a time per
+organization and share overall import capacity, so a long `queued` stretch is
+normal rather than a stall.
+
+Limits: 1 GiB per upload, 50 MiB per message, 100,000 messages and 20
+`original_addresses` per job, 65,000 entries per ZIP, and 20 import jobs per
+organization per 24 hours. Upload targets expire after 5 minutes and can be
+re-issued; a job whose upload never arrives is cancelled after 24 hours.
+
+### Email Drafts
+
+Python, TypeScript, Rust, and the CLI support creating, listing, reading,
+updating, duplicating, deleting, and sending saved drafts. Drafts may be
+incomplete. Each draft response includes a `generation`; pass that exact value
+to the next mutation so edits from another client are not overwritten.
+
+Drafts share the mailbox's standard Drafts folder, so changes made through the
+SDK or CLI are visible in connected mail clients and vice versa. Attachment
+`part_index` / `partIndex` values belong to the generation that returned them;
+refresh the draft before using an index after any edit.
+
+A successful send returns the sent message and removes the draft. Retrying send
+with the same draft ID and exact generation may return that same sent message.
+HTTP 409 responses carry a structured `error`: refresh before retrying
+`draft_generation_conflict`, retry the same generation for
+`draft_send_in_progress`. Do not resend `draft_delivery_uncertain`; after
+checking sent mail, duplicate or delete that draft instead.
+
+### Tunnels (TypeScript)
+
+```typescript
+import { connect } from "@inkbox/sdk/tunnels/connect";
+
+const listener = await connect(inkbox, {
+  name: "my-app",
+  forwardTo: "http://127.0.0.1:8080",
+});
+console.log(listener.publicUrl);
+console.log(listener.status, listener.isConnected, listener.lastConnectedAt);
+await listener.wait();
+```
+
+### Tunnels (Rust)
+
+The blocking Rust runtime is behind the `tunnels-runtime` feature. Run it on a
+caller-owned thread and retain a cloneable local status handle:
+
+```rust
+use inkbox::tunnels::client::TunnelStatusHandle;
+
+let status = TunnelStatusHandle::new();
+let runtime_status = status.clone();
+let client = inkbox.clone();
+let tunnel_thread = std::thread::spawn(move || {
+    client.tunnels().connect_with_status(
+        "my-app",
+        "http://127.0.0.1:8080",
+        runtime_status.callback(),
+    )
+});
+println!("{:?} {}", status.status(), status.is_connected());
+
+// Join when shutdown is expected so startup/runtime errors are surfaced.
+if let Err(error) = tunnel_thread.join().expect("tunnel thread panicked") {
+    eprintln!("tunnel stopped: {error}");
+}
+```
+
+Python and TypeScript also accept an in-process callable (Fetch handler in TS,
+ASGI app in Python) instead of a `forward_to` URL. All three runtimes reconnect
+after transient connection failures. See [`skills/inkbox-tunnels/`](./skills/inkbox-tunnels/)
+for the full reference.
+
+**Redeploys are graceful.** When the tunnel service redeploys, a long-running listener reconnects make-before-break: it stands up a fresh connection before closing the draining one, so short HTTP requests see no gap. In-progress WebSocket and passthrough-TCP sessions cannot migrate across a redeploy — they end with a typed `server_draining` close and the third-party peer reconnects onto the new task. Write handlers to reconnect idempotently.
+
+### Outbound SMS — current limits
+
+- Outbound SMS works only from **local** numbers (not toll-free).
+- **100 recipient sends per phone number per rolling 24h.** A 3-recipient group message counts as 3 recipient sends. A single accepted send may push usage past the cap; the next capped send fails with `429 sender_rate_limited`.
+- A new local number waits **~10-15 minutes** for the 10DLC campaign to propagate at the carrier; until then `phone_number.sms_status` (Python) / `phoneNumber.smsStatus` (TS) is `"pending"` and sends fail with `409 sender_sms_pending`.
+- Recipients must text **`START`** to any number in your organization to opt in. Unknown recipients fail with `403 recipient_not_opted_in`; opt-outs (`STOP`) return `403 recipient_opted_out`.
+- **Beta:** Group MMS and conversation sends are beta. Some carriers may reject group chats or MMS from 10DLC numbers even when the sender is ready and recipients have opted in.
+
+Customer-managed 10DLC brands and campaigns lift the default per-number cap to the carrier-assigned tier. Toll-free SMS sending is still coming soon.
+
+---
+
+## Agent Signup
+
+Agents can self-register without a pre-existing API key. The flow provisions a mailbox, identity, and API key in one call:
+
+### Python
+
+```python
+import os
+from inkbox import Inkbox
+
+# 1. Sign up (no API key needed)
+result = Inkbox.signup(
+    human_email="john@example.com",
+    note_to_human="Hey John, this is your agent signing up!",
+    display_name="My Agent",          # optional
+    agent_handle="my-agent",          # optional
+    email_local_part="my.agent",      # optional
+    invitation_token=os.getenv("INKBOX_A2A_INVITATION"),  # optional link or raw token
+)
+api_key = result.api_key  # save this — shown only once
+print(result.message)     # authoritative delivery/acceptance outcome
+
+# 2. Verify only when signup did not already accept and claim the invitation
+already_claimed = (
+    result.invitation is not None and result.invitation.status == "accepted"
+) or result.claim_status == "agent_claimed"
+if not already_claimed:
+    Inkbox.verify_signup(api_key, verification_code="483921")
+
+# 3. Use the API key
+with Inkbox(api_key=api_key) as inkbox:
+    identity = inkbox.get_identity(result.agent_handle)
+    identity.send_email(to=["john@example.com"], subject="Hello!", body_text="I'm set up.")
+```
+
+### TypeScript
+
+```typescript
+import { Inkbox } from "@inkbox/sdk";
+
+// 1. Sign up (no API key needed)
+const result = await Inkbox.signup({
+  humanEmail: "john@example.com",
+  noteToHuman: "Hey John, this is your agent signing up!",
+  displayName: "My Agent",      // optional
+  agentHandle: "my-agent",      // optional
+  emailLocalPart: "my.agent",   // optional
+  invitationToken: process.env.INKBOX_A2A_INVITATION, // optional link or raw token
+});
+const apiKey = result.apiKey; // save this — shown only once
+console.log(result.message);  // authoritative delivery/acceptance outcome
+
+// 2. Verify only when signup did not already accept and claim the invitation
+const alreadyClaimed = result.invitation?.status === "accepted"
+  || result.claimStatus === "agent_claimed";
+if (!alreadyClaimed) {
+  await Inkbox.verifySignup(apiKey, { verificationCode: "483921" });
+}
+
+// 3. Use the API key
+const inkbox = new Inkbox({ apiKey });
+const identity = await inkbox.getIdentity(result.agentHandle);
+await identity.sendEmail({ to: ["john@example.com"], subject: "Hello!", bodyText: "I'm set up." });
+```
+
+### CLI
+
+```bash
+# 1. Sign up (no --api-key needed)
+inkbox signup create --human-email john@example.com \
+  --note-to-human "Hey John, this is your agent signing up!" \
+  --display-name "My Agent" \
+  --agent-handle my-agent \
+  --email-local-part my.agent
+# When invited, use --invitation-prompt, --invitation-stdin, or
+# INKBOX_A2A_INVITATION (the legacy token-named environment variable remains supported).
+
+# 2. Verify only if signup did not report an accepted/claimed invitation
+inkbox signup verify --code 483921
+
+# 3. Check status
+inkbox signup status
+```
+
+Use an admin-scoped API key to create and manage invitations through
+`inkbox.a2a_invitations` (Python), `inkbox.a2aInvitations` (TypeScript), or
+`inkbox a2a invites`. Acceptance is agent-only and automatically makes the
+bilateral A2A contact rules needed for the invited peer bundle.
+
+---
+
+## What's in this repo
+
+| Directory | Description |
+|---|---|
+| [`sdk/python/`](./sdk/python/) | Python SDK (`inkbox`) |
+| [`sdk/typescript/`](./sdk/typescript/) | TypeScript SDK (`@inkbox/sdk`) |
+| [`cli/`](./cli/) | CLI (`@inkbox/cli`) |
+| [`skills/inkbox-python/`](./skills/inkbox-python/) | Python agent skill for Claude Code and other coding agents |
+| [`skills/inkbox-ts/`](./skills/inkbox-ts/) | TypeScript agent skill for Claude Code and other coding agents |
+| [`skills/inkbox-onboarding/`](./skills/inkbox-onboarding/) | Language-agnostic identity and channel onboarding skill |
+| [`skills/inkbox-tunnels/`](./skills/inkbox-tunnels/) | Tunnels skill — bring a local server online at a public Inkbox URL |
+| [`examples/use-inkbox-browser-use/`](./examples/use-inkbox-browser-use/) | Inkbox + Browser Use — give your agent an email, phone, and vault |
+| [`examples/use-inkbox-kernel/`](./examples/use-inkbox-kernel/) | Inkbox + Kernel — give your agent an email and browser |
+| [`examples/use-inkbox-cli/`](./examples/use-inkbox-cli/) | Shell script examples for CLI automation and CI pipelines |
+| [`examples/use-inkbox-vault/`](./examples/use-inkbox-vault/) | Vault TOTP example — create credentials with one-time codes |
+| [`examples/use-inkbox-signup/`](./examples/use-inkbox-signup/) | Agent self-signup — register without an API key, verify, send welcome email |
+| [`examples/use-inkbox-webhook/`](./examples/use-inkbox-webhook/) | Inbound email webhook — tunnel + signature verification + auto-reply |
+
+---
+
+## Agent Skills
+
+Load the Inkbox skills into your coding agent so it automatically knows how to use the SDK.
+
+### Claude Code (plugin)
+
+```
+/plugin marketplace add inkbox-ai/inkbox   # <github-owner>/<repo>
+/plugin install inkbox@inkbox              # <plugin-name>@<marketplace-name>
+/reload-plugins
+```
+
+The plugin loads the Inkbox skills and connects the remote MCP server. Sign in when prompted to authorize an identity.
+
+The plugin's version tracks the SDK and CLI release it documents, so `/plugin update` pulls the skills that match the version you're running.
+
+### Codex (plugin)
+
+```bash
+codex plugin marketplace add inkbox-ai/inkbox
+```
+
+Then install `inkbox` from the Codex plugin UI. See the [Codex plugin docs](https://developers.openai.com/codex/plugins/build) for current installation options.
+
+### Any Agent (individual skills)
+
+```bash
+npx skills add inkbox-ai/inkbox/skills
+```
+
+See [`skills/README.md`](./skills/README.md) for details.
+
+---
+
+## Documentation
+
+- [Inkbox Docs](https://inkbox.ai/docs)
+- [API Reference](https://inkbox.ai/docs/api-reference)
+- [Console](https://inkbox.ai/console)
+
+## Releasing
+
+Maintainers: see [RELEASING.md](./RELEASING.md) for the lockstep version-bump and per-registry publish steps (PyPI, npm, crates.io).
+
+## Custom email signatures
+
+Custom signatures are saved per mailbox and require an eligible paid plan to set or enable.
+Each HTML/text field supports up to 16,384 characters. HTML is sanitized; logos
+must use absolute HTTPS URLs. Updating HTML without text generates a plain-text
+fallback. Omitted fields stay unchanged; null clears saved content. If saved text
+is null, sending derives it from HTML when possible. Disable without deleting to
+pause automatic insertion. Disabling and clearing remain available on every plan.
+Signatures are inserted when mail is sent, including replies, forwards, and sent
+drafts; do not append them manually. The Inkbox watermark is controlled separately.
+Signed/encrypted SMTP mail cannot have a custom signature inserted; disable
+automatic insertion before sending those messages.
+A `.sig` file is not a standardized attachment format: read its UTF-8 text or HTML
+content into the corresponding field; images and proprietary formats are not imported.
+
+```python
+from pathlib import Path
+
+inkbox.mailboxes.update(
+    "alex@example.com",
+    signature_html=Path("signature.html").read_text(encoding="utf-8"),
+    signature_enabled=True,
+)
+# Pause without deleting; use None for both content fields to clear them.
+inkbox.mailboxes.update("alex@example.com", signature_enabled=False)
+```
+```typescript
+await inkbox.mailboxes.update("alex@example.com", {
+  signatureHtml: '<b>Alex</b><br><a href="https://example.com">Website</a>',
+  signatureEnabled: true,
+});
+// Pause without deleting; use null for both content fields to clear them.
+await inkbox.mailboxes.update("alex@example.com", { signatureEnabled: false });
+```
+
+## Webhook subscriptions
+
+Mixed subscriptions and explicit identity-wide lists require SDK/CLI **0.7.8 or
+later** and `supports_identity_subscriptions: true` from `GET /webhooks/catalog`.
+Until available, keep separate channel subscriptions using mailbox, phone, and
+identity selectors without explicit scope. Explicit identity scope checks the
+catalog once per list call and fails clearly when unsupported; omitted scope adds
+no request. The mixed-event examples below assume the capability is available.
+
+Subscriptions belong to an identity and can combine mail, text, iMessage,
+call-lifecycle, A2A, and Slack notifications, even before channels are configured.
+Existing list calls keep their single-family views. Explicitly pass
+`scope="identity"` (Python), `scope: "identity"` (TypeScript), or use Rust's
+`list_with_scope` to include every family and mixed subscription. The CLI supports
+`inkbox webhook subscription list --agent-identity-id <id> --scope identity`.
+Mixed subscriptions also require explicit identity scope for updates and deletion:
+pass `scope="identity"` in Python, `{ scope: "identity" }` in TypeScript, use Rust's
+`update_with_scope` / `delete_with_scope`, or CLI `--scope identity`. Omitted scope
+preserves legacy behavior and receives 409 when targeting a mixed subscription.
+Event-list updates replace the complete selection. Incoming-call actions remain
+separate identity settings.
+
+## Safe message retries
+
+SDK send methods automatically include `Prefer: idempotency-replay`. Raw HTTP
+callers use this preference with `Idempotency-Key`. Older requests keep their
+existing behavior. Email and SMS continue waiting for send acceptance; iMessage
+continues returning its queued acknowledgement.
+
+Email, SMS/MMS, and iMessage send calls generate a request key and reuse it during
+bounded request retries. Pass an explicit `idempotency_key` (Python) or
+`idempotencyKey` (TypeScript) when your workflow retries across separate calls.
+Rust provides `send_with_idempotency_key` variants without changing existing methods.
+
+After a failed send, recover its generated key with `get_message_request_key(error)`
+(Python, imported from `inkbox`) or `getMessageRequestKey(error)` (TypeScript,
+imported from `@inkbox/sdk`). Both handle transport and API errors. The CLI prints
+the key in its error output. Rust errors do not expose automatically generated
+keys: preserve your own key and use an explicit-key variant for cross-call recovery.
+
+A completed retry returns the original response, not current delivery status.
+Read the message or use webhooks for delivery updates. A queued response confirms
+acceptance, not delivery or a guarantee of delivery retries. Use `message_sends.lookup` (Python),
+`messageSends.lookup` (TypeScript), or `inkbox send-lookup` to recover an original ID.
+See [message send retries](https://inkbox.ai/docs/api/message-sends).
+
+Read an iMessage by ID with `imessages.get(...)`, Rust's `imessages().get(...)`,
+or `inkbox imessage get <message-id> --identity <handle>`.
+
+## Slack workspace connections
+
+Slack contact rules support exact people and home workspaces, with whitelist or
+blacklist defaults and optional per-direction settings. Import visible people
+into real contact cards and use Slack with Companion mode. Importing a contact does not allow communication. Contact import
+requires an organization admin API key or a human Console session.
+See [Slack contact rules](https://inkbox.ai/docs/api/slack/contact-rules) and
+[contact import](https://inkbox.ai/docs/api/slack/contact-import) for version
+`0.7.14` examples.
+
+Slack sponsorship covers the channel or group DM, including all its threads.
+A new participant joining or the sponsor leaving requires fresh sponsorship;
+another participant leaving alone does not. Explicit blocks still apply.
+Optional `thread_ts` selects a reply thread; it does not limit sponsorship.
+
+Slack SDK and CLI methods require version **0.7.11 or later**.
+
+Connect an existing Inkbox identity to your Slack workspace. The
+[Python SDK](sdk/python/README.md#slack), [TypeScript SDK](sdk/typescript/README.md#slack),
+[Rust SDK](sdk/rust/README.md#slack), and [CLI](cli/README.md#slack) support reusable organization-owned workspace setup
+and direct browser handoffs, live conversations/history, durable message
+and utility actions, general file uploads/downloads, and identity-owned Slack
+webhooks with five selectable incoming-message events. Identity-wide message search spans workspace connections by default.
+Prepare the identity’s Slack app in a saved workspace before installing it;
+no identity toggle is required. Organization-member sessions, organization admin API
+keys, and claimed agent keys can save setup workspaces; claimed agent keys prepare
+and install only their own identity’s app.
+Accessible observed messages are captured automatically, independently of webhook
+subscriptions. Searchable retained history, bounded imports, and coverage are separate
+from live reads. Retention has no time limit by default; organization management
+can set a retention limit or delete existing history without stopping new capture.
+Pausing the identity stops live operations and webhook delivery while preserving
+its connections and history. Workspace approval, connection ownership, and current
+conversation access remain required.
+
+## iMessage sender addresses
+
+Dedicated lines can also receive one-to-one messages from non-phone sender
+addresses, such as `sender@example.com`. Read responses and `imessage.received`
+webhooks preserve the address as a string; do not normalize it into a phone number
+or assume every received message can be answered. These conversations are
+**receive-only**: sending messages, reactions, typing indicators, or read receipts
+returns HTTP `422` with `recipient_not_e164`. Outbound `to` recipients must still
+be E.164 phone numbers. Reading message history does not send a read receipt.
+
+## Threaded iMessage replies
+
+Requires SDK/CLI **0.7.13 or later**. These reply examples require a
+phone-number conversation or a supported group; non-phone one-to-one
+conversations remain receive-only, including threaded replies.
+
+Reply to a specific message in an existing one-to-one or group conversation with
+Python `reply_to_message_id`, TypeScript `replyToMessageId`, Rust `send_reply`, or
+CLI `--reply-to-message-id`. Supply its conversation ID too; do not use `to`.
+Messages expose nullable direct-parent, thread, and root-message IDs. A thread ID
+is opaque and distinct from its root message ID. Standalone messages can have a
+thread ID before anyone replies, with their own message ID as the root. A non-null
+reply-parent ID identifies a visible parent; a thread ID does not prove there are replies.
+
+Read a chronological page by any message using Python `imessages.get_thread`,
+TypeScript `imessages.getThread`, Rust `imessages().get_thread`, or CLI
+`imessage thread`. Read by conversation and thread IDs with the corresponding
+`get_conversation_thread` / `getConversationThread` / `conversation-thread` operation.
+Follow the returned cursor for more; existing message lists remain flat and
+newest-first with optional conversation-scoped thread filtering. See each
+language's README for complete examples and Rust's additive wrapper types.
+
+Reply sends allow an ordinary message in the same conversation when native
+threading is unsupported, including SMS/RCS targets. Set Python
+`plain_reply_fallback=False`, TypeScript `plainReplyFallback: false`, or CLI
+`--no-plain-reply-fallback` to require native threading. Rust offers
+`send_reply_with_fallback` / `send_imessage_reply_with_fallback` with a final
+boolean argument. The API owns fallback; clients do not resend failed replies
+as ordinary messages. Invalid or inaccessible targets still fail. Keep agent
+memory tied to the conversation; a native thread is optional context, and an
+ordinary fallback has no reply parent and does not join the target's native
+thread. Unsettled targets or missing reply metadata still fail. A previously
+supported target can still fail if native delivery becomes unavailable; fallback
+does not resend rejected replies. Read the queued message status and error fields
+because delivery webhooks do not cover every failure before dispatch.
+
+## License
+
+MIT

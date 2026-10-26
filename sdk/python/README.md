@@ -1,0 +1,2271 @@
+# inkbox
+
+Python SDK for the [Inkbox API](https://inkbox.ai/docs) — API-first communication infrastructure for AI agents (email, phone, identities, encrypted vault — login credentials, API keys, key pairs, SSH keys, OTP, etc.).
+
+## Install
+
+```bash
+pip install inkbox
+```
+
+Requires Python ≥ 3.11.
+
+## Companion mode
+
+Companion mode is off by default, separate from whitelist/blacklist settings.
+Eligibility requires active exact email, number, or Slack-account allow rules covering both
+directions, either one Both rule or two applicable one-way allows. It is per
+normalized identifier and channel; phone and iMessage share one policy. Domain
+allowances, default access, contact visibility, and access borrowed from another
+Companion conversation do not qualify. Multiple senders may qualify; the first
+qualifying group message activates the conversation, without repeated
+initialization when another eligible sender messages. Mere participation is
+insufficient. Blocks and existing sending requirements still apply.
+
+```python
+from inkbox import ContactRuleDirection, Inkbox
+
+with Inkbox() as client:
+    config = client.companion.get("example-agent")
+    # Administrator credentials are required for both writes.
+    client.mail_identity_contact_rules.create(
+        "example-agent", action="allow", match_type="exact_email",
+        match_target="trusted@example.com", direction=ContactRuleDirection.BOTH,
+    )
+    config = client.companion.update("example-agent", enabled=True)
+    # trusted@example.com sends "Please join this conversation" to the group.
+    states = client.companion.conversations("example-agent", channel="mail", limit=50, offset=0)
+```
+
+Administrator and claimed-agent reads return enabled state, revision, readiness,
+and optional notices. Only `enabled` can be updated; omission is a no-op, and
+`None` or unknown keywords are rejected locally. Enabling is allowed before any
+eligible sender or channel resource exists. Per-channel readiness reports
+prerequisites independently of enabled state, including
+`bidirectional_allow_required` when no exact bidirectional allow exists. Readiness
+reason strings are open-ended. Revision changes only when enabled changes;
+turning off and on requires a fresh qualifying message.
+
+Continued access depends on the actual trigger sender's permissions and membership,
+without transferring to another eligible participant. Conversation state reports
+`reply_ready` separately from history access, including SMS consent requirements.
+A group does not authorize private messages or another group. Group iMessage
+requires a dedicated line; identical-participant MMS chats are one conversation.
+
+For an authenticated initialization/live webhook, use its `activation_id`:
+
+```python
+activation_id = "22222222-2222-4222-8222-222222222222"
+with Inkbox() as client:
+    initial = client.companion.load_initialization(
+        "example-agent", activation_id, max_bytes=8 * 1024 * 1024,
+    )
+    # Queue initial.text once, keeping initial.reply_context on that same turn.
+    reply = initial.reply_context
+    if reply.channel == "mail":
+        client.messages.reply_all(
+            "example-agent@example.com", reply.reply_to_message_id,
+            body_text="Thanks, I have the conversation context.",
+        )
+```
+
+The stored mail parent is a message UUID, not an RFC Message-ID. Use `reply_all`
+with that parent. For phone/iMessage use `texts.send(..., conversation_id=...)`
+or `imessages.send(..., conversation_id=...)` with the canonical conversation.
+Do not convert group replies into raw-address sends. The server rechecks the
+actual reply audience and current permission; an out-of-scope reply fails.
+
+The helper returns `scope_id`, `activation_id`, `conversation_id`, `channel`,
+`entries`, `reply_context`, one combined `text`, and `notices`. It preserves
+server order and attachment references, deduplicates identical source IDs, and
+requires exactly one trigger. It exhausts pages and performs a final authorized
+read. The default limits are 8 MiB of serialized fetched pages plus UTF-8
+transcript text and 1,000 pages, with one additional revalidation request. Set
+`max_bytes`/`max_pages` explicitly for larger supported host inputs. Exceeding a
+bound raises `CompanionInitializationError`; 403/409 responses remain API errors.
+For lossless streaming use
+`client.companion.activation_messages(handle, activation_id, limit=100, cursor=...)`.
+Pages expose `history_complete` and `next_cursor`; page sizes are 1-200.
+
+Persist a checkpoint keyed by identity, channel, scope, and activation before
+submitting **one** host input. Buffer live events until initialization completes.
+On retries, revalidate through the helper; reconcile uncertain host acceptance
+instead of blindly submitting again. Historical `/clear`, `YES`, and similar
+text is conversation data, never a fresh command or approval. Ordinary-phase
+webhooks have no activation authority and use a separate conversation-scoped
+session. Keep Companion context out of private contact sessions. Notices may
+describe unavailable history; unknown notice codes/levels are preserved.
+
+## Authentication
+
+You'll need an API key to use this SDK. Get one at [inkbox.ai/console](https://inkbox.ai/console).
+
+`Inkbox(...)` resolves `api_key` / `base_url` / `vault_key` from the explicit argument, then the matching env var (`INKBOX_API_KEY` / `INKBOX_BASE_URL` / `INKBOX_VAULT_KEY`), then a `~/.inkbox/config` file (`key = value` lines). The file fallback is handy for background/agent processes that don't inherit the shell's env, so `Inkbox()` with no arguments works once the file is in place.
+
+## Quick start
+
+```python
+import os
+from inkbox import Inkbox
+
+with Inkbox(
+    api_key=os.environ["INKBOX_API_KEY"],
+    vault_key=os.environ.get("INKBOX_VAULT_KEY"),
+) as inkbox:
+    # Create an agent identity with a linked mailbox
+    identity = inkbox.create_identity("support-bot", display_name="Support Bot")
+    identity.provision_phone_number()  # provisions a local number
+
+    # Send email directly from the identity
+    identity.send_email(
+        to=["customer@example.com"],
+        subject="Your order has shipped",
+        body_text="Tracking number: 1Z999AA10123456784",
+    )
+
+    # Place an outbound call
+    identity.place_call(
+        to_number="+18005559999",
+        client_websocket_url="wss://my-app.com/voice",
+    )
+
+    # Read inbox
+    for message in identity.iter_emails():
+        print(message.subject)
+
+    # List calls
+    calls = identity.list_calls()
+
+    # Access credentials (vault unlocked at construction)
+    for login in identity.credentials.list_logins():
+        print(login.name, login.payload.username)
+```
+
+## Authentication
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `api_key` | `str` | required | Your `ApiKey_...` token |
+| `base_url` | `str` | API default | Override for self-hosting or testing |
+| `timeout` | `float` | `30.0` | Request timeout in seconds |
+
+Use `with Inkbox(...) as inkbox:` (recommended) or call `inkbox.close()` manually to clean up HTTP connections.
+
+---
+
+## Agent Signup
+
+Agents can self-register without a pre-existing API key. All signup methods are **class methods** — no `Inkbox` instance required.
+
+```python
+import os
+from inkbox import Inkbox
+
+# Sign up (public — no API key needed)
+result = Inkbox.signup(
+    human_email="john@example.com",
+    note_to_human="Hey John, this is your sales bot signing up!",  # required
+    display_name="Sales Agent",          # optional
+    agent_handle="sales-agent",          # optional
+    email_local_part="sales.agent",      # optional
+    harness="claude-code",               # optional — selects matching plugin guidance
+    invitation_token=os.getenv("INKBOX_A2A_INVITATION"),  # optional link or raw token
+)
+api_key = result.api_key          # save — shown only once
+email = result.email_address      # e.g. "sales-agent-a1b2c3@inkboxmail.com"
+handle = result.agent_handle      # e.g. "sales-agent-a1b2c3"
+print(result.message)             # authoritative delivery/acceptance outcome
+
+# A matching email-bound invitation can claim immediately without another email.
+already_claimed = (
+    result.invitation is not None and result.invitation.status == "accepted"
+) or result.claim_status == "agent_claimed"
+if not already_claimed:
+    # If the email is missing, resend before submitting its 6-digit code.
+    # Inkbox.resend_signup_verification(api_key)  # 5-minute cooldown
+    Inkbox.verify_signup(api_key, verification_code="483921")
+
+# Check status and restrictions
+status = Inkbox.get_signup_status(api_key)
+print(status.claim_status)                    # "agent_unclaimed" or "agent_claimed"
+print(status.restrictions.max_sends_per_day)  # Effective 24-hour recipient-send limit
+```
+
+| Method | Auth | Returns |
+|---|---|---|
+| `Inkbox.signup(human_email, *, note_to_human, ..., invitation_token=None)` | None | `AgentSignupResponse` |
+| `Inkbox.verify_signup(api_key, verification_code)` | API key | `AgentSignupVerifyResponse` |
+| `Inkbox.resend_signup_verification(api_key)` | API key | `AgentSignupResendResponse` |
+| `Inkbox.get_signup_status(api_key)` | API key | `AgentSignupStatusResponse` |
+
+`signup()` requires `human_email` and `note_to_human`. `display_name`, `agent_handle`, `email_local_part`, `harness`, and `invitation_token` are optional. Omit `invitation_token` when signup is not part of an A2A connection invitation. When an invitation is present, signup and verification return an optional `invitation` summary. A claimed response includes plugin guidance in `message`, tailored to `harness` when supplied.
+
+> **Note:** Unclaimed agents have a limited send quota and can only email the `human_email` specified at signup. After verification or human approval in the console, full capabilities are unlocked.
+
+> **Note:** The `organization_id` returned at signup may change after verification or human approval. Always use the `organization_id` from the most recent response (`verify_signup` or `resend_signup_verification`) rather than caching the value from the initial `signup()` call.
+
+---
+
+## Identities
+
+`inkbox.create_identity()` and `inkbox.get_identity()` return an `AgentIdentity` object that holds the identity's channels and exposes convenience methods scoped to those channels.
+
+```python
+# create_identity atomically provisions the mailbox AND the tunnel —
+# both come back on the response. Phone numbers stay opt-in.
+identity = inkbox.create_identity(
+    "sales-bot",
+    display_name="Sales Bot",
+    description="Sales-outreach agent",
+)
+phone = identity.provision_phone_number()  # provisions a local number
+
+print(identity.email_address)            # sales-bot@inkboxmail.com
+print(identity.tunnel.public_host)       # sales-bot.inkboxwire.com
+print(phone.number)
+
+# Pin the identity's mailbox to a verified custom sending domain
+# (bare name; see "Custom Sending Domains" below).
+inkbox.create_identity("sales-bot-2", sending_domain="mail.acme.com")
+
+# Provision a passthrough tunnel (tls_mode is fixed at create time)
+from inkbox import IdentityTunnelCreateOptions
+inkbox.create_identity("sales-bot-pt", tunnel=IdentityTunnelCreateOptions(tls_mode="passthrough"))
+
+# Get an existing identity
+identity = inkbox.get_identity("sales-bot")
+identity.refresh()  # re-fetch channels from API
+
+# Admin credentials list organization identities; agent-scoped credentials
+# return only their own identity.
+all_identities = inkbox.list_identities()
+
+# Agent-scoped credentials discover peers through the A2A directory.
+peers = inkbox.a2a.organization_directory()
+
+# Update display name and description. The handle is fixed at creation. For description,
+# pass None to clear and omit the kwarg to leave untouched.
+identity.update(display_name="New Name", description="New blurb")
+identity.update(description=None)  # clear
+
+# Release the phone number (vendor + local).
+identity.release_phone_number()
+
+# Delete (cascades to mailbox + tunnel + phone-number release; revokes scoped API keys).
+identity.delete()
+```
+
+## Mail
+
+### Mailbox imports
+
+```python
+from inkbox import MailImportFormat
+
+created = inkbox.mailboxes.imports.create(
+    "agent@inkboxmail.com",
+    source_format=MailImportFormat.AUTO,
+    original_addresses=["old-address@example.com"],
+)
+inkbox.mailboxes.imports.upload(created.upload, "./archive.mbox")
+inkbox.mailboxes.imports.start("agent@inkboxmail.com", str(created.job.id))
+job = inkbox.mailboxes.imports.wait(
+    "agent@inkboxmail.com",
+    str(created.job.id),
+    timeout=3600,
+    poll_interval=5,
+)
+```
+
+Supported formats are `auto`, `mbox`, `eml`, and `zip`. A ZIP may hold `.eml`
+and/or `.mbox` files (a Gmail Takeout ZIP imports as-is); entries that are not
+mail, including nested archives, are ignored. `wait` fetches immediately, polls
+every five seconds by default, and returns every terminal state, including
+`failed` and `cancelled`. A local timeout does not cancel the job. Counters are
+cumulative and never go backwards, but they can sit unchanged while a large
+message is processed and never yield a percentage. Jobs run one at a time per
+organization and share overall import capacity, so a long `queued` stretch is
+normal. Unsafe imported content may be rejected and reported in
+`messages_rejected_unsafe`.
+
+Upload targets expire after 5 minutes; call `refresh_upload_target` and upload
+again if one expires, or `cancel` the job so the mailbox is not held by an
+upload that never landed. Other limits: 1 GiB per upload, 50 MiB per message,
+100,000 messages and 20 `original_addresses` per job, 65,000 entries per ZIP, 20
+import jobs per organization per 24 hours (`MailImportQuotaExceededError`
+carries `retry_after_seconds`), and one in-flight import per mailbox.
+
+```python
+# Send an email (plain text and/or HTML)
+sent = identity.send_email(
+    to=["user@example.com"],
+    subject="Hello from Inkbox",
+    body_text="Hi there!",
+    body_html="<p>Hi there!</p>",
+    cc=["manager@example.com"],
+    bcc=["archive@example.com"],
+)
+
+# Send a threaded reply
+identity.send_email(
+    to=["user@example.com"],
+    subject=f"Re: {sent.subject}",
+    body_text="Following up!",
+    in_reply_to_message_id=sent.id,
+)
+
+# Send with attachments
+identity.send_email(
+    to=["user@example.com"],
+    subject="See attached",
+    body_text="Please find the file attached.",
+    attachments=[{
+        "filename": "report.pdf",
+        "content_type": "application/pdf",
+        "content_base64": "<base64-encoded-content>",
+    }],
+)
+
+# Inline images: set content_id on an image attachment and reference it from
+# body_html as cid:<content_id>. Requires body_html + an image/* content_type,
+# a unique id per send, and is not supported on forwards.
+identity.send_email(
+    to=["user@example.com"],
+    subject="Weekly report",
+    body_html='<p>Revenue:</p><img src="cid:chart">',
+    attachments=[{
+        "filename": "chart.png",
+        "content_type": "image/png",
+        "content_base64": "<base64-encoded-content>",
+        "content_id": "chart",
+    }],
+)
+
+# Track opens: embed a tracking pixel when an HTML body is present. Opens
+# surface on the returned Message as first_opened_at / open_count.
+tracked = identity.send_email(
+    to=["user@example.com"],
+    subject="Did you see this?",
+    body_html="<p>Please review.</p>",
+    track_opens=True,
+)
+print(tracked.first_opened_at, tracked.open_count)
+# Caveats: plain-text-only sends aren't tracked;
+# open_count is approximate (proxy prefetch inflates it, the per-window
+# debounce collapses repeats — so it can read above or below the true
+# count); prefer first_opened_at. Pixels can also raise spam scores.
+
+# Drafts may be incomplete. Every draft response includes its current generation.
+from inkbox import DraftRecipients
+
+draft = identity.create_email_draft(
+    subject="Review requested",
+    idempotency_key="draft-create-2026-08-19-1",
+)
+for saved in identity.iter_email_drafts():
+    print(saved.id, saved.generation)
+current = identity.get_email_draft(draft.id)
+current = identity.update_email_draft(
+    current.id,
+    generation=current.generation,
+    recipients=DraftRecipients(to=["reviewer@example.com"]),
+    subject=None,  # explicit null clears; omitting subject leaves it unchanged
+)
+
+# Attachment part_index values are valid only for the generation that returned them.
+current = inkbox.drafts.add_attachments(
+    identity.email_address,
+    current.id,
+    generation=current.generation,
+    attachments=[{
+        "filename": "report.txt",
+        "content_type": "text/plain",
+        "content_base64": "cmVwb3J0",
+    }],
+)
+part = current.attachment_metadata[0]
+downloaded = inkbox.drafts.download_attachment(
+    identity.email_address, current.id, part.part_index, generation=current.generation
+)
+current = inkbox.drafts.remove_attachment(
+    identity.email_address, current.id, part.part_index, generation=current.generation
+)
+
+copy = identity.duplicate_email_draft(current.id, generation=current.generation)
+identity.delete_email_draft(copy.id, generation=copy.generation)
+sent_draft = identity.send_email_draft(current.id, generation=current.generation)
+
+# Iterate inbox (paginated automatically)
+for msg in identity.iter_emails():
+    print(msg.subject, msg.from_address, msg.is_read)
+
+# Filter by direction: "inbound" or "outbound"
+for msg in identity.iter_emails(direction="inbound"):
+    print(msg.subject)
+
+# Iterate only unread emails
+for msg in identity.iter_unread_emails():
+    print(msg.subject)
+
+# Mark messages as read (or unread)
+identity.mark_emails_read([msg.id for msg in identity.iter_unread_emails()])
+identity.mark_emails_unread(["message-uuid"])
+
+# Get all emails in a thread (thread_id comes from msg.thread_id)
+thread = identity.get_thread(msg.thread_id)
+for m in thread.messages:
+    print(m.subject, m.from_address)
+```
+
+Drafts use the same Drafts folder as a connected mail client, so edits are
+visible in both directions. Always use the latest returned `generation`; after
+any edit, refresh attachment metadata before reusing a `part_index`.
+
+A successful send returns a `Message` and removes the draft. An exact-generation
+retry may return the same sent message. Draft conflicts are structured
+`InkboxAPIError` responses with status `409`; inspect `error.detail["error"]`.
+Refresh on `draft_generation_conflict` and retry the same draft ID and generation
+on `draft_send_in_progress`. Do not resend `draft_delivery_uncertain`; after
+checking sent mail, duplicate or delete that draft instead.
+
+Fetching a single inbound message by id (`inkbox.messages.get`, below)
+with an API key marks it read server-side (`is_read` becomes `True`);
+iterating via `iter_emails` / `iter_unread_emails` does not, so
+`mark_emails_read` stays the way to clear unread in list-only workflows.
+This server-side `is_read` (the agent consumed the message via the API)
+is distinct from `first_opened_at` (the recipient's mail client loaded
+the tracking pixel).
+
+### Mailbox storage
+
+Every mailbox has a plan storage cap. Sends, reply-alls, and forwards that
+would push it over the cap are rejected with a `402` —
+`StorageLimitExceededError`:
+
+```python
+from inkbox import StorageLimitExceededError
+
+try:
+    identity.send_email(to=["user@example.com"], subject="Hi", body_text="…")
+except StorageLimitExceededError as err:
+    print(err.message)                      # human-readable, includes the limit
+    print(err.limit_bytes, err.upgrade_url) # e.g. 2147483648, https://…?tab=billing
+    # Free space (reclaim is immediate) or upgrade the plan:
+    inkbox.messages.delete(mailbox.email_address, "message-uuid")
+    inkbox.threads.delete(mailbox.email_address, "thread-uuid")
+```
+
+Current usage lives on the mailbox (`inkbox.mailboxes.list()` / `.get()`):
+
+```python
+mailbox = inkbox.mailboxes.get("abc-xyz@inkboxmail.com")
+print(mailbox.storage_used_bytes)   # e.g. 1288490188
+print(mailbox.storage_limit_bytes)  # e.g. 2147483648 (2 GiB), or None if unresolved
+
+used_gib = mailbox.storage_used_bytes / 1024**3   # caps are binary — GiB, not GB
+```
+
+The caps are **binary**: 2 GiB is `2 * 1024**3` = 2,147,483,648 bytes. Divide by
+1024 and label the result GiB/MiB.
+
+> **Free plan:** a footer is appended to the **stored** body of outgoing mail,
+> so what you read back with `inkbox.messages.get(...)` is not byte-for-byte
+> what you sent — a `sent_body == fetched_body` round-trip assertion will fail
+> on Free plans (a send with no body comes back with the footer as its body).
+> Paid plans are unaffected.
+
+---
+
+## Phone
+
+```python
+# Place an outbound call — stream audio over WebSocket
+call = identity.place_call(
+    to_number="+15551234567",
+    client_websocket_url="wss://your-agent.example.com/ws",
+)
+print(call.status, call.rate_limit.calls_remaining)
+
+# Let Voice AI handle the call using this identity's saved authority.
+from inkbox import CallMode, HostedAgentAuthorityMode, OnVoicemail
+
+# Discover voices for your organization; no identity argument is needed.
+catalog = inkbox.hosted_agent.list_voices()
+print("Default voice:", catalog.default_voice)
+for voice in catalog.voices:
+    print(voice.id, voice.name, voice.description, voice.available, voice.preview_url)
+
+# Choose an available voice. Config updates replace voice and instructions,
+# so preserve the saved instructions when changing only the voice.
+selected = next((voice for voice in catalog.voices if voice.available), None)
+if selected is not None:
+    config = identity.get_hosted_agent_config()
+    identity.set_hosted_agent_config(
+        voice=selected.id,
+        instructions=config.instructions,
+    )
+
+# Hosted-agent calls leave a voicemail by default (on_voicemail=leave_message);
+# pass voicemail_message to control what is said, or hang_up / ignore to
+# end the call at the beep or skip detection entirely.
+hosted_call = identity.place_call(
+    to_number="+15551234567",
+    mode=CallMode.HOSTED_AGENT,
+    reason="Coordinate the appointment and send confirmations.",
+    on_voicemail=OnVoicemail.LEAVE_MESSAGE,
+    voicemail_message="Hi, this is Ava calling about your appointment. Please call us back.",
+)
+print(hosted_call.on_voicemail)  # OnVoicemail.LEAVE_MESSAGE
+
+# Set the saved default for future inbound and outbound Voice AI calls.
+# Changing the saved default requires an admin API key.
+identity.set_hosted_agent_authority_mode(HostedAgentAuthorityMode.YOLO)
+
+# Per-call overrides are optional. contact_scoped always downscopes. yolo
+# requires an admin credential unless the saved authority is already yolo.
+scoped_call = identity.place_call(
+    to_number="+15551234567",
+    mode=CallMode.HOSTED_AGENT,
+    reason="Confirm only this caller's appointment.",
+    hosted_agent_authority_mode=HostedAgentAuthorityMode.CONTACT_SCOPED,
+)
+
+# List calls (paginated)
+calls = identity.list_calls(limit=10, offset=0)
+for call in calls:
+    print(call.id, call.direction, call.remote_phone_number, call.status)
+
+# Fetch transcript segments for a call
+segments = identity.list_transcripts(calls[0].id)
+for t in segments:
+    print(f"[{t.party}] {t.text}")  # party: "local" or "remote"
+
+# Inspect tool activity for a Voice AI call
+activity = identity.list_tool_invocations(calls[0].id, limit=50, offset=0)
+for invocation in activity.items:
+    print(invocation.tool_name, invocation.status)
+
+# Read transcripts across all recent calls
+for call in identity.list_calls(limit=10):
+    segments = identity.list_transcripts(call.id)
+    if not segments:
+        continue
+    print(f"\n--- Call {call.id} ({call.direction}) ---")
+    for t in segments:
+        print(f"  [{t.party:6}] {t.text}")
+
+# Filter to only the remote party's speech
+for t in identity.list_transcripts(calls[0].id):
+    if t.party == "remote":
+        print(t.text)
+
+# Search transcripts across a phone number (org-level)
+hits = inkbox.phone_numbers.search_transcripts(phone.id, q="refund", party="remote")
+for t in hits:
+    print(f"[{t.party}] {t.text}")
+```
+
+---
+
+## Text Messages (SMS/MMS)
+
+Send and receive SMS/MMS through the identity's assigned phone number.
+
+**Outbound SMS rules (read before sending):**
+
+- Each sender phone number is rate-limited to **100 recipient sends per rolling 24-hour window**. A 3-recipient group message counts as 3 recipient sends. A single accepted send may push usage past the cap; the next capped send returns `429 sender_rate_limited`.
+- A new local number takes **~10-15 minutes** for the 10DLC campaign to propagate at the carrier — `phone_number.sms_status` reads `pending` until then, and sends will return `409 sender_sms_pending`.
+- The recipient must have texted **`START`** to any number within your organization to opt in. Unknown recipients will fail with `403 recipient_not_opted_in`; recipients who later send `STOP` flip to `403 recipient_opted_out`. You can inspect consent state directly via `inkbox.sms_opt_ins` — see [SMS Opt-Ins](#sms-opt-ins).
+- **Beta:** Group MMS and conversation sends are beta. Some carriers may reject group chats or MMS from 10DLC numbers even when the sender is ready and recipients have opted in.
+
+Customer-managed 10DLC brands and campaigns lift the default per-number cap to the carrier-assigned tier.
+
+```python
+# Send SMS/MMS. Returns a queued TextMessage; final delivery state
+# arrives via any webhook subscription on the sender's identity
+# whose event_types include the text.* lifecycle events.
+sent = identity.send_text(to="+15551234567", text="Hello from Inkbox")
+print(sent.id, sent.delivery_status)   # SmsDeliveryStatus.QUEUED
+
+# Group MMS uses the same method with a list of recipients.
+group = identity.send_text(
+    to=["+15551234567", "+15557654321"],
+    text="Hello group",
+    media_urls=["https://example.com/photo.jpg"],
+)
+print(group.conversation_id, group.recipients)
+
+# Reply to an existing conversation by UUID. Do not pass "to" with this form.
+reply = identity.send_text(
+    conversation_id=group.conversation_id,
+    text="Following up in the same conversation.",
+)
+
+# List text messages
+texts = identity.list_texts(limit=20)
+for t in texts:
+    print(t.remote_phone_number, t.text, t.is_read)
+
+# Filter to unread only
+unread = identity.list_texts(is_read=False)
+
+# Get a single text
+text = identity.get_text("text-uuid")
+print(text.type)  # "sms" or "mms"
+if text.media:    # MMS attachments (temporary signed URLs)
+    for m in text.media:
+        print(m.content_type, m.size, m.url)
+
+# List one-to-one conversation summaries; opt into groups explicitly.
+convos = identity.list_text_conversations(limit=20, include_groups=True)
+for c in convos:
+    print(c.id, c.participants, c.latest_has_media, c.latest_text)
+
+# Get messages in a specific conversation by remote number or conversation UUID.
+msgs = identity.get_text_conversation("+15551234567", limit=50)
+
+# Mark as read
+identity.mark_text_read("text-uuid")
+identity.mark_text_conversation_read("+15551234567")
+
+# Org-level: search and delete
+results = inkbox.texts.search(phone.id, q="invoice", limit=20)
+inkbox.texts.update(phone.id, "text-uuid", status="deleted")
+```
+
+---
+
+## SMS Opt-Ins
+
+Per-recipient SMS consent state, keyed by `(your org, recipient number)`. The
+registry is updated automatically when recipients text `START` / `STOP` to any
+of your numbers (`source="sms"`).
+
+**Reads** — open to admin API keys and user session JWTs.
+
+```python
+from inkbox import SmsOptInStatus
+
+# List the org's consent rows (newest-updated first; server caps limit at 200)
+rows = inkbox.sms_opt_ins.list(limit=50)
+opted_out = inkbox.sms_opt_ins.list(status=SmsOptInStatus.OPTED_OUT)
+
+# Look up one recipient — 404 → InkboxAPIError if no row exists
+row = inkbox.sms_opt_ins.get("+15551234567")
+print(row.status, row.source, row.opted_in_at, row.opted_out_at)
+```
+
+**Writes** — admin-only, and only if your org runs its own active, customer-managed 10DLC
+campaign. Orgs on the Inkbox-default campaign share consent state and get a
+`409 customer_campaign_required` on write attempts. Writes record an audit
+event with `source="api"`.
+
+```python
+# Record consent captured outside of STOP/START (signup form, paper waiver, etc.)
+inkbox.sms_opt_ins.opt_in("+15551234567")
+
+# Honor an opt-out collected outside of inbound STOP
+inkbox.sms_opt_ins.opt_out("+15551234567")
+```
+
+---
+
+## iMessage
+
+Chat with humans over the shared iMessage router or a personal iMessage line.
+iMessage is **opt-in per identity** (`imessage_enabled`). Shared service
+requires the human to message first. Personal lines may start new
+conversations, subject to consent, contact-rule, and rate-limit checks.
+
+Personal lines can also receive one-to-one messages from non-phone sender
+addresses, such as `sender@example.com`. Read responses and `imessage.received`
+webhooks preserve the address as a string; do not normalize it into a phone number
+or assume every received message can be answered. These conversations are
+**receive-only**: sending messages, reactions, typing indicators, or read receipts
+returns HTTP `422` with `recipient_not_e164`. Outbound `to` recipients must still
+be E.164 phone numbers. Reading message history does not send a read receipt.
+
+```python
+from inkbox import IMessageSendStyle
+
+# Shared service: opt an identity in at create time or later.
+identity = inkbox.create_identity("my-agent", imessage_enabled=True)
+
+# Resolve the router number at runtime — never hardcode it.
+router = inkbox.imessages.get_triage_number()
+print(router.number, router.connect_command)  # e.g. 'connect @my-agent'
+
+# List personal iMessage lines, attached or not.
+numbers = inkbox.imessages.list_numbers()
+for number in numbers:
+    print(number.number, number.line_role, number.agent_handle)
+
+# Claim an unattached organization-owned number. Keep the caller-generated
+# key stable if the request's outcome is ambiguous and you retry it.
+number = inkbox.imessages.claim_number(
+    idempotency_key="claim-agent-2026-07-18",
+)
+# `number.type` remains "dedicated_outbound" as a legacy response field. Do
+# not use it for capability detection.
+
+# Claim and attach atomically while creating an identity.
+dedicated_identity = inkbox.create_identity(
+    "dedicated-agent",
+    imessage_enabled=True,
+    claim_imessage_number=True,
+)
+print(dedicated_identity.imessage_number.number)
+
+# Existing identities can atomically claim/swap a new number, attach an already
+# owned number by UUID, or move back to the shared service with explicit None.
+identity.update(
+    claim_imessage_number=True,
+    idempotency_key="swap-my-agent-2026-07-18",
+)
+identity.update(imessage_number_id=number.id)
+identity.update(imessage_number_id=None)
+
+# Once a human has connected and messaged, read and reply.
+import re
+
+# Select a phone-number conversation for these outbound examples.
+convos = [c for c in identity.list_imessage_conversations(limit=20)
+          if c.assignment_status == "active"
+          and re.fullmatch(r"\+[1-9][0-9]{1,14}", c.remote_number or "")]
+if not convos:
+    raise ValueError("No phone-number conversation is available for replies.")
+msgs = identity.list_imessages(conversation_id=convos[0].id)
+identity.send_imessage(
+    conversation_id=convos[0].id,
+    text="On it — give me two minutes.",
+)
+
+# A personal line can create or reuse an exact-participant group. Keep the
+# returned conversation_id and use it for later replies. A best-known set that
+# matches multiple conversations returns 409 instead of choosing one.
+group = dedicated_identity.send_imessage(
+    to=["+15551234567", "+15557654321"],
+    text="Welcome to the group!",
+    media_urls=["https://example.com/group-photo.jpg"],
+    send_style=IMessageSendStyle.CONFETTI,
+)
+dedicated_identity.send_imessage(
+    conversation_id=group.conversation_id,
+    text="Following up in the same conversation.",
+    media_urls=["https://example.com/follow-up.jpg"],
+    send_style=IMessageSendStyle.LASERS,
+)
+group_convos = dedicated_identity.list_imessage_conversations(include_groups=True)
+group_msgs = dedicated_identity.list_imessages(include_groups=True)
+print(group.is_group, group.participants, group.recipients)
+# group_creation_status is creating, not_created, or ready. A rejected initial
+# creation leaves this same local conversation at not_created; send again with
+# its conversation_id to retry. A successful retry binds the remote thread and
+# changes the status to ready.
+print(group_convos[0].group_creation_status)
+# Groups accept the same 13 IMessageSendStyle values as one-to-one sends on
+# both creation and conversation_id replies, with or without the media URL.
+
+# Who is currently connected? (Disconnected conversations stay readable
+# with assignment_status == "released"; sends into them return 409.)
+connections = identity.list_imessage_assignments()
+identity.release_imessage_assignment(connections[0].id)  # admin key only; they can reconnect via triage
+
+# Tapbacks target inbound one-to-one or group messages by message_id. The seven
+# named reactions include "eyes" ("custom" is rejected locally on send), and a
+# new tapback replaces your previous one on the same message part. Group read
+# receipts and typing indicators remain unsupported and return 409.
+sent_reaction = identity.send_imessage_reaction(message_id=msgs[0].id, reaction="like")
+
+# Take your own tapback back. Only the sender can; a failed removal leaves it in
+# place rather than clearing it locally, so the call can be retried.
+identity.remove_imessage_reaction(sent_reaction.id)
+
+# Read receipts, typing indicator, media.
+identity.mark_imessage_conversation_read(convos[0].id)
+identity.send_imessage_typing(convos[0].id)
+upload = identity.upload_imessage_media(
+    content=open("chart.png", "rb").read(),
+    filename="chart.png",
+    content_type="image/png",
+)
+identity.send_imessage(conversation_id=convos[0].id, media_urls=[upload.media_url])
+
+# Per-identity allow/block rules, interpreted via imessage_filter_mode.
+inkbox.imessage_contact_rules.create(
+    "my-agent", action="block", match_target="+15555550999",
+)
+```
+
+Claiming can raise `DedicatedIMessageNumberQuotaExceededError` (inspect
+`number_type`, `limit`, `current`, and `upgrade_url`),
+`DedicatedIMessageNumberInventoryPendingError` (inspect
+`retry_after_seconds`), or `IdempotencyKeyReusedError` when a key is
+reused with a different request.
+
+Inbound messages, tapbacks, and outbound delivery status arrive via
+identity-owned webhook subscriptions — see [Webhooks](#webhooks) for
+the five `imessage.*` event types.
+
+---
+
+## Agent-to-Agent (A2A)
+
+With an admin-scoped API key, create and manage an invitation that connects an
+external agent to a fixed bundle of peers:
+
+```python
+invite = inkbox.a2a_invitations.create(
+    ["support", "billing"], recipient_email="customer@example.test"
+)
+page = inkbox.a2a_invitations.list(status="pending")
+inkbox.a2a_invitations.revoke(invite.id)
+
+# No API key is required to review an invitation before signup or acceptance:
+preview = Inkbox.preview_a2a_invitation(os.environ["INKBOX_A2A_INVITATION"])
+
+# With a claimed agent-scoped key:
+inkbox.a2a_invitations.accept(os.environ["INKBOX_A2A_INVITATION"])
+```
+
+An unbound create returns `invitation_token`, `invitation_url`, and
+`agent_handoff_prompt` when available. `accept()` and signup accept either the
+exact-origin share URL or a raw token; `extract_a2a_invitation_token()` is
+exported for local normalization. Only the raw token is sent to the API.
+A recipient-email-bound create emails the recipient and omits capability fields.
+Raw and extracted tokens must match `a2ai_` followed by 43 URL-safe characters.
+Share links require HTTPS, except for configured `localhost`/`127.0.0.1` URLs.
+
+```python
+identity = inkbox.get_identity("coordinator")
+
+public_agents = inkbox.a2a.public_directory(q="research", limit=25)
+organization_agents = inkbox.a2a.organization_directory(q="support")
+for item in public_agents.items:
+    print(item.card.name, item.card_url, item.visibility)
+
+identity.a2a_set_publicly_discoverable(True)  # admin API key required
+identity.a2a_set_allow_public_egress(True)
+
+# Omit direction for the receiver inbox. Use "outbound" for requested work
+# or "both" for the complete identity-scoped history.
+page = identity.a2a_tasks(
+    direction="both",
+    requester_handle="coordinator",
+    worker_handle="researcher",
+    state="working",
+    q="quarterly report",
+    since="2026-07-01T00:00:00Z",
+    limit=25,
+)
+if page.next_cursor:
+    next_page = identity.a2a_tasks(
+        direction="both",
+        requester_handle="coordinator",
+        worker_handle="researcher",
+        state="working",
+        q="quarterly report",
+        since="2026-07-01T00:00:00Z",
+        cursor=page.next_cursor,
+        limit=25,
+    )
+
+# Iterators preserve every filter while following opaque cursors.
+for message in identity.iter_a2a_messages(
+    direction="outbound",
+    worker_handle="researcher",
+    role="agent",
+    q="revenue",
+):
+    print(message.task_id, message.task_state, message.parts)
+
+# The outbound alias is convenient when only requested work is needed.
+sent = identity.a2a_sent_tasks(worker_handle="researcher")
+
+# Context caller/target stays in original-open orientation. Each nested task
+# carries its own caller and target, so both directions can run concurrently.
+for context in identity.a2a_contexts(direction="both").items:
+    print(context.name, context.id)
+
+renamed = identity.a2a_update_context(
+    "context-uuid",
+    name="Quarterly Research Review",
+)
+```
+
+Task keyword filtering returns tasks containing a matching message. Message
+filtering returns the individual matching messages with task, context,
+requester, and worker provenance. Search covers string and numeric content
+values from `text` and `data` parts, excludes metadata, and is newest-first
+rather than relevance-ranked. `role` is the message author (`caller` or
+`agent`), independent of task direction. Task detail exposes message history
+and current state.
+
+Directory methods support `q`, `cursor`, and `limit`; iterator variants follow
+all pages. Receiver enablement, public egress, and advertised skills accept the
+identity's agent-scoped key. Public discoverability, filter-mode, and
+contact-rule create/update/delete operations require an admin API key. Use
+`a2a_reset_skills()` to restore default skills.
+
+New contexts immediately expose the persisted name `New A2A Session`. That
+exact default may be replaced asynchronously with a short name based on the
+first task message. Either participant can rename the shared context at any
+time; a non-default name is not replaced by automatic naming.
+Applications should display the returned value as-is. Context-level `caller`
+and `target` always identify the original opener and recipient. Nested task
+participants are authoritative for each task's direction, and multiple tasks
+can run concurrently in either direction.
+
+The standard client reuses the existing `context_id` option. Supplying a
+context without a task starts a sibling task; supplying `task_id` continues
+that specific task:
+
+```python
+client = identity.a2a_client()
+target = client.fetch_card("https://example.test/a2a/researcher/card")
+result = client.send(
+    target,
+    text="Review the updated findings",
+    context_id="context-uuid",
+)
+```
+
+Cross-endpoint context reuse is supported between Inkbox identities. External
+A2A services may define different context reuse behavior.
+
+Rule directions are `inbound`, `outbound`, or `both`. Same-organization and
+public discovery may imply admission; private cross-organization calls must
+pass the requester's outbound policy and the worker's inbound policy. `both`
+applies in either role, and explicit blocks always win.
+
+The standard client authenticates Agent Card retrieval on the configured
+Inkbox origin. It never sends the Inkbox API key to external card or RPC
+origins. An explicit external credential is sent only to a same-origin RPC URL.
+
+## Credentials
+
+Access credentials stored in the vault through the agent-facing `credentials` surface. The vault must be unlocked first.
+
+```python
+# Unlock the vault (once per session)
+inkbox.vault.unlock("my-Vault-key-01!")
+
+identity = inkbox.get_identity("my-agent")
+
+# Discovery — list credentials this identity has access to
+for login in identity.credentials.list_logins():
+    print(login.name, login.payload.username)
+
+for key in identity.credentials.list_api_keys():
+    print(key.name, key.payload.access_key)
+
+# Access by UUID — returns the typed payload directly
+login   = identity.credentials.get_login("secret-uuid")      # → LoginPayload
+api_key = identity.credentials.get_api_key("secret-uuid")    # → APIKeyPayload
+ssh_key = identity.credentials.get_ssh_key("secret-uuid")    # → SSHKeyPayload
+
+# Generic access
+secret = identity.credentials.get("secret-uuid")             # → DecryptedVaultSecret
+```
+
+---
+
+## Vault Management
+
+Manage the encrypted vault at the org level. Access via `inkbox.vault`.
+
+```python
+# Get vault metadata (key counts, secret counts)
+info = inkbox.vault.info()
+print(info.secret_count, info.key_count)
+
+# Initialize a new vault (creates primary key + recovery keys)
+result = inkbox.vault.initialize("my-Vault-key-01!")
+for recovery_key in result.recovery_keys:
+    print(recovery_key.recovery_code)  # save these immediately
+
+# Rotate the vault password
+inkbox.vault.update_key("new-Vault-key-02!", current_vault_key="my-Vault-key-01!")
+
+# Rotate using a recovery code (if primary key is lost)
+inkbox.vault.update_key("new-Vault-key-02!", recovery_code="recovery-code-here")
+
+# List vault keys
+keys = inkbox.vault.list_keys()                         # all keys
+primary_keys = inkbox.vault.list_keys(key_type="PRIMARY")
+recovery_keys = inkbox.vault.list_keys(key_type="RECOVERY")
+
+# List secrets (metadata only — no encrypted payloads)
+secrets = inkbox.vault.list_secrets()
+logins  = inkbox.vault.list_secrets(secret_type="login")
+
+# Delete a secret
+inkbox.vault.delete_secret("secret-uuid")
+
+# Unlock the vault for decryption (returns an UnlockedVault)
+unlocked = inkbox.vault.unlock("my-Vault-key-01!")
+secret = unlocked.get_secret("secret-uuid")
+print(secret.name, secret.payload)
+```
+
+### Access control
+
+Control which identities can access which secrets.
+
+```python
+# List access rules for a secret
+rules = inkbox.vault.list_access_rules("secret-uuid")
+for rule in rules:
+    print(rule.identity_id)
+
+# Grant an identity access to a secret
+inkbox.vault.grant_access("secret-uuid", "identity-uuid")
+
+# Revoke access
+inkbox.vault.revoke_access("secret-uuid", "identity-uuid")
+```
+
+---
+
+## Identity Secret Management
+
+Manage vault secrets scoped to a specific identity. These methods create secrets and automatically grant the identity access.
+
+```python
+from inkbox.vault.models import LoginPayload, APIKeyPayload
+
+identity = inkbox.get_identity("my-agent")
+
+# Create a secret and auto-grant this identity access
+secret = identity.create_secret(
+    name="CRM Login",
+    payload=LoginPayload(username="bot@crm.com", password="s3cret"),
+    description="CRM service account",
+)
+
+# Fetch and decrypt a secret
+decrypted = identity.get_secret(secret.id)
+print(decrypted.payload.username)
+
+# Delete a secret
+identity.delete_secret(secret.id)
+
+# Revoke this identity's access (without deleting the secret)
+identity.revoke_credential_access(secret.id)
+```
+
+### TOTP (one-time passwords)
+
+Add, remove, and generate TOTP codes for login secrets.
+
+```python
+# Add TOTP to a login secret (accepts otpauth:// URI or TOTPConfig)
+identity.set_totp(secret.id, "otpauth://totp/Example:user?secret=JBSWY3DPEHPK3PXP&issuer=Example")
+
+# Generate the current TOTP code
+code = identity.get_totp_code(secret.id)
+print(code.code, code.expires_in)
+
+# Remove TOTP from a secret
+identity.remove_totp(secret.id)
+```
+
+---
+
+## Org-level Messages and Threads
+
+Access messages and threads directly without going through an identity. Useful for org-wide operations.
+
+```python
+# List messages for a mailbox (paginated automatically)
+for msg in inkbox.messages.list("abc@inkboxmail.com"):
+    print(msg.subject)
+
+# Get a single message with full body. Fetching an *inbound* message with
+# an API key marks it read server-side (is_read -> True); list, thread, and
+# attachment routes do not. Use mark_read for list-only workflows.
+detail = inkbox.messages.get("abc@inkboxmail.com", "message-uuid")
+print(detail.body_text)
+
+# Send a message from a mailbox
+inkbox.messages.send(
+    "abc@inkboxmail.com",
+    to=["user@example.com"],
+    subject="Hello",
+    body_text="Hi there!",
+)
+
+# Update message flags
+inkbox.messages.update_flags("abc@inkboxmail.com", "message-uuid", is_read=True)
+inkbox.messages.mark_read("abc@inkboxmail.com", "message-uuid")
+inkbox.messages.mark_unread("abc@inkboxmail.com", "message-uuid")
+inkbox.messages.star("abc@inkboxmail.com", "message-uuid")
+inkbox.messages.unstar("abc@inkboxmail.com", "message-uuid")
+
+# Delete a message
+inkbox.messages.delete("abc@inkboxmail.com", "message-uuid")
+
+# Get a temporary signed URL for an attachment
+attachment = inkbox.messages.get_attachment("abc@inkboxmail.com", "message-uuid", "report.pdf")
+print(attachment["url"])
+
+# List threads (paginated automatically)
+for thread in inkbox.threads.list("abc@inkboxmail.com"):
+    print(thread.subject, thread.message_count)
+
+# Get a thread with all messages
+thread = inkbox.threads.get("abc@inkboxmail.com", "thread-uuid")
+
+# Delete a thread
+inkbox.threads.delete("abc@inkboxmail.com", "thread-uuid")
+```
+
+---
+
+## Org-level Calls
+
+Calls are identity-scoped. Access them via `inkbox.calls`; transcripts
+are folded onto the same resource as `inkbox.calls.transcripts(call_id)`.
+
+```python
+# List calls (agent-scoped keys resolve their own identity; admin/JWT
+# keys must pass agent_identity_id).
+calls = inkbox.calls.list(limit=10)
+for call in calls:
+    print(call.id, call.direction, call.status, call.origin)
+
+# List calls for a specific identity (admin/JWT)
+scoped = inkbox.calls.list(agent_identity_id="identity-uuid", limit=10)
+
+# Get a single call
+call = inkbox.calls.get("call-uuid")
+
+# Place an outbound call from a dedicated number
+placed = inkbox.calls.place(
+    from_number="+18335794607",
+    to_number="+15551234567",
+    client_websocket_url="wss://example.com/ws",
+)
+
+# Place an outbound call over the shared iMessage-number pool
+from inkbox import CallOrigin
+shared = inkbox.calls.place(
+    to_number="+15551234567",
+    origination=CallOrigin.SHARED_IMESSAGE_NUMBER,
+    agent_identity_id="identity-uuid",
+)
+
+# List transcript segments for a call
+segments = inkbox.calls.transcripts("call-uuid")
+for t in segments:
+    print(f"[{t.party}] {t.text}")
+```
+
+### Incoming-call routing
+
+```python
+from inkbox import ForwardingTargetType, IncomingCallAction
+
+# Read the current incoming-call config
+config = inkbox.incoming_call_action.get()
+
+# Route incoming calls to a webhook
+inkbox.incoming_call_action.set(
+    incoming_call_action=IncomingCallAction.WEBHOOK,
+    incoming_call_webhook_url="https://your-agent.example.com/incoming-call",
+)
+
+# Forward every incoming call for this identity to a SIP URI with a public DNS hostname
+inkbox.incoming_call_action.set(
+    incoming_call_action=IncomingCallAction.FORWARD,
+    forwarding_target_type=ForwardingTargetType.SIP,
+    forwarding_sip_uri="sip:+14155550100@voice.example.com",
+)
+
+# Connection attempts are chronological and separate from call.status.
+call = inkbox.calls.get("call-uuid")
+if call.connections is not None:  # An empty list is authoritative.
+    for connection in call.connections:
+        print(connection.kind, connection.status, connection.target)
+else:  # Older responses expose automatic incoming forwarding only.
+    for forwarding in call.forwardings:
+        print(forwarding.status, forwarding.target)
+```
+
+Call records also expose `connections` when available: `kind` distinguishes
+`handoff` from `conference`, and `trigger` distinguishes `incoming_action` from
+`agent_tool`. Successful attempts use `status: "connected"`; `ended_at` records
+when they later end. Prefer `connections` when present, including an empty list.
+Only use `forwardings` as a fallback for older responses that omit `connections`;
+`forwardings` contains only automatic incoming-call forwarding, while `connections`
+also includes live transfers and conference guests. Do not count overlapping
+attempts twice. Transfers and conferences are Voice AI
+actions, not SDK call-control methods. Call items in contact correspondence also
+expose the same optional `connections` list, without a legacy forwarding list.
+Unknown connection kinds, triggers, and statuses retain their original string
+values; do not interpret an unfamiliar value as a handoff or a successful connection.
+
+---
+
+## Org-level Mailboxes
+
+Mailboxes are provisioned atomically by `inkbox.create_identity(...)`
+and removed by `identity.delete()` (cascade). The `inkbox.mailboxes`
+surface is read + update + search only.
+
+```python
+# List all mailboxes in the organisation
+mailboxes = inkbox.mailboxes.list()
+
+# Get a specific mailbox
+mailbox = inkbox.mailboxes.get("abc-xyz@inkboxmail.com")
+print(mailbox.email_address)
+print(mailbox.sending_domain)        # bare domain the mailbox sends from
+print(mailbox.agent_identity_id)     # non-null for live customer mailboxes (1:1 invariant)
+print(mailbox.storage_used_bytes)    # bytes currently stored
+print(mailbox.storage_limit_bytes)   # plan cap in bytes (binary GiB), or None
+
+# Filter mode now lives on the agent identity — set it via
+# identity.update(mail_filter_mode=...). display_name likewise moved to
+# the identity; the mailbox PATCH endpoint hard-rejects display_name
+# with a 422. To attach a webhook receiver, see "Webhooks" below.
+inkbox.get_identity("support-agent").update(mail_filter_mode="whitelist")  # admin-scoped key only
+# (deprecated) inkbox.mailboxes.update(mailbox.email_address, filter_mode="whitelist")
+
+# Full-text search across messages in a mailbox
+results = inkbox.mailboxes.search(mailbox.email_address, q="invoice", limit=20)
+for msg in results:
+    print(msg.subject, msg.from_address)
+
+# To remove a mailbox, delete its owning identity (cascades to the
+# linked mailbox AND tunnel; revokes scoped API keys):
+inkbox.get_identity("support-agent").delete()
+```
+
+---
+
+## Custom Sending Domains
+
+If your org has registered custom sending domains in the console, list them and (admin-only) set the org default. New mailboxes inherit the org default unless you pass `sending_domain` to `create_identity`. Domain registration, DNS records, verification, DKIM rotation, and deletion stay in the console.
+
+```python
+from inkbox import SendingDomainStatus
+
+# List custom sending domains for the org (optionally filter by status)
+verified = inkbox.domains.list(status=SendingDomainStatus.VERIFIED)
+for d in verified:
+    print(d.id, d.domain, d.status, d.is_default)
+
+# Set the org default — admin-scoped API key only.
+# Returns the bare new default domain name (or None when reverted to platform).
+new_default = inkbox.domains.set_default("mail.acme.com")
+
+# Pass the platform domain (e.g. "inkboxmail.com" in prod) to revert.
+inkbox.domains.set_default("inkboxmail.com")  # -> None
+```
+
+---
+
+## Mail clients (IMAP/SMTP)
+
+An Inkbox inbox can also be attached to a regular mail client (Thunderbird,
+Apple Mail, mutt, …) with the API key you already have. There is no separate
+credential to create and no SDK call involved — the gateway speaks IMAP and
+SMTP directly.
+
+| Setting | Value |
+|---|---|
+| IMAP host | `imap.inkboxmail.com` |
+| IMAP port | `993` (IMAPS / implicit TLS) |
+| SMTP host | `smtp.inkboxmail.com` |
+| SMTP port | `465` (SMTPS / implicit TLS) or `587` (STARTTLS) |
+| Username | the inbox address (e.g. `sales-bot@inkboxmail.com`) |
+| Password | an **identity-scoped** API key (`ApiKey_...`) |
+
+The password is an agent-scoped API key — the same key an identity-scoped
+`Inkbox(...)` client authenticates with. Mint one with
+`inkbox.api_keys.create(scoped_identity_id=...)`. Admin-scoped keys are
+rejected: one key maps to exactly one mailbox. Revoking the key revokes
+mail-client access.
+
+Two constraints that bite in practice:
+
+- **`From` must be the authenticated inbox address**, and exactly one address.
+  Aliases and "send as" identities are rejected.
+- **On the Free plan, signed/encrypted mail (S/MIME, PGP) cannot be sent over
+  SMTP.** The required footer can't be injected without breaking the signature,
+  so the send is refused. Send unsigned, or upgrade the plan.
+
+If your client saves its own copy of sent messages, leave that setting on:
+Inkbox recognizes the copy as the message it already stored, so you get one
+Sent entry, charged against your storage cap once.
+
+Full setup walkthrough:
+<https://inkbox.ai/docs/capabilities/email/mail-clients>
+
+---
+
+## Org-level Phone Numbers
+
+Read, search, and release phone numbers org-wide via `inkbox.phone_numbers`. Provisioning still goes through an identity — pass `agent_handle` so the new number is bound to it from the start.
+
+```python
+# List all phone numbers in the organisation
+numbers = inkbox.phone_numbers.list()
+
+# Get a specific phone number by ID
+number = inkbox.phone_numbers.get("phone-number-uuid")
+
+# Provision a new number
+number = inkbox.phone_numbers.provision(agent_handle="sales-bot")  # local by default
+in_ny  = inkbox.phone_numbers.provision(agent_handle="sales-bot", state="NY")
+
+# Update incoming call behaviour
+inkbox.phone_numbers.update(
+    number.id,
+    incoming_call_action="webhook",
+    incoming_call_webhook_url="https://example.com/calls",
+)
+inkbox.phone_numbers.update(
+    number.id,
+    incoming_call_action="auto_accept",
+    client_websocket_url="wss://example.com/ws",
+)
+
+# Full-text search across transcripts
+hits = inkbox.phone_numbers.search_transcripts(number.id, q="refund", party="remote")
+for t in hits:
+    print(f"[{t.party}] {t.text}")
+
+# Release a number
+inkbox.phone_numbers.release(number.id)
+```
+
+---
+
+## Tunnels
+
+Bring a local Python process online at a public `https://{name}.inkboxwire.com` URL via outbound HTTP/2. No inbound port to open, no static IP needed. Supports Linux, macOS, and native Windows with Python 3.11 or newer; WSL is not required.
+
+Keep Python current with the latest patch release. Tunnel state defaults to your user profile; if you set `state_dir`, use a directory accessible only to your account.
+
+```python
+with Inkbox(api_key="ApiKey_...") as inkbox:
+    # Forward to a local HTTP server (edge mode — Inkbox terminates TLS)
+    listener = inkbox.tunnels.connect(
+        name="my-app",
+        forward_to="http://127.0.0.1:8080",
+    )
+    print(listener.public_url)        # https://my-app.inkboxwire.com
+    print(listener.status)            # idle, connecting, connected, ...
+    print(listener.is_connected)      # local runtime liveness
+    print(listener.last_connected_at) # aware UTC datetime, or None
+    listener.wait()                   # blocks until close()/Ctrl-C
+
+    # Or forward to an in-process ASGI app (FastAPI / Starlette / yours)
+    listener = inkbox.tunnels.connect(name="my-app", forward_to=fastapi_app)
+
+    # Passthrough TLS — tls_mode is fixed at identity-create time:
+    inkbox.create_identity("my-app-pt", tunnel={"tls_mode": "passthrough"})
+    listener = inkbox.tunnels.connect(
+        name="my-app-pt",
+        forward_to="http://127.0.0.1:8080",
+    )
+```
+
+Async variant (`serve_forever()` / `aclose()`) is available for callers already inside an event loop. Pick one pair; don't mix `wait`/`close` with the async APIs.
+
+The listener retries transient connect, HELLO, transport, and PING failures with
+bounded establishment and exponential backoff. `status` is one of `idle`,
+`connecting`, `connected`, `reconnecting`, `closed`, or `superseded`;
+`last_connected_at` retains the latest successful connection time while the
+runtime reconnects. These properties describe this local listener. The
+`listener.tunnel` object is the bootstrap resource snapshot; fetch the tunnel
+again when you need current control-plane fields. Authentication rejection and
+takeover remain terminal and surface from `wait()` / `serve_forever()`.
+Synchronous `close()` raises `TimeoutError` if the runtime thread does not stop
+within 30 seconds; avoid calling it from a `finally` block if that exception
+would mask another error.
+
+Tunnels are provisioned atomically by `inkbox.create_identity(...)`;
+there is no standalone `create` / `delete` / `restore` /
+`rotate_secret` surface. Read + edit on the resource:
+
+```python
+inkbox.tunnels.list()
+inkbox.tunnels.get("tunnel-uuid")
+inkbox.tunnels.update("tunnel-uuid", metadata={"team": "gtm"})
+# Passthrough only:
+inkbox.tunnels.sign_csr("tunnel-uuid", csr_pem=csr_bytes)
+```
+
+Data-plane authentication uses the same `api_key` the `Inkbox` client
+was constructed with — admin-scoped or identity-scoped (matching the
+tunnel's identity). Mint a per-agent scoped key via
+`inkbox.api_keys.create(scoped_identity_id=...)`. There is no
+per-tunnel connect secret to rotate. State (passthrough cert/key,
+cached tunnel id) lives under `~/.inkbox/tunnels/{name}/`; treat it
+like an SSH key dir. `forward_to` is loopback-only by default; pass
+`allow_remote_forwarding=True` after reviewing the SSRF tradeoff.
+
+---
+
+## Webhooks
+
+Mixed subscriptions and explicit identity-wide lists require SDK/CLI **0.7.8 or
+later** and `supports_identity_subscriptions: true` from `GET /webhooks/catalog`.
+Until available, keep separate channel subscriptions using mailbox, phone, and
+identity selectors without explicit scope. Explicit identity scope checks the
+catalog once per list call and fails clearly when unsupported; omitted scope adds
+no request. The mixed-event examples below assume the capability is available.
+
+Each notification subscription belongs to an agent identity and can combine
+mail, text, iMessage, call-lifecycle, A2A, and Slack event types. Optional
+channels do not have to be configured before subscribing. Multiple receivers
+remain supported; one identity and URL cannot have overlapping event selections.
+
+Incoming-call actions are separate identity settings: `phone.incoming_call` is a
+synchronous call-control callback, not a notification subscription.
+
+### Subscribe once across channels
+
+```python
+identity = inkbox.get_identity("my-agent")
+sub = inkbox.webhooks.subscriptions.create(
+    agent_identity_id=identity.id,
+    url="https://example.com/hook",
+    event_types=["message.received", "text.received", "imessage.received",
+                 "call.ended", "a2a.task.created"],
+)
+
+# Events on update replace the full selection.
+updated = inkbox.webhooks.subscriptions.update(
+    sub.id, scope="identity", event_types=[*sub.event_types, "a2a.task.message"],
+)
+inkbox.webhooks.subscriptions.delete(updated.id, scope="identity")
+```
+
+Available event types:
+
+| Channel | `event_type` values |
+|---|---|
+| Mail | `message.received`, `message.sent`, `message.forwarded`, `message.delivered`, `message.bounced`, `message.failed` |
+| Phone text | `text.received`, `text.sent`, `text.delivered`, `text.delivery_failed`, `text.delivery_unconfirmed` |
+| iMessage | `imessage.received`, `imessage.reaction_received`, `imessage.sent`, `imessage.delivered`, `imessage.delivery_failed` |
+| Call lifecycle | `call.ended` |
+| A2A | `a2a.task.created`, `a2a.task.message`, `a2a.task.canceled`, `a2a.sent_task.updated` |
+
+Prefer `agent_identity_id`. Legacy mailbox/phone selectors remain mutually exclusive
+and resolve to their owning identity. Event lists must be nonempty and distinct;
+the API validates exact catalog values, while the SDK rejects unknown prefixes
+and `phone.incoming_call`. No wildcard or automatic channel provisioning is implied.
+
+### Listing and delivery history
+
+Owner-filtered lists preserve legacy single-family views by default and exclude
+mixed subscriptions. Explicitly opt in when listing all notification families:
+
+```python
+subscriptions = inkbox.webhooks.subscriptions.list(
+    agent_identity_id=identity.id, scope="identity",
+)
+```
+
+Identity-owned subscriptions return the canonical identity owner with null legacy
+mailbox and phone owner fields. Older servers can still return legacy resource owners. Event-list updates replace the full selection.
+Delivery history retains the original subscription ID and exposes `replayable`
+and `replay_unavailable_reason`. Older responses default these to false and null.
+Replay still checks whether the subscription is active and selects the event.
+
+### Conversation context
+
+Opt a subscription into per-class conversation history on **received**
+events (`message.received`, `text.received`, `imessage.received`) by
+passing `context_config`. Each class (`email`, `texts`, `calls`) takes a
+`count` mode (last N items, 1..50) or a `window` mode (last H hours,
+1..168); omit a class to leave it unconfigured. Only these received events
+include context; A2A, call-lifecycle and other notifications ignore it.
+
+```python
+inkbox.webhooks.subscriptions.create(
+    agent_identity_id=identity.id,
+    url="https://example.com/hook",
+    event_types=["message.received"],
+    context_config={
+        "email": {"mode": "count", "count": 10},
+        "texts": {"mode": "window", "hours": 24},
+    },
+)
+
+# update() is tri-state: omit context_config to leave it unchanged, pass a
+# dict to replace it, or pass None to clear it.
+inkbox.webhooks.subscriptions.update(sub.id, scope="identity", context_config=None)
+```
+
+Received-event payloads then carry an optional `data["context"]` keyed by
+class. Optional fields are **omitted when empty** (never `null`) — read
+with `.get(...)`. A skipped
+class ships `items: []` plus a `skipped` reason; call transcript entries
+are either turns or an abridgment marker, discriminated on
+`"marker" in entry`:
+
+```python
+# payload is a cast MailWebhookPayload / TextWebhookPayload / ... (see below)
+context = payload["data"].get("context")
+if context:
+    email = context.get("email")
+    if email:
+        if email.get("skipped"):
+            logger.info("no email context: %s", email["skipped"])
+        for item in email["items"]:
+            logger.info("%s %s", item["direction"], item.get("subject"))
+    calls = context.get("calls")
+    if calls:
+        for call in calls["items"]:
+            for entry in call["transcript"]:
+                if "marker" in entry:
+                    logger.info("… %s turns abridged", entry["omitted_turns"])
+                else:
+                    logger.info("%s: %s", entry.get("party"), entry.get("text"))
+```
+
+The config types (`WebhookContextConfig`, `WebhookContextClassConfig`) and
+the payload wire types (`WebhookContextWire`, `WebhookContextBlockWire`,
+`WebhookTranscriptEntryWire`, …) are exported from `inkbox`.
+
+### Delivery auth token
+
+If your endpoint requires its own `Authorization` header, set an optional
+bearer token on the subscription. Every delivery (and replay) then carries
+`Authorization: Bearer <token>` in addition to the signature headers.
+Reads return the stored token as `auth_token` (`None` when unset) along
+with the boolean `has_auth_token` flag; both default to unset on servers
+that predate the fields.
+
+```python
+inkbox.webhooks.subscriptions.create(
+    agent_identity_id=identity.id,
+    url="https://example.com/hook",
+    event_types=["message.received"],
+    auth_token="your-endpoint-token",
+)
+
+# update() is tri-state: omit auth_token to leave it unchanged, pass a
+# string to replace it, or pass None to clear it.
+inkbox.webhooks.subscriptions.update(sub.id, scope="identity", auth_token=None)
+```
+
+### Incoming-call webhooks (still per-number)
+
+```python
+# Route incoming calls to a webhook. The response body controls call routing.
+inkbox.phone_numbers.update(
+    number.id,
+    incoming_call_action="webhook",
+    incoming_call_webhook_url="https://example.com/calls",
+)
+```
+
+### Wire shapes
+
+Every mail and text payload uses the standard `{event_type,
+timestamp, data}` envelope. `data["contacts"]` (mail and text) and
+`data["agent_identities"]` are always present, possibly empty.
+`agent_identities` mirrors `contacts` but matches active agent
+identities in the same org. On mail, each list entry carries a
+`bucket: "from" | "to" | "cc" | "bcc"` plus `address`; receivers
+should pair to the source field by `(bucket, address)`.
+`data["message"]["bcc_addresses"]` is populated only on outbound
+events. Every resolved contact carries active memory text, newest
+first, in `memories`; use `match.get("memories", [])` for replayed
+payloads that predate contact memories. This is separate from the
+optional conversation `context`.
+
+`name` is `None` when the contact has no name on file -- a contact
+created automatically from an inbound message has an `id` and
+`memories` before anyone gives it a name. It never falls back to the
+phone number or email address, so guard it before addressing someone
+by name.
+
+On inbound `message.received`, `data["message"]` carries the plain-text
+`body`: the whole message when it fits the size cap, otherwise a prefix
+with `body_truncated: true` and `body_state: "truncated"` (else
+`"complete"`). When truncated, fetch the full message by id:
+`inkbox.messages.get(message["email_address"], message["id"])`. These
+fields are present-with-`null` on non-received events, and absent on
+payloads predating the feature — read with `.get(...)`.
+
+Phone-text payloads carry several fields for group sends:
+
+- `text_message["recipients"]` -- `None` on inbound, a one-element
+  list on outbound 1:1, multiple entries on group outbound.
+- `text_message["remote_phone_number"]` -- `None` on group outbound
+  (the per-recipient state is in `recipients[]`).
+- `data["recipient_phone_number"]` -- set on outbound group lifecycle
+  events, names the recipient the event is about. `None` on inbound
+  and on 1:1 outbound.
+
+The inbound-call payload is **flat** -- no envelope -- and carries
+`contacts: list[WebhookContact]` and `agent_identities:
+list[WebhookAgentIdentity]` at the top level.
+
+### Receiving webhooks (typed)
+
+The SDK exports `TypedDict` wire shapes for every payload. Pair `verify_webhook` with `cast(TextWebhookPayload, json.loads(body))` and discriminate on `event_type`:
+
+```python
+import json
+from typing import cast
+
+from inkbox import (
+    MailWebhookPayload,
+    PhoneIncomingCallWebhookPayload,
+    TextWebhookPayload,
+    verify_webhook,
+)
+
+# FastAPI
+@app.post("/hooks/mail")
+async def mail_hook(request: Request):
+    raw_body = await request.body()
+    if not verify_webhook(payload=raw_body, headers=request.headers, secret="whsec_..."):
+        raise HTTPException(status_code=403)
+    payload = cast(MailWebhookPayload, json.loads(raw_body))
+    for match in payload["data"]["contacts"]:
+        logger.info(
+            "%s %s -> %s (%s)",
+            match["bucket"], match["address"], match["name"], match["id"],
+        )
+
+@app.post("/hooks/text")
+async def text_hook(request: Request):
+    raw_body = await request.body()
+    if not verify_webhook(payload=raw_body, headers=request.headers, secret="whsec_..."):
+        raise HTTPException(status_code=403)
+    payload = cast(TextWebhookPayload, json.loads(raw_body))
+    match payload["event_type"]:
+        case "text.delivery_failed":
+            msg = payload["data"]["text_message"]
+            recipient = payload["data"]["recipient_phone_number"] or msg["remote_phone_number"]
+            logger.error(
+                "SMS to %s failed: %s (%s)",
+                recipient, msg["error_code"], msg["error_detail"],
+            )
+        case "text.delivered":
+            # delivery_status, sent_at, delivered_at are all populated.
+            ...
+        case "text.received":
+            for contact in payload["data"]["contacts"]:
+                logger.info("inbound from known contact %s", contact["id"])
+            for agent in payload["data"]["agent_identities"]:
+                logger.info("inbound from agent identity %s", agent["agent_handle"])
+```
+
+Wire shapes are intentionally **snake_case** (the raw JSON body, not the SDK's parsed dataclasses) so `json.loads(body)` round-trips into the `TypedDict` without a transformer. Enum-valued fields like `direction`, `status`, and `delivery_status` are `Literal[...]` string unions rather than the SDK's `StrEnum`s — `json.loads` produces bare strings, and `Literal` unions narrow cleanly under mypy / pyright.
+
+---
+
+## Directional contact rules
+
+Requires SDK `0.7.3` or later.
+
+Email and phone policies have independent inbound (receive) and outbound (send)
+settings. Phone policy also applies to iMessage. Management requires admin
+credentials.
+
+```python
+from inkbox import ContactChannelAccessUpdate, ContactRuleDirection
+
+agent = inkbox.get_identity("support-agent")
+agent.update(
+    mail_inbound_filter_mode="blacklist",
+    mail_outbound_filter_mode="whitelist",
+)
+rule = agent.create_mail_contact_rule(
+    action="allow",
+    match_type="exact_email",
+    match_target="x@example.com",
+    direction=ContactRuleDirection.OUTBOUND,
+)
+agent.update_mail_contact_rule(rule.id, direction="both")
+agent.update_mail_contact_rule(rule.id, action="block", apply_to="inbound")
+rules = agent.list_mail_contact_rules(direction="outbound")
+
+inkbox.contacts.access.update(
+    agent.agent_handle,
+    contact_id,
+    email=ContactChannelAccessUpdate(inbound_contactable=["x@example.com"]),
+)
+```
+
+- `direction` is optional on `create`, `list`, `list_all`, and `update` across
+  `mail_identity_contact_rules`, `phone_identity_contact_rules`,
+  `imessage_contact_rules`, and the legacy `mail_contact_rules` and
+  `phone_contact_rules` resources. Omitted create direction means `both`;
+  omitted update direction preserves coverage. An action-only update changes
+  the rule across its current coverage. A direction-only update is valid.
+- `apply_to="inbound"` or `"outbound"` with `action` edits one covered side
+  atomically while preserving the other. It cannot be combined with `direction`.
+  Refresh the list after an edit to see any resulting split or consolidation.
+- Inbound/outbound list filters include `both` rules; `direction="both"` selects
+  only bidirectional rules. A2A retains its separate exact-direction filtering.
+- Matching rules can consolidate. Use the returned ID and direction rather than
+  assuming every create allocates a new ID. Previously issued IDs continue to
+  address the consolidated logical rule. Duplicate requests still raise
+  `DuplicateContactRuleError`.
+- Identities expose `mail_inbound_filter_mode`, `mail_outbound_filter_mode`,
+  `phone_inbound_filter_mode`, and `phone_outbound_filter_mode`. The existing
+  `mail_filter_mode`, `phone_filter_mode`, and `imessage_filter_mode` writes set
+  both directions. Do not mix shared and directional writes for the same channel.
+  Shared reads report the common effective mode when equal, otherwise the legacy
+  baseline. Older responses fall back to their shared modes and `both` rules.
+- Contact groups expose `inbound_contactable` and `outbound_contactable`.
+  Legacy `contactable` reads mean outbound permission; legacy writes affect both
+  directions. Omit unchanged lists; an empty list denies that direction for all
+  current addresses. Null lists and mixing legacy/directional lists are invalid.
+  These group options also work in `ContactCreatePermissions`.
+- `ContactAddressUpdate` accepts `direction`, `expected_inbound_action`, and
+  `expected_outbound_action` for communication-policy edits. Opposite directions
+  can be edited in one request. Use both expected actions when editing a split
+  pair to `both`, together with the observed revision.
+
+Receiving permission does not imply permission to reply. Shared-line iMessage
+connection setup requires permission in both directions and does not grant it.
+Directional operations require an API version supporting these fields.
+
+## Response notices
+
+Existing resource methods retain their return types. To receive optional advisory
+metadata alongside any result, use a scoped operation:
+
+```python
+result = inkbox.with_response_metadata(
+    lambda scoped: scoped.mail_identity_contact_rules.list("support-agent")
+)
+rules = result.data
+for notice in result.notices or []:
+    print(notice.code, notice.level, notice.message)
+```
+
+`APIResponse[T]` contains the original `data` and optional
+`list[ResponseNotice]`. Empty results such as deletes keep `data=None`.
+Each notice has open-string `code`, `level`, and `message` fields, so unfamiliar
+codes and levels remain available.
+
+An optional observer receives `ResponseMetadata` once per completed HTTP response,
+including failed requests, downloads, and bodyless responses:
+
+```python
+from inkbox import Inkbox, ResponseMetadata
+
+def observe(metadata: ResponseMetadata) -> None:
+    for notice in metadata.notices or []:
+        print(notice.message)
+
+inkbox = Inkbox(response_observer=observe)
+```
+
+The SDK stays silent by default. Notices prefer the `Inkbox-Notices` response
+header, with top-level body fallback only on declared metadata contracts. Nested
+user content is never treated as metadata. Missing, null, and empty notices become
+`None`; malformed entries are ignored. Notices and observer failures do not change
+API errors or retry a completed request.
+
+The callback must use the supplied scoped client and consume any paginated
+iterator within the callback. Notices are deduplicated across its requests.
+Concurrent and nested scopes collect independently; connections, cookies, and
+unlocked vault state are shared without extra requests or another unlock.
+Standalone signup and invitation-preview class methods accept their own
+`response_observer` argument because they do not use an existing client.
+
+## API errors
+
+All REST endpoint failures raised as `InkboxAPIError` retain the optional
+Support Agent instructions returned by the API. This also applies to specialized
+subclasses and remapped identity or tunnel errors; existing exception text and
+`detail` remain unchanged.
+
+```python
+from inkbox import InkboxAPIError
+
+try:
+    inkbox.get_identity("unknown")
+except InkboxAPIError as error:
+    print(error.detail)
+    if error.agent_support:
+        print(f"Support: {error.agent_support}")
+```
+
+## Whoami
+
+```python
+# Check the authenticated caller's identity
+info = inkbox.whoami()
+print(info.auth_type)        # "api_key" or "jwt"
+print(info.organization_id)
+
+# Narrow by auth type
+if isinstance(info, inkbox.WhoamiApiKeyResponse):
+    print(info.key_id, info.label)
+elif isinstance(info, inkbox.WhoamiJwtResponse):
+    print(info.email, info.org_role)
+```
+
+---
+
+## Signing Keys
+
+Signing keys are **per agent identity**. Create/rotate or check status via the
+identity (or `inkbox.signing_keys.create_or_rotate(agent_handle)` /
+`get_status(agent_handle)`). The plaintext is returned **once**.
+
+```python
+identity = inkbox.get_identity("support-agent")
+
+# Create or rotate this identity's webhook signing key (plaintext returned once)
+key = identity.create_signing_key()
+print(key.signing_key)  # save this immediately
+
+# Check whether a key is configured
+status = identity.get_signing_key_status()
+print(status.configured, status.created_at)
+
+# The FIRST webhook subscription for a keyless identity returns its secret once:
+created = inkbox.webhooks.subscriptions.create(
+    mailbox_id=identity.mailbox.id,
+    url="https://example.com/hooks/mail",
+    event_types=["message.received"],
+)
+if created.signing_key is not None:
+    print(created.signing_key)  # save this immediately — shown only once
+
+# (deprecated) org-level: inkbox.create_signing_key()
+```
+
+---
+
+## Verifying Webhook Signatures
+
+Use `verify_webhook` to confirm that an incoming request was sent by Inkbox.
+
+```python
+from inkbox import verify_webhook
+
+# FastAPI
+@app.post("/hooks/mail")
+async def mail_hook(request: Request):
+    raw_body = await request.body()
+    if not verify_webhook(
+        payload=raw_body,
+        headers=request.headers,
+        secret="whsec_...",
+    ):
+        raise HTTPException(status_code=403)
+    ...
+
+# Flask
+@app.post("/hooks/mail")
+def mail_hook():
+    raw_body = request.get_data()
+    if not verify_webhook(
+        payload=raw_body,
+        headers=request.headers,
+        secret="whsec_...",
+    ):
+        abort(403)
+    ...
+```
+
+---
+
+## Examples
+
+Runnable example scripts are available in the [examples/python](https://github.com/vectorlyapp/inkbox/tree/main/inkbox/examples/python) directory:
+
+| Script | What it demonstrates |
+|---|---|
+| `register_agent_identity.py` | Create an identity with a linked mailbox and phone number |
+| `agent_send_email.py` | Send an email and a threaded reply |
+| `read_agent_messages.py` | List messages and threads |
+| `create_agent_mailbox.py` | Create, update, search, and delete a mailbox |
+| `create_agent_phone_number.py` | Provision, update, and release a number |
+| `list_agent_phone_numbers.py` | List all phone numbers in the org |
+| `read_agent_calls.py` | List calls and print transcripts |
+| `receive_agent_email_webhook.py` | Register and delete a mailbox webhook |
+| `receive_agent_call_webhook.py` | Register, update, and delete a phone webhook |
+
+## Custom email signatures
+
+Custom signatures are saved per mailbox and require an eligible paid plan to set or enable.
+Each HTML/text field supports up to 16,384 characters. HTML is sanitized; logos
+must use absolute HTTPS URLs. Updating HTML without text generates a plain-text
+fallback. Omitted fields stay unchanged; null clears saved content. If saved text
+is null, sending derives it from HTML when possible. Disable without deleting to
+pause automatic insertion. Disabling and clearing remain available on every plan.
+Signatures are inserted when mail is sent, including replies, forwards, and sent
+drafts; do not append them manually. The Inkbox watermark is controlled separately.
+Signed/encrypted SMTP mail cannot have a custom signature inserted; disable
+automatic insertion before sending those messages.
+A `.sig` file is not a standardized attachment format: read its UTF-8 text or HTML
+content into the corresponding field; images and proprietary formats are not imported.
+
+```python
+from pathlib import Path
+
+inkbox.mailboxes.update(
+    "alex@example.com",
+    signature_html=Path("signature.html").read_text(encoding="utf-8"),
+    signature_enabled=True,
+)
+# Pause without deleting; use None for both content fields to clear them.
+inkbox.mailboxes.update("alex@example.com", signature_enabled=False)
+```
+
+## Slack
+
+Slack contact rules support exact people and home workspaces, with whitelist or
+blacklist defaults and optional per-direction settings. Import visible people
+into real contact cards and use Slack with Companion mode. Importing a contact does not allow communication.
+See [Slack contact rules](https://inkbox.ai/docs/api/slack/contact-rules) and
+[contact import](https://inkbox.ai/docs/api/slack/contact-import) for version
+`0.7.14` examples.
+
+Slack sponsorship covers the channel or group DM, including all its threads.
+A new participant joining or the sponsor leaving requires fresh sponsorship;
+another participant leaving alone does not. Explicit blocks still apply.
+Optional `thread_ts` selects a reply thread; it does not limit sponsorship.
+
+```python
+from inkbox import Inkbox
+
+client = Inkbox()
+identity_id = "22222222-2222-4222-8222-222222222222"
+connections = client.slack.list_connections(identity_id)
+connection = next(
+    (
+        c for c in connections.connections
+        if c.workspace_id == "TEXAMPLE" and c.status == "connected"
+    ),
+    None,
+)
+if connection is None:
+    raise RuntimeError("Connect or reauthorize the intended workspace first")
+connection_id = connection.id
+action = client.slack.send_message(
+    connection_id,
+    conversation_id="CEXAMPLE",
+    text="Hello from Inkbox",
+    idempotency_key="greeting:2026-09-16",
+)
+page = client.slack.list_messages(connection_id, "CEXAMPLE")
+```
+
+Onboarding is separate from using an existing connection. Organization-member sessions,
+organization admin API keys, and claimed agent keys can save and list setup workspaces.
+Claimed agent keys can prepare and install their own identity’s app.
+`installation_available` reports installation availability; `setup.status` reports
+preparation readiness. Save app-configuration credentials for
+the target workspace first; reuse that saved workspace for later identity apps.
+Credentials are write-only. The returned metadata identifies the verified workspace.
+An identity app stays bound to its selected workspace.
+
+```python
+import os
+import time
+
+setup_client = Inkbox(api_key="YOUR_INKBOX_API_KEY")
+workspace = setup_client.slack.save_provisioning_workspace(
+    access_token=os.environ["SLACK_CONFIGURATION_ACCESS_TOKEN"],
+    refresh_token=os.environ["SLACK_CONFIGURATION_REFRESH_TOKEN"],
+)
+# For a workspace already saved, use list_provisioning_workspaces() and select its ID.
+setup = setup_client.slack.start_setup(identity_id, workspace.id)
+deadline = time.monotonic() + 120
+while setup.status == "pending" and time.monotonic() < deadline:
+    time.sleep(5)
+    setup = setup_client.slack.list_connections(identity_id).setup
+    if setup is None:
+        raise RuntimeError("Preparation status is unavailable; check again later")
+if setup.status != "ready":
+    raise RuntimeError(f"Slack preparation is {setup.status}; check its status before continuing")
+installation = setup_client.slack.start_installation(identity_id)
+# Open installation.authorization_url in a browser; keep it secret.
+```
+
+The sample bounds its preparation wait to two minutes. Pending setup can take
+longer; resume status reads later without repeatedly starting installation.
+For failed or unavailable setup, inspect the status before taking further action.
+`needs_credentials` requires saving valid credentials for the selected workspace.
+After browser approval, list connections again to confirm `connected`.
+
+`client.slack` also provides `list_provisioning_workspaces`, `save_provisioning_workspace`, `disconnect`,
+`list_conversations`, `open_conversation`, `get_conversation`, `get_action`, `get_action_by_key`, `get_file`,
+and `download_file` (returns `bytes`). Live workspace operations use explicit connection IDs so a
+multi-workspace identity never silently picks a workspace.
+
+```python
+subscription = client.webhooks.subscriptions.create(
+    agent_identity_id=identity_id,
+    url="https://example.com/hooks/slack",
+    event_types=["slack.mention_received", "slack.thread_reply_received"],
+)
+client.webhooks.subscriptions.update(
+    subscription.id, event_types=["slack.dm_received", "slack.mention_received"]
+)
+```
+
+### Cached Slack display context
+
+```python
+page = inkbox.slack.list_archived_messages(
+    connection_id, conversation_id="C0123456789", roots_only=True,
+    include=["conversation", "sender", "reactions", "files"],
+)
+if page.included:
+    print(page.included.conversations)
+emoji_page = inkbox.slack.list_cached_emoji(connection_id, q="party", limit=100)
+# Continue with cursor=emoji_page.next_cursor; one page is not the entire directory.
+image = inkbox.slack.download_cached_media(connection_id, "user", "U0123456789")
+preview = inkbox.slack.download_file_preview(connection_id, "F0123456789")
+```
+
+Cached context is optional and may be incomplete or temporarily stale. Unknown
+reaction and thread counts are not zero; a known count does not imply a complete
+list of reacting users. Keep display caches separate by connection and invalidate
+them when its optional `generation` changes. Emoji aliases name another definition.
+The byte methods authenticate against Inkbox; do not forward your API key to
+fallback image URLs. Cached image and preview reads return `404` when no copy exists
+and no capture is queued. Queued or running capture/repair and temporary storage
+failures return `503` with `Retry-After`. Honor that delay before retrying. Emoji image downloads accept alias names and
+resolve them within the selected connection. Existing live methods and mutation
+idempotency are unchanged.
+
+Use root-only archive pages for the main timeline. They also retain replies whose
+root is unavailable, so captured threads remain discoverable. Open a thread using
+the reply’s `thread_ts` (`threadTs` in TypeScript/CLI); its missing root is not restored.
+
+### Slack behavior
+
+Organization-member sessions and organization admin API keys can prepare and install
+apps for identities in their organization. Claimed agent keys can save workspace
+configuration and prepare, install, read, and use their own identity’s connections.
+Disconnecting connections, changing retention, and purging history require an
+organization-member session or organization admin API key. Installation availability
+does not mean preparation is complete; check `setup.status` before continuing.
+Direct installation is also supported: `start_installation` (Python/Rust),
+`startInstallation` (TypeScript), or `slack installation start` returns a short-lived
+opaque authorization URL to open in a browser. Treat it as a secret; the browser
+handoff establishes installation state. Workspace approval and channel permissions
+still apply. Join accessible public channels or invite the agent to private channels;
+Slack Connect conversations are supported when the connection has access.
+
+`start_installation(..., return_url=...)` optionally selects an approved Console
+completion URL with the exact path `/console/slack/complete`, no query or fragment,
+and at most 2048 characters.
+Omit it to use the default completion page.
+
+Conversation and live-history reads use the selected connection. The Console and
+organization admin keys can read available retained file copies without a live Slack
+lookup. Agent-scoped downloads still check current file access. A content download
+without a retained copy can fall back to Slack and requires current access. These
+methods do not read an entire-workspace archive. Conversation pages default to 100 (maximum 200); message
+pages default to 15 (maximum 100). Pass the returned cursor explicitly for another
+page. Slack timestamp identifiers are strings, never floating-point numbers. Direct
+messages accept 1..8 user IDs. Message text is 1..12000 characters; sends require a
+stable 1..128-character idempotency key using letters, digits, `.`, `_`, `:`, or `-`.
+Reuse a key only for the exact same operation. A different body with the same key is a
+conflict. Poll an action while it is `sending`; `sent` is not a delivered/read receipt.
+Recover a lost response without resending with `client.slack.get_action_by_key(connection_id, idempotency_key)`.
+A 404 lookup result does not prove that no send occurred; do not switch to a new key
+based on missing lookup data. A fresh `failed` / `rate_limited` send can include
+`retry_after` (`retryAfter` in TypeScript/CLI), the minimum wait in seconds before
+starting a deliberate new attempt. This hint is not retained on stored action reads
+or same-key replays. Reusing the original key returns its terminal action and does
+not send again. No automatic resend occurs.
+`unknown` is terminal uncertainty, not a promise of future reconciliation: do not
+blindly resend. Inspect authorized live history before deliberately starting a new
+operation. File downloads return bytes; unavailable or oversized files surface API
+errors. General file uploads accept standard base64 for 1 byte..10 MiB of decoded
+content (CLI: `slack file upload --file PATH`). Reactions, pins, own-message edits and
+deletions, channel join/leave, and native processing status use stable keys and return
+operations: poll only `in_progress`; `unknown` remains terminal uncertainty. Send
+keys and utility-operation keys have independent per-connection namespaces. A key
+reused with a different request raises `IdempotencyKeyReusedError`; it is not
+a transient failure and must not be retried with changed arguments. Utility
+operations emit no outcome webhook: inspect the returned status and operation lookup,
+not send-outcome events. Native processing support depends on the workspace and may fail explicitly; no reaction is
+used as a fallback. Inspect capabilities for missing scopes before requesting an upgrade.
+Disconnect removes Inkbox authority, not the workspace's Slack app installation.
+
+Slack setup creates the identity’s app directly in its selected workspace.
+No identity toggle is required. Connection responses report app creation,
+preparation readiness, and installation status separately.
+
+Retained history is separate from live reads and webhook diagnostics. All observed
+messages in conversations the connection can access are captured automatically,
+independently of webhook subscriptions, with no time-based retention limit by default.
+This is not an automatic whole-workspace or historical copy. Organization management
+can set retention or delete retained history, but cannot disable or filter capture.
+Omitted retention resets to no time limit.
+Archive messages/search return retained records only. Backfill queues bounded imports
+and reports coverage; a completed channel page does not prove every thread is complete. `restart=true`
+restarts a completed/failed import. Purge deletes existing retained history without
+stopping new capture. Reconnecting resumes capture automatically, but does not restore
+deleted history. Archive reads still require current connection/conversation access.
+Use the live exact-message permalink method when a Slack link is needed.
+Live message context is a bounded window (`complete=false`), not full history.
+
+Slack webhook envelopes use the existing signature verification and stable `id`
+deduplication; delivery order is not guaranteed. All 23 event types are exported as
+`SlackWebhookEventType`, with `SlackWebhookData` and `SlackWebhookPayload` types.
+Select incoming messages through ordinary subscription event types:
+
+| Event | Trigger |
+| --- | --- |
+| `slack.dm_received` | Direct message |
+| `slack.group_dm_received` | Group direct message |
+| `slack.channel_message_received` | Channel message |
+| `slack.mention_received` | Message mentioning the agent |
+| `slack.thread_reply_received` | Any thread reply, not a managed thread watch |
+
+These categories overlap. Each incoming message produces at most one logical delivery per
+subscription. Its `event_type` is the first matching selected event in this priority:
+mention, thread reply, DM, group DM, channel message. `data.message_kinds` remains
+contextual metadata. Subscriptions cover all accessible conversations across the
+identity's connected workspaces; there are no connection/conversation selectors.
+Edits and deletions use their own events without message-kind filtering. The
+remaining event types cover message updates, reactions, files, and other activity.
+
+Slack events can share an identity-owned subscription with other notification families.
+Conversation context applies only to received mail, text, and iMessage events.
+Mixed subscriptions require explicit identity scope for updates and deletion.
+Slack delivery logs contain metadata only; historical replay is not supported.
+The agent runtime owns narrower attention rules, thread watches, and its own memory.
+
+### Retained history and utility actions
+
+Start with `search_messages` to search retained message text across all workspace
+connections owned by one identity. Agent credentials infer their identity; other
+credentials must supply an explicit identity. A connection filter narrows that
+identity's results; it is not required. Each result includes its connection ID.
+Search uses plain English keywords, ranked by relevance and then recency, not
+Slack query operators or semantic search. Attachment bodies are not indexed.
+The query accepts 1..512 characters and page sizes are 1..100 (default 50).
+Follow the returned cursor with the same filters even for short or empty pages;
+stop only when the cursor is absent. Agent-scoped results require current Slack
+access; the Console and organization admin keys read authorized retained history
+without a live Slack lookup. Results may not cover all workspace history. Search
+errors are raised, not returned as empty results.
+The connection-specific archive search remains available.
+
+```python
+# Accessible observed messages are captured automatically; webhook event selection controls wake-ups.
+history = client.slack.search_messages(
+    "release notes", limit=20
+)
+operation = client.slack.add_reaction(
+    connection_id, "CEXAMPLE", "1780000000.000001", "eyes",
+    idempotency_key="review:release:1",
+)
+# Inspect operation.status; do not repeat an unknown outcome.
+```
+
+The same resource exposes `capabilities`, `list_users`, `get_user`, `list_members`,
+`get_message`, `message_context`, `get_permalink`, `get_reactions`, `list_pins`,
+`add_pin`/`remove_pin`, `update_message`/`delete_message`, `join_conversation`/
+`leave_conversation`, `set_processing_status`, `upload_file`, and `get_operation`.
+Archive methods include `get_archive_settings`, `update_archive_settings`,
+`list_archived_messages`, `search_archived_messages`, `archive_backfill`,
+`list_archive_coverage`, and `purge_archive`.
+
+## License
+
+MIT
+
+## Verified domains
+
+An organization admin can prove DNS control and attach a domain to an agent.
+The domain follows the agent's visibility: public agents show it publicly;
+private agents show it to their organization and authorized A2A peers. Proof expires at the
+returned `valid_until`; assertions do not establish legal identity or endorse an
+agent. Keep the TXT record in place. Domain certification is separate from custom
+email sending domains.
+
+See [verified domains](https://inkbox.ai/docs/capabilities/verified-domains) for
+expiry, ownership, and recovery rules. These methods require version 0.7.12 or later.
+
+```python
+from inkbox import Inkbox
+
+client = Inkbox()
+claim = client.organization_domains.create("example.com")
+print(claim.dns_record.name, claim.dns_record.value)
+# Add the exact TXT record before verifying.
+claim = client.organization_domains.verify(claim.id)
+if claim.state == "verified":
+    client.identities.set_domain_affiliation("helper", claim.id)
+for item in client.a2a.iter_public_directory(q="example.com"):
+    print(item.card.name)
+```
+
+Claim methods: `create`, `list`, `get`, `verify`, `delete`.
+Use `client.identities.get_domain_affiliation(handle)` to inspect saved settings,
+`set_domain_affiliation(handle, claim_id)` to attach a domain, and
+`remove_domain_affiliation(handle)` to remove the selection. Task and context
+participants expose optional `.affiliation`; message assertions identify the author.
+
+Directory `q` searches handles, descriptions, skills, and published verified
+domains, including domain fragments. Text matches can include unverified agents.
+Use `verified_domain="example.com"` to require an exact current domain in public
+results. Preserve the query and filters when following a cursor.
+
+## Threaded iMessage replies
+
+Requires SDK/CLI **0.7.13 or later**. These reply examples require a
+phone-number conversation or a supported group; non-phone one-to-one
+conversations remain receive-only, including threaded replies.
+
+```python
+message = identity.get_imessage(message_id)
+reply = identity.send_imessage(
+    conversation_id=message.conversation_id,
+    reply_to_message_id=message.id,
+    text="Agreed — let's use that option.",
+)
+page = identity.get_imessage_thread(message.id, limit=50)
+if page.next_cursor:
+    next_page = identity.get_imessage_thread(message.id, cursor=page.next_cursor)
+if message.thread_id:
+    page = identity.get_imessage_conversation_thread(message.conversation_id, message.thread_id)
+    rows = identity.list_imessages(conversation_id=message.conversation_id, thread_id=message.thread_id)
+```
+
+`IMessage` and message webhook payloads expose nullable `reply_to_message_id`,
+`thread_id`, and `thread_root_message_id`. Resource-level equivalents are
+`imessages.get`, `get_thread`, `get_conversation_thread`, `send`, and `list`;
+these also accept `agent_identity_id`.
+
+Thread IDs are opaque and distinct from message IDs. Thread pages include the
+root and its replies in chronological order; follow `next_cursor` (Python/Rust)
+or `nextCursor` (TypeScript/CLI) until null. A standalone message can have its own
+thread ID and use its own message ID as the root, even before anyone replies.
+A non-null `reply_to_message_id` / `replyToMessageId` identifies a visible reply
+parent; a thread ID alone does not mean the message has replies. Thread metadata
+may be null for pending or older messages, and the root or direct parent can be
+unavailable. Conversation message lists remain flat and newest-first. A thread filter requires its conversation ID; it uses the existing
+limit/offset pagination, unlike the chronological thread endpoints.
+
+Native replies work in supported one-to-one and group iMessage conversations.
+Use a message from the same conversation. With plain fallback enabled (the
+default), the API sends an ordinary message in that conversation when native
+threading is unsupported: the target is known to use SMS/RCS or was downgraded.
+This does not force a particular transport. An ordinary fallback has no reply
+parent and does not join the target's native thread. Invalid or inaccessible
+targets, unsettled messages, and missing reply metadata still fail. Delivery
+errors are not retried as new ordinary messages. If a previously supported target
+can no longer receive a native reply, that send may fail even with fallback enabled.
+Read the message status and error fields after queueing; delivery webhooks do not
+cover every failure before dispatch. Omitting the target preserves ordinary sending.
+
+Set `plain_reply_fallback=False` on `send_imessage` or `imessages.send` to
+require a native reply instead.

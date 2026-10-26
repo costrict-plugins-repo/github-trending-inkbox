@@ -1,0 +1,628 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { execFile, execFileSync } from "node:child_process";
+import http from "node:http";
+import { fileURLToPath } from "node:url";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseContactAccessFile, parseContactPolicyFile, parseContactPermissionsFile } from "../dist/commands/contacts.js";
+import { outputContactRules } from "../dist/output.js";
+
+const cli = fileURLToPath(new URL("../dist/index.js", import.meta.url));
+
+test("access files preserve omission and reject malformed or contradictory groups", () => {
+  for (const body of [{}, { email: {} }, { email: { visible: false, contactable: [] }, profile: false }, { phone: { contactable: ["+15555550123"] } }]) {
+    assert.deepEqual(parseContactAccessFile(JSON.stringify(body)), body);
+  }
+  for (const body of [null, [], { email: null }, { profile: null }, { phone: { visible: "false" } },
+    { email: { visible: false, contactable: ["person@example.com"] } }, { email: { contactable: null } },
+    { email: { contactable: [false] } }, { phone: { contactable: [""] } }, { phone: { allow: true } },
+    { emails: {} }, { memories: 0 }, { profile: false, memories: true }, { profile: false, email: { visible: true } },
+    { profile: false, phone: { contactable: ["+15555550123"] } }, { email: { contactable: ["person@example.com", "person@example.com"] } },
+    { phone: { contactable: Array.from({ length: 51 }, (_, i) => `+1555555${String(i).padStart(4, "0")}`) } }]) {
+    assert.throws(() => parseContactAccessFile(JSON.stringify(body)));
+  }
+});
+
+test("access get and set preserve nested choices and reject invalid files before HTTP", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "contact-access-"));
+  const path = join(directory, "access.json");
+  const requests = [];
+  const access = { email: { visible: true, contactable: ["person@example.com"] }, phone: { visible: true, contactable: [] }, profile: true, memories: false };
+  const parsedAccess = { ...access,
+    email: { ...access.email, inboundContactable: access.email.contactable, outboundContactable: access.email.contactable },
+    phone: { ...access.phone, inboundContactable: [], outboundContactable: [] },
+  };
+  const mock = await listen(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    requests.push({ method: req.method, path: req.url, body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : null });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(access));
+  });
+  try {
+    const args = ["--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`, "--json", "contacts", "access"];
+    const get = await runCli([...args, "get", "test-agent", "contact-1"]);
+    assert.equal(get.error, null, get.stderr);
+    assert.deepEqual(JSON.parse(get.stdout), parsedAccess);
+    const update = { email: { visible: false, contactable: [] }, phone: { visible: false }, profile: false };
+    const setArgs = [...args, "set", "test-agent", "contact-1", "--file", path];
+    for (const body of [update, { email: {} }, {}]) {
+      await writeFile(path, JSON.stringify(body));
+      const result = await runCli(setArgs);
+      assert.equal(result.error, null, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), parsedAccess);
+    }
+    await writeFile(path, '{"email":{"visible":false,"contactable":["person@example.com"]}}');
+    assert.ok((await runCli(setArgs)).error);
+    assert.deepEqual(requests, [
+      { method: "GET", path: "/api/v1/identities/test-agent/contacts/contact-1/access", body: null },
+      ...[update, { email: {} }, {}].map((body) => ({ method: "PATCH", path: "/api/v1/identities/test-agent/contacts/contact-1/access", body })),
+    ]);
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("boolean permissions reject null, strings, unknown fields, and excessive maps", () => {
+  for (const body of [{}, { emails: {}, phones: {}, profile: false, memories: false }]) {
+    assert.deepEqual(parseContactPermissionsFile(JSON.stringify(body)), body);
+  }
+  for (const body of [null, [], { profile: null }, { memories: "false" }, { profile: 0 },
+    { emails: null }, { phones: [] }, { emails: { "person@example.com": "allow" } },
+    { email: {} }, { expectedRevision: 0 }, { addresses: [] }, { profile: false, memories: true },
+    { profile: false, emails: { "person@example.com": true } },
+    { emails: Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`person${i}@example.com`, true])) }]) {
+    assert.throws(() => parseContactPermissionsFile(JSON.stringify(body)));
+  }
+});
+
+test("boolean permissions get and set preserve false, empty maps, and omission", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "contact-permissions-"));
+  const path = join(directory, "permissions.json");
+  const requests = [];
+  const effective = { emails: { "person@example.com": false }, phones: { "+15555550123": true }, profile: false, memories: true };
+  const parsedEffective = { ...effective, inboundEmails: effective.emails, outboundEmails: effective.emails,
+    inboundPhones: effective.phones, outboundPhones: effective.phones };
+  const mock = await listen(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    requests.push({ method: req.method, path: req.url, body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : null });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(effective));
+  });
+  try {
+    const args = ["--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`, "--json", "contacts", "permissions"];
+    const get = await runCli([...args, "get", "test-agent", "contact-1"]);
+    assert.equal(get.error, null, get.stderr);
+    assert.deepEqual(JSON.parse(get.stdout), parsedEffective);
+    const update = { emails: { "person@example.com": false }, phones: {}, profile: false };
+    await writeFile(path, JSON.stringify(update));
+    const setArgs = [...args, "set", "test-agent", "contact-1", "--file", path];
+    const set = await runCli(setArgs);
+    assert.equal(set.error, null, set.stderr);
+    assert.deepEqual(JSON.parse(set.stdout), parsedEffective);
+    await writeFile(path, "{}");
+    assert.equal((await runCli(setArgs)).error, null);
+    await writeFile(path, '{"profile":"block"}');
+    assert.ok((await runCli(setArgs)).error);
+    assert.deepEqual(requests, [
+      { method: "GET", path: "/api/v1/identities/test-agent/contacts/contact-1/permissions", body: null },
+      { method: "PATCH", path: "/api/v1/identities/test-agent/contacts/contact-1/permissions", body: update },
+      { method: "PATCH", path: "/api/v1/identities/test-agent/contacts/contact-1/permissions", body: {} },
+    ]);
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("contact creation forwards permissions in one atomic request", async () => {
+  const requests = [];
+  const mock = await listen(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    requests.push({ path: req.url, body: JSON.parse(Buffer.concat(chunks).toString()) });
+    res.writeHead(201, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ id: "contact-1", preferred_name: "Person", emails: [], phones: [], access: [],
+      created_at: "2026-09-12T00:00:00Z", updated_at: "2026-09-12T00:00:00Z" }));
+  });
+  try {
+    const result = await runCli(["--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`,
+      "contacts", "create", `--json=${JSON.stringify({ givenName: "Person", permissions: {
+        identityId: "11111111-1111-4111-8111-111111111111", profile: false, memories: false,
+      } })}`]);
+    assert.equal(result.error, null, result.stderr);
+    assert.deepEqual(requests, [{ path: "/api/v1/contacts/with-permissions", body: { given_name: "Person", permissions: {
+      identity_id: "11111111-1111-4111-8111-111111111111", profile: false, memories: false,
+    } } }]);
+    const nested = await runCli(["--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`,
+      "contacts", "create", `--json=${JSON.stringify({ givenName: "Person", permissions: {
+        identityId: "11111111-1111-4111-8111-111111111111", email: { visible: true, contactable: [] },
+      } })}`]);
+    assert.equal(nested.error, null, nested.stderr);
+    assert.deepEqual(requests[1], { path: "/api/v1/contacts/with-permissions", body: { given_name: "Person", permissions: {
+      identity_id: "11111111-1111-4111-8111-111111111111", email: { visible: true, contactable: [] },
+    } } });
+  } finally { await new Promise((resolve) => mock.server.close(resolve)); }
+});
+
+test("directional permission files validate each map independently and reject same-channel mixtures", () => {
+  const maps = ["inboundEmails", "outboundEmails", "inboundPhones", "outboundPhones"];
+  for (const key of maps) {
+    for (const values of [{}, { "person@example.com": false }]) {
+      const body = { [key]: values };
+      assert.deepEqual(parseContactPermissionsFile(JSON.stringify(body)), body);
+    }
+    for (const value of [null, [], { "person@example.com": "false" }, Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`person${i}@example.com`, false]))]) {
+      assert.throws(() => parseContactPermissionsFile(JSON.stringify({ [key]: value })));
+    }
+    assert.throws(() => parseContactPermissionsFile(JSON.stringify({ profile: false, [key]: { "person@example.com": true } })));
+  }
+  for (const body of [{ emails: {}, inboundEmails: {} }, { emails: {}, outboundEmails: {} }, { phones: {}, inboundPhones: {} }, { phones: {}, outboundPhones: {} }]) {
+    assert.throws(() => parseContactPermissionsFile(JSON.stringify(body)), /cannot combine/);
+  }
+  const crossChannel = { emails: {}, inboundPhones: {}, outboundPhones: {} };
+  assert.deepEqual(parseContactPermissionsFile(JSON.stringify(crossChannel)), crossChannel);
+});
+
+test("directional permission files serialize all four maps and preserve receive-only responses", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "directional-permissions-"));
+  const path = join(directory, "permissions.json");
+  const requests = [];
+  const effective = { emails: {}, phones: {}, profile: true, memories: false,
+    inbound_emails: { "person@example.com": true }, outbound_emails: {}, inbound_phones: {}, outbound_phones: {} };
+  const mock = await listen(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    requests.push({ method: req.method, body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : null });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(effective));
+  });
+  try {
+    const args = ["--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`, "--json", "contacts", "permissions", "set", "test-agent", "contact-1", "--file", path];
+    const update = { inboundEmails: { "person@example.com": true }, outboundEmails: {}, inboundPhones: {}, outboundPhones: { "+15555550123": false } };
+    await writeFile(path, JSON.stringify(update));
+    const result = await runCli(args);
+    assert.ifError(result.error);
+    assert.deepEqual(requests, [{ method: "PATCH", body: {
+      inbound_emails: update.inboundEmails, outbound_emails: {}, inbound_phones: {}, outbound_phones: update.outboundPhones,
+    } }]);
+    assert.deepEqual(JSON.parse(result.stdout), { emails: {}, phones: {}, profile: true, memories: false,
+      inboundEmails: effective.inbound_emails, outboundEmails: {}, inboundPhones: {}, outboundPhones: {} });
+    await writeFile(path, JSON.stringify({ emails: {}, inboundEmails: {} }));
+    assert.ok((await runCli(args)).error);
+    assert.equal(requests.length, 1);
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("policy guards require only the edited directions and retain legacy expectedAction", () => {
+  const policy = (change) => JSON.stringify({ expectedRevision: 1, identityId: "identity-1", addresses: [{
+    kind: "email", value: "person@example.com", action: "allow", ...change,
+  }] });
+  for (const change of [
+    { direction: "inbound", expectedInboundAction: "block" },
+    { direction: "outbound", expectedOutboundAction: "inherit" },
+    { direction: "both", expectedInboundAction: "allow", expectedOutboundAction: "block" },
+    { expectedInboundAction: "allow", expectedOutboundAction: "block" },
+    { expectedAction: "inherit" }, { direction: "inbound", expectedAction: "block" },
+  ]) assert.deepEqual(parseContactPolicyFile(policy(change)), JSON.parse(policy(change)));
+  for (const change of [
+    { direction: "inbound", expectedOutboundAction: "block" },
+    { direction: "outbound", expectedInboundAction: "block" },
+    { direction: "both", expectedInboundAction: "block" },
+    { expectedOutboundAction: "block" },
+    { direction: "inbound", expectedInboundAction: null },
+    { direction: "outbound", expectedAction: "block", expectedInboundAction: null },
+  ]) assert.throws(() => parseContactPolicyFile(policy(change)));
+});
+
+test("contact creation accepts 200 directional address decisions without raising identifier limits", async () => {
+  const emails = Array.from({ length: 50 }, (_, i) => ({ value: `person${i}@example.com`, label: null, isPrimary: false }));
+  const phones = Array.from({ length: 50 }, (_, i) => ({ value: `+1555555${String(i).padStart(4, "0")}`, label: null, isPrimary: false }));
+  const addresses = [["email", emails], ["phone", phones]].flatMap(([kind, identifiers]) => identifiers.flatMap(({ value }) => [
+    { kind, value, action: "allow", direction: "inbound" }, { kind, value, action: "block", direction: "outbound" },
+  ]));
+  const requests = [];
+  const mock = await listen(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    requests.push(JSON.parse(Buffer.concat(chunks).toString()));
+    res.writeHead(201, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ id: "contact-1", created_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-01T00:00:00Z" }));
+  });
+  try {
+    const args = ["--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`, "contacts", "create"];
+    const payload = { givenName: "Person", emails, phones, permissions: { identityId: "identity-1", addresses } };
+    const result = await runCli([...args, `--json=${JSON.stringify(payload)}`]);
+    assert.ifError(result.error);
+    assert.equal(requests[0].emails.length, 50);
+    assert.equal(requests[0].phones.length, 50);
+    assert.deepEqual(requests[0].permissions, { identity_id: "identity-1", addresses });
+    payload.permissions.addresses = [...addresses, addresses[0]];
+    assert.ok((await runCli([...args, `--json=${JSON.stringify(payload)}`])).error);
+    assert.equal(requests.length, 1);
+    const policy = { expectedRevision: 1, identityId: "identity-1", addresses: addresses.map((row) => ({
+      ...row, ...(row.direction === "inbound" ? { expectedInboundAction: "inherit" } : { expectedOutboundAction: "inherit" }),
+    })) };
+    assert.deepEqual(parseContactPolicyFile(JSON.stringify(policy)), policy);
+  } finally { await new Promise((resolve) => mock.server.close(resolve)); }
+});
+
+test("policy pagination rejects malformed and out-of-range arguments before HTTP", async () => {
+  let requests = 0;
+  const mock = await listen((_req, res) => { requests++; res.end("{}"); });
+  try {
+    for (const command of [["contacts", "communication-policy", "list"], ["contacts", "communication-policy", "list-management"], ["identity", "contact-policies"]]) {
+      for (const [flag, value] of [["--limit", "abc"], ["--limit", "1.5"], ["--limit", "0"], ["--limit", "201"], ["--offset", "-1"], ["--offset", "10001"]]) {
+        const result = await runCli(["--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`, ...command, "test-agent", flag, value]);
+        assert.ok(result.error);
+        assert.match(result.stderr, /must be an integer between/);
+      }
+    }
+    assert.equal(requests, 0);
+    assert.match(help("contacts", "communication-policy", "set"), /optional visibility/);
+  } finally { await new Promise((resolve) => mock.server.close(resolve)); }
+});
+
+test("rule tables show names while JSON preserves the card", (t) => {
+  const lines = [];
+  t.mock.method(console, "log", (line) => lines.push(line));
+  const rows = [{ id: "rule-1", contact: { preferredName: "Person" } }, { id: "rule-2", contact: null }];
+  outputContactRules(rows, { json: false, columns: ["id", "contact"] });
+  assert.match(lines[2], /rule-1\s+Person/);
+  assert.match(lines[3], /rule-2\s+-/);
+  lines.length = 0;
+  outputContactRules(rows, { json: true, columns: ["id", "contact"] });
+  assert.deepEqual(JSON.parse(lines[0]), rows);
+});
+
+test("permission management forwards filters and preserves the page in JSON", async () => {
+  let request;
+  const mock = await listen((req, res) => {
+    request = new URL(req.url, "http://localhost");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ items: [], limit: 1, offset: 2, has_more: true }));
+  });
+  try {
+    const result = await runCli(["--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`, "--json",
+      "contacts", "communication-policy", "list-management", "test-agent", "--q", "Person", "--order", "name",
+      "--limit", "1", "--offset", "2", "--review-status", "confirmed", "unreviewed"]);
+    assert.equal(result.error, null, result.stderr);
+    assert.equal(request.pathname, "/api/v1/identities/test-agent/contact-permissions");
+    assert.equal(request.searchParams.get("q"), "Person");
+    assert.equal(request.searchParams.get("order"), "name");
+    assert.deepEqual(request.searchParams.getAll("review_status"), ["confirmed", "unreviewed"]);
+    assert.deepEqual(JSON.parse(result.stdout), { items: [], limit: 1, offset: 2, hasMore: true });
+  } finally { await new Promise((resolve) => mock.server.close(resolve)); }
+});
+
+test("policy files preserve visibility omission and validate every supplied field", () => {
+  const base = { expectedRevision: 0, identityId: "identity-1", addresses: [] };
+  assert.deepEqual(parseContactPolicyFile(JSON.stringify(base)), base);
+  const full = { ...base, visibility: { defaults: { profile: "allow", memories: "block" },
+    identities: [{ identityId: "identity-1", profile: "allow", memories: "allow" }] } };
+  assert.deepEqual(parseContactPolicyFile(JSON.stringify(full)), full);
+  for (const invalid of [
+    { ...base, visiblity: full.visibility }, { ...base, visibility: null },
+    { ...full, visibility: { ...full.visibility, defaults: { profile: "allow", memory: "block" } } },
+    { ...full, visibility: { ...full.visibility, identities: [{ identityId: "i", profile: "allow", memories: "block", typo: true }] } },
+    { ...base, defaults: { email: "allow" } }, { ...base, expectedRevision: -1 },
+    { ...base, addresses: [{ kind: "email", value: "person@example.com", action: "block" }] },
+    { ...base, addresses: [{ kind: "sms", value: "+15555550123", action: "block", expectedAction: "allow" }] },
+    { ...base, visibility: { defaults: { profile: "block", memories: "allow" }, identities: [] } },
+    { ...base, visibility: { defaults: { profile: "allow", memories: "allow" },
+      identities: [{ identityId: "identity-1", profile: "block", memories: "allow" }] } },
+  ]) assert.throws(() => parseContactPolicyFile(JSON.stringify(invalid)));
+});
+
+test("policy set forwards visibility and rejects unknown keys before HTTP", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "contact-policy-"));
+  const path = join(directory, "policy.json");
+  const body = { expectedRevision: 3, identityId: "identity-1",
+    addresses: [{ kind: "email", value: "person@example.com", action: "allow", expectedAction: "block" }],
+    visibility: { defaults: { profile: "allow", memories: "block" }, identities: [{ identityId: "identity-1", profile: "allow", memories: "allow" }] } };
+  const requests = [];
+  const mock = await listen(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString());
+    requests.push({ method: req.method, url: req.url, payload });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ contact_id: "contact-1", revision: 4, identity_id: payload.identity_id,
+      addresses: [{ kind: "email", value: "person@example.com", action: "allow", allowed: true, label: null }],
+      effective_visibility: { profile: false, memories: true }, visibility: payload.visibility }));
+  });
+  try {
+    const args = ["--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`, "--json",
+      "contacts", "communication-policy", "set", "contact-1", "--file", path];
+    await writeFile(path, JSON.stringify(body));
+    const result = await runCli(args);
+    assert.equal(result.error, null, result.stderr);
+    assert.deepEqual(requests[0], { method: "PUT", url: "/api/v1/contacts/contact-1/communication-policy", payload: {
+      expected_revision: 3, identity_id: "identity-1",
+      addresses: [{ kind: "email", value: "person@example.com", action: "allow", expected_action: "block" }], visibility: {
+        defaults: body.visibility.defaults, identities: [{ identity_id: "identity-1", profile: "allow", memories: "allow" }],
+      },
+    } });
+    await writeFile(path, JSON.stringify({ ...body, visiblity: body.visibility }));
+    const invalid = await runCli(args);
+    assert.notEqual(invalid.error, null);
+    assert.match(invalid.stderr, /Unknown field/);
+    assert.equal(requests.length, 1);
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+function help(...args) {
+  return execFileSync(process.execPath, [cli, ...args, "--help"], {
+    encoding: "utf8",
+  });
+}
+
+function runCli(args) {
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      [cli, ...args],
+      {
+        env: {
+          ...process.env,
+          NODE_USE_ENV_PROXY: "0",
+        },
+        timeout: 15_000,
+      },
+      (error, stdout, stderr) => resolve({ error, stdout, stderr }),
+    );
+  });
+}
+
+function listen(handler) {
+  return new Promise((resolve) => {
+    const server = http.createServer(handler);
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ server, port: server.address().port });
+    });
+  });
+}
+
+test("contacts exposes contact-memory commands", () => {
+  const text = help("contacts");
+  assert.match(text, /facts/);
+  assert.match(text, /correspondence/);
+  assert.match(text, /merge/);
+  assert.match(text, /communication-policy/);
+});
+
+test("contact communication policy reads use the administrative policy endpoint", async () => {
+  let request;
+  const mock = await listen((req, res) => {
+    request = { method: req.method, url: req.url };
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      contact_id: "contact-1", revision: 3,
+      identity_id: "identity-1", addresses: [], effective_visibility: { profile: false, memories: false },
+      visibility: { defaults: { profile: "inherit", memories: "inherit" }, identities: [] },
+    }));
+  });
+  try {
+    const result = await runCli([
+      "--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`, "--json",
+      "contacts", "communication-policy", "get", "contact-1", "--identity-id", "identity-1",
+    ]);
+    assert.equal(result.error, null, result.stderr);
+    assert.deepEqual(request, { method: "GET", url: "/api/v1/contacts/contact-1/communication-policy?identity_id=identity-1" });
+    const policy = JSON.parse(result.stdout);
+    assert.equal(policy.revision, 3);
+    assert.equal(policy.identityId, "identity-1");
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+  }
+});
+
+test("contact facts exposes read and deletion commands", () => {
+  const text = help("contacts", "facts");
+  assert.match(text, /list (?:\[options\] )?<contact-id>/);
+  assert.match(text, /get <contact-id> <fact-id>/);
+  assert.match(text, /citation <contact-id> <fact-id> <citation-id>/);
+  assert.match(text, /citation-url <source-url>/);
+  assert.match(text, /delete <contact-id> <fact-id>/);
+  assert.match(help("contacts", "facts", "delete"), /admin-scoped API key required/);
+});
+
+test("contact facts exposes hand-written memory commands", () => {
+  const text = help("contacts", "facts");
+  assert.match(text, /create (?:\[options\] )?<contact-id>/);
+  assert.match(text, /update (?:\[options\] )?<contact-id> <fact-id>/);
+  assert.match(help("contacts", "facts", "list"), /--include-expired/);
+  assert.match(help("contacts", "facts", "create"), /--kind <kind>/);
+  assert.match(help("contacts", "facts", "create"), /admin-scoped API key required/);
+  assert.match(help("contacts", "facts", "update"), /admin-scoped API key required/);
+  assert.match(help("contacts", "facts", "update"), /manually\s+maintained and revives it/);
+  assert.match(help("contacts", "facts", "list"), /locked facts remain\s+active/);
+});
+
+test("contact fact creation posts content and kind", async () => {
+  let request;
+  const mock = await listen((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      request = { method: req.method, url: req.url, body: JSON.parse(body) };
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "fact-1",
+        contact_id: "contact-1",
+        content: "Prefers email",
+        confidence: null,
+        origin: "user",
+        kind: "preference",
+        expires_at: null,
+        locked_at: null,
+        created_at: "2026-07-21T12:00:00Z",
+        updated_at: "2026-07-21T12:00:00Z",
+        citations: [],
+      }));
+    });
+  });
+
+  try {
+    const result = await runCli([
+      "--api-key", "test-key",
+      "--base-url", `http://127.0.0.1:${mock.port}`,
+      "--json",
+      "contacts", "facts", "create", "contact-1",
+      "--content", "Prefers email",
+      "--kind", "preference",
+    ]);
+
+    assert.ifError(result.error);
+    assert.equal(request.method, "POST");
+    assert.equal(request.url, "/api/v1/contacts/contact-1/facts");
+    assert.deepEqual(request.body, { content: "Prefers email", kind: "preference" });
+    assert.equal(JSON.parse(result.stdout).kind, "preference");
+  } finally {
+    mock.server.close();
+  }
+});
+
+test("contact fact commands reject an unknown kind and an empty update", async () => {
+  const badKind = await runCli([
+    "--api-key", "test-key",
+    "contacts", "facts", "create", "contact-1",
+    "--content", "Prefers email",
+    "--kind", "nickname",
+  ]);
+  assert.ok(badKind.error);
+  assert.match(badKind.stderr, /--kind must be one of: profile, preference, context/);
+
+  const emptyUpdate = await runCli([
+    "--api-key", "test-key",
+    "contacts", "facts", "update", "contact-1", "fact-1",
+  ]);
+  assert.ok(emptyUpdate.error);
+  assert.match(emptyUpdate.stderr, /Pass --content, --kind, or both/);
+});
+
+test("contact lifecycle options are discoverable", () => {
+  assert.match(help("contacts", "list"), /--review-status <status>/);
+  assert.doesNotMatch(help("contacts", "get"), /--include-dismissed/);
+  assert.doesNotMatch(help("contacts", "correspondence"), /--include-dismissed/);
+  assert.doesNotMatch(help("contacts", "facts", "list"), /--include-dismissed/);
+  assert.doesNotMatch(help("contacts", "create"), /--idempotency-key/);
+  assert.doesNotMatch(help("contacts", "update", "contact-id"), /--idempotency-key/);
+  assert.doesNotMatch(help("contacts", "delete", "contact-id"), /--idempotency-key/);
+  assert.doesNotMatch(help("contacts", "import", "contacts.vcf"), /--idempotency-key/);
+});
+
+test("contacts exposes bulk deletion and batch export", () => {
+  const text = help("contacts");
+  assert.match(text, /bulk-delete <contact-id\.\.\.>/);
+  assert.match(text, /export-many (?:\[options\] )?<contact-id\.\.\.>/);
+});
+
+test("contact access retains compatibility list without legacy grant/revoke commands", () => {
+  const text = help("contacts", "access");
+  assert.match(text, /list <contact-id>/);
+  assert.doesNotMatch(text, /^\s+grant(?:\s|$)/m);
+  assert.doesNotMatch(text, /^\s+revoke(?:\s|$)/m);
+});
+
+test("contact correspondence and merge expose their request options", () => {
+  const correspondence = help("contacts", "correspondence");
+  assert.match(correspondence, /--channels <channel>/);
+  assert.match(correspondence, /--limit-per-channel <n>/);
+  assert.match(correspondence, /--transcripts <mode>/);
+
+  const merge = help("contacts", "merge");
+  assert.match(merge, /--losing <contact-id\.\.\.>/);
+  assert.match(merge, /--field-sources <json>/);
+  assert.match(merge, /admin-scoped key required/);
+  assert.match(merge, /rejected\s+when\s+a\s+memory\s+kind\s+or\s+total\s+goes\s+over/);
+  assert.match(merge, /any\s+active\s+fact\s+for\s+total/);
+});
+
+test("contact fact deletion calls the API and prints remaining memory", async () => {
+  let request;
+  const mock = await listen((req, res) => {
+    request = { method: req.method, url: req.url };
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      deleted_fact_id: "fact-1",
+      memory_count: 1,
+      latest_memory: {
+        id: "fact-2",
+        content: "Prefers email",
+        updated_at: "2026-07-21T12:00:00Z",
+      },
+    }));
+  });
+
+  try {
+    const result = await runCli([
+      "--api-key", "test-key",
+      "--base-url", `http://127.0.0.1:${mock.port}`,
+      "--json",
+      "contacts", "facts", "delete", "contact-1", "fact-1",
+    ]);
+
+    assert.ifError(result.error);
+    assert.equal(result.stderr, "");
+    assert.deepEqual(request, {
+      method: "DELETE",
+      url: "/api/v1/contacts/contact-1/facts/fact-1",
+    });
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.deletedFactId, "fact-1");
+    assert.equal(output.memoryCount, 1);
+    assert.equal(output.latestMemory.content, "Prefers email");
+  } finally {
+    mock.server.close();
+  }
+});
+
+test("contact correspondence selects all channels by default and preserves Slack filters", async () => {
+  const requests = [];
+  const mock = await listen((req, res) => {
+    requests.push(new URL(req.url, "http://localhost").searchParams.getAll("channels"));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      contact_id: "contact-1", identity_id: "identity-1", channels: [], next_cursor: null,
+      items: [{
+        channel: "slack", source_id: "source-1", identity_id: "identity-1",
+        direction: "inbound", occurred_at: "2026-07-20T12:00:00Z", status: null, detail_url: null,
+        connection_id: "00000000-0000-4000-8000-000000000001",
+        conversation_id: "C123", workspace_id: "T123", user_id: "U123",
+        message_ts: "1784548800.123456", text: "Hello", text_truncated: true,
+        sender_access: "sponsored",
+      }],
+    }));
+  });
+  try {
+    for (const filters of [[], ["--channels", "slack"], ["--channels", "email,sms"]]) {
+      const result = await runCli([
+        "--api-key", "test-key", "--base-url", `http://127.0.0.1:${mock.port}`,
+        "--json", "contacts", "correspondence", "contact-1", ...filters,
+      ]);
+      assert.ifError(result.error);
+      const item = JSON.parse(result.stdout).items[0];
+      assert.equal(item.channel, "slack");
+      assert.equal(item.conversationId, "C123");
+      assert.equal(item.messageTs, "1784548800.123456");
+      assert.equal(item.textTruncated, true);
+      assert.equal(item.senderAccess, "sponsored");
+    }
+    assert.deepEqual(requests, [
+      ["email", "sms", "imessage", "calls", "slack"], ["slack"], ["email", "sms"],
+    ]);
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+  }
+});

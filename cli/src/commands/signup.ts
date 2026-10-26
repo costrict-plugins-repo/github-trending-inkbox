@@ -1,0 +1,167 @@
+import { Command } from "commander";
+import { getGlobalOpts, resolveBaseUrl, type GlobalOpts } from "../client.js";
+import { output, printStatus } from "../output.js";
+import { observeResponse } from "../response-metadata.js";
+import { withErrorHandler } from "../errors.js";
+import { Inkbox, extractA2AInvitationToken } from "@inkbox/sdk";
+import {
+  redactSecretError,
+  resolveOptionalA2AInvitationToken,
+} from "../invitation-token.js";
+
+function requireApiKey(opts: GlobalOpts): string {
+  const apiKey = opts.apiKey ?? process.env.INKBOX_API_KEY;
+  if (!apiKey) {
+    console.error(
+      "Error: API key required. Set INKBOX_API_KEY or pass --api-key.",
+    );
+    process.exit(1);
+  }
+  return apiKey;
+}
+
+export function registerSignupCommands(program: Command): void {
+  const signup = program
+    .command("signup")
+    .description("Agent self-signup flow");
+
+  signup
+    .command("create")
+    .description("Register a new agent (no API key required)")
+    .requiredOption("--human-email <email>", "Email of the human who should approve this agent")
+    .requiredOption("--note-to-human <note>", "Message from the agent to the human, included in the verification email")
+    .option("--display-name <name>", "Human-readable name for the agent")
+    .option("--agent-handle <handle>", "Requested handle for the agent identity")
+    .option("--email-local-part <local>", "Requested mailbox local part before the sending domain")
+    .option("--harness <harness>", "Identifier for the agent harness/runtime (e.g. claude-code, codex)")
+    .option("--invitation-stdin", "Read the optional A2A invitation link or token from stdin")
+    .option("--invitation-prompt", "Prompt privately for an optional A2A invitation link or token")
+    .option("--invitation-token-stdin", "Read the optional A2A invitation token from stdin")
+    .option("--invitation-token-prompt", "Prompt privately for an optional A2A invitation token")
+    .action(
+      withErrorHandler(async function (this: Command) {
+        const globalOpts = getGlobalOpts(this);
+        const cmdOpts = this.opts();
+        const stdinSources = [cmdOpts.invitationStdin, cmdOpts.invitationTokenStdin].filter(Boolean).length;
+        const promptSources = [cmdOpts.invitationPrompt, cmdOpts.invitationTokenPrompt].filter(Boolean).length;
+        if (stdinSources + promptSources > 1) {
+          throw new Error("Use only one invitation input option.");
+        }
+        const invitation = await resolveOptionalA2AInvitationToken(
+          stdinSources === 1,
+          promptSources === 1,
+        );
+        let invitationToken: string | undefined;
+        let result;
+        try {
+          invitationToken = invitation === undefined
+            ? undefined
+            : extractA2AInvitationToken(
+                invitation,
+                resolveBaseUrl(globalOpts) ?? "https://inkbox.ai",
+              );
+          result = await Inkbox.signup(
+            {
+              humanEmail: cmdOpts.humanEmail,
+              noteToHuman: cmdOpts.noteToHuman,
+              displayName: cmdOpts.displayName,
+              agentHandle: cmdOpts.agentHandle,
+              emailLocalPart: cmdOpts.emailLocalPart,
+              harness: cmdOpts.harness,
+              invitationToken,
+            },
+            { baseUrl: resolveBaseUrl(globalOpts), onResponse: observeResponse },
+          );
+        } catch (error) {
+          throw invitation
+            ? redactSecretError(error, invitation, invitationToken ?? "")
+            : error;
+        }
+        if (globalOpts.json) {
+          output(result, { json: true });
+        } else {
+          printStatus();
+          printStatus("Agent registered successfully!");
+          printStatus();
+          printStatus(`  Email:    ${result.emailAddress}`);
+          printStatus(`  Handle:   ${result.agentHandle}`);
+          printStatus(`  Org:      ${result.organizationId}`);
+          printStatus(`  Status:   ${result.claimStatus}`);
+          printStatus();
+          printStatus(`  API Key:  ${result.apiKey}`);
+          printStatus();
+          printStatus("Save the API key — it is shown only once.");
+          printStatus(result.message);
+        }
+        if (invitationToken && !result.invitation) {
+          console.warn(
+            "WARNING: The server response did not confirm that the A2A invitation was applied. " +
+            "Save the API key, then verify the invitation before relying on the connection.",
+          );
+        }
+      }),
+    );
+
+  signup
+    .command("verify")
+    .description("Submit a 6-digit verification code")
+    .requiredOption("--code <code>", "The 6-digit verification code")
+    .action(
+      withErrorHandler(async function (this: Command) {
+        const globalOpts = getGlobalOpts(this);
+        const apiKey = requireApiKey(globalOpts);
+        const cmdOpts = this.opts();
+        const result = await Inkbox.verifySignup(
+          apiKey,
+          { verificationCode: cmdOpts.code },
+          { baseUrl: globalOpts.baseUrl, onResponse: observeResponse },
+        );
+        output(result, { json: !!globalOpts.json });
+      }),
+    );
+
+  signup
+    .command("resend-verification")
+    .description("Resend the verification email (5-minute cooldown)")
+    .action(
+      withErrorHandler(async function (this: Command) {
+        const globalOpts = getGlobalOpts(this);
+        const apiKey = requireApiKey(globalOpts);
+        const result = await Inkbox.resendSignupVerification(
+          apiKey,
+          { baseUrl: globalOpts.baseUrl, onResponse: observeResponse },
+        );
+        output(result, { json: !!globalOpts.json });
+      }),
+    );
+
+  signup
+    .command("status")
+    .description("Check signup claim status and restrictions")
+    .action(
+      withErrorHandler(async function (this: Command) {
+        const globalOpts = getGlobalOpts(this);
+        const apiKey = requireApiKey(globalOpts);
+        const result = await Inkbox.getSignupStatus(
+          apiKey,
+          { baseUrl: globalOpts.baseUrl, onResponse: observeResponse },
+        );
+        if (globalOpts.json) {
+          output(result, { json: true });
+        } else {
+          output(
+            {
+              claimStatus: result.claimStatus,
+              humanState: result.humanState,
+              humanEmail: result.humanEmail,
+              maxSendsPerDay: result.restrictions.maxSendsPerDay,
+              allowedRecipients: result.restrictions.allowedRecipients.join(", ") || "-",
+              canReceive: result.restrictions.canReceive,
+              canCreateMailboxes: result.restrictions.canCreateMailboxes,
+            },
+            { json: false },
+          );
+        }
+      }),
+    );
+}

@@ -1,0 +1,1089 @@
+import { Command, Option } from "commander";
+import { registerCompanionCommands } from "./companion.js";
+import { addDirectionalRuleOptions, directionalRuleOptions } from "../contact-rules.js";
+import { parsePolicyPagination } from "../pagination.js";
+import { createClient, getGlobalOpts } from "../client.js";
+import { output, outputContactRules, printStatus } from "../output.js";
+import { withErrorHandler } from "../errors.js";
+import type {
+  SecretPayload,
+  MailRuleAction,
+  MailRuleMatchType,
+  PhoneRuleAction,
+  PhoneRuleMatchType,
+} from "@inkbox/sdk";
+import { parseTotpUri } from "@inkbox/sdk";
+
+const RULE_COLUMNS = [
+  "id",
+  "agentIdentityId",
+  "action",
+  "direction",
+  "matchType",
+  "matchTarget",
+  "contact",
+  "status",
+];
+
+function registerIdentityMailRuleCommands(parent: Command): void {
+  const rules = parent
+    .command("mail-rules")
+    .description("Mail contact rules scoped to an agent identity");
+
+  rules
+    .command("list <handle>")
+    .description("List an identity's mail contact rules")
+    .option("--action <action>", "Filter by action: allow or block")
+    .option("--match-type <type>", "Filter by match_type: exact_email or domain")
+    .option("--limit <n>", "Max rows", (v) => parseInt(v, 10))
+    .option("--offset <n>", "Offset", (v) => parseInt(v, 10))
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        cmdOpts: { action?: string; matchType?: string; limit?: number; offset?: number },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rows = await inkbox.mailIdentityContactRules.list(handle, {
+          ...directionalRuleOptions(this),
+          action: cmdOpts.action as MailRuleAction | undefined,
+          matchType: cmdOpts.matchType as MailRuleMatchType | undefined,
+          limit: cmdOpts.limit,
+          offset: cmdOpts.offset,
+        });
+        outputContactRules(rows, { json: !!opts.json, columns: RULE_COLUMNS });
+      }),
+    );
+
+  rules
+    .command("list-all")
+    .description("List mail contact rules across the org (admin-only)")
+    .option("--agent-identity-id <id>", "Narrow to a single agent identity id")
+    .option("--action <action>", "Filter by action: allow or block")
+    .option("--match-type <type>", "Filter by match_type: exact_email or domain")
+    .option("--limit <n>", "Max rows", (v) => parseInt(v, 10))
+    .option("--offset <n>", "Offset", (v) => parseInt(v, 10))
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        cmdOpts: {
+          agentIdentityId?: string;
+          action?: string;
+          matchType?: string;
+          limit?: number;
+          offset?: number;
+        },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rows = await inkbox.mailIdentityContactRules.listAll({
+          ...directionalRuleOptions(this),
+          agentIdentityId: cmdOpts.agentIdentityId,
+          action: cmdOpts.action as MailRuleAction | undefined,
+          matchType: cmdOpts.matchType as MailRuleMatchType | undefined,
+          limit: cmdOpts.limit,
+          offset: cmdOpts.offset,
+        });
+        outputContactRules(rows, { json: !!opts.json, columns: RULE_COLUMNS });
+      }),
+    );
+
+  rules
+    .command("get <handle> <rule-id>")
+    .description("Get a single mail contact rule")
+    .action(
+      withErrorHandler(async function (this: Command, handle: string, ruleId: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rule = await inkbox.mailIdentityContactRules.get(handle, ruleId);
+        output(rule as unknown as Record<string, unknown>, { json: !!opts.json });
+      }),
+    );
+
+  rules
+    .command("create <handle>")
+    .description("Create a mail allow or block contact rule")
+    .requiredOption("--action <action>", "allow or block")
+    .requiredOption("--match-type <type>", "exact_email or domain")
+    .requiredOption("--match-target <value>", "Address or domain to match")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        cmdOpts: { action: string; matchType: string; matchTarget: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rule = await inkbox.mailIdentityContactRules.create(handle, {
+          ...directionalRuleOptions(this),
+          action: cmdOpts.action as MailRuleAction,
+          matchType: cmdOpts.matchType as MailRuleMatchType,
+          matchTarget: cmdOpts.matchTarget,
+        });
+        output(rule as unknown as Record<string, unknown>, { json: !!opts.json });
+      }),
+    );
+
+  rules
+    .command("update <handle> <rule-id>")
+    .description("Update the action on a mail rule (admin-only)")
+    .requiredOption("--action <action>", "allow or block")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        ruleId: string,
+        cmdOpts: { action: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rule = await inkbox.mailIdentityContactRules.update(handle, ruleId, {
+          ...directionalRuleOptions(this),
+          action: cmdOpts.action as MailRuleAction,
+        });
+        output(rule as unknown as Record<string, unknown>, { json: !!opts.json });
+      }),
+    );
+
+  rules
+    .command("delete <handle> <rule-id>")
+    .description("Delete a mail contact rule (admin-only)")
+    .action(
+      withErrorHandler(async function (this: Command, handle: string, ruleId: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        await inkbox.mailIdentityContactRules.delete(handle, ruleId);
+        printStatus(`Deleted mail contact rule '${ruleId}' on '${handle}'.`);
+      }),
+    );
+  addDirectionalRuleOptions(rules);
+}
+
+function registerIdentityPhoneRuleCommands(parent: Command): void {
+  const rules = parent
+    .command("phone-rules")
+    .description("Shared phone and iMessage contact rules scoped to an agent identity");
+
+  rules
+    .command("list <handle>")
+    .description("List an identity's shared phone and iMessage contact rules")
+    .option("--action <action>", "Filter by action: allow or block")
+    .option("--match-type <type>", "Filter by match_type: exact_number")
+    .option("--limit <n>", "Max rows", (v) => parseInt(v, 10))
+    .option("--offset <n>", "Offset", (v) => parseInt(v, 10))
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        cmdOpts: { action?: string; matchType?: string; limit?: number; offset?: number },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rows = await inkbox.phoneIdentityContactRules.list(handle, {
+          ...directionalRuleOptions(this),
+          action: cmdOpts.action as PhoneRuleAction | undefined,
+          matchType: cmdOpts.matchType as PhoneRuleMatchType | undefined,
+          limit: cmdOpts.limit,
+          offset: cmdOpts.offset,
+        });
+        outputContactRules(rows, { json: !!opts.json, columns: RULE_COLUMNS });
+      }),
+    );
+
+  rules
+    .command("list-all")
+    .description("List phone contact rules across the org (admin-only)")
+    .option("--agent-identity-id <id>", "Narrow to a single agent identity id")
+    .option("--action <action>", "Filter by action: allow or block")
+    .option("--match-type <type>", "Filter by match_type: exact_number")
+    .option("--limit <n>", "Max rows", (v) => parseInt(v, 10))
+    .option("--offset <n>", "Offset", (v) => parseInt(v, 10))
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        cmdOpts: {
+          agentIdentityId?: string;
+          action?: string;
+          matchType?: string;
+          limit?: number;
+          offset?: number;
+        },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rows = await inkbox.phoneIdentityContactRules.listAll({
+          ...directionalRuleOptions(this),
+          agentIdentityId: cmdOpts.agentIdentityId,
+          action: cmdOpts.action as PhoneRuleAction | undefined,
+          matchType: cmdOpts.matchType as PhoneRuleMatchType | undefined,
+          limit: cmdOpts.limit,
+          offset: cmdOpts.offset,
+        });
+        outputContactRules(rows, { json: !!opts.json, columns: RULE_COLUMNS });
+      }),
+    );
+
+  rules
+    .command("get <handle> <rule-id>")
+    .description("Get a single phone contact rule")
+    .action(
+      withErrorHandler(async function (this: Command, handle: string, ruleId: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rule = await inkbox.phoneIdentityContactRules.get(handle, ruleId);
+        output(rule as unknown as Record<string, unknown>, { json: !!opts.json });
+      }),
+    );
+
+  rules
+    .command("create <handle>")
+    .description("Create a shared phone and iMessage contact rule (admin API key required)")
+    .requiredOption("--action <action>", "allow or block")
+    .requiredOption("--match-target <value>", "E.164 phone number to match")
+    .option("--match-type <type>", "Match type (default exact_number)", "exact_number")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        cmdOpts: { action: string; matchTarget: string; matchType: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rule = await inkbox.phoneIdentityContactRules.create(handle, {
+          ...directionalRuleOptions(this),
+          action: cmdOpts.action as PhoneRuleAction,
+          matchTarget: cmdOpts.matchTarget,
+          matchType: cmdOpts.matchType as PhoneRuleMatchType,
+        });
+        output(rule as unknown as Record<string, unknown>, { json: !!opts.json });
+      }),
+    );
+
+  rules
+    .command("update <handle> <rule-id>")
+    .description("Update the action on a phone rule (admin-only)")
+    .requiredOption("--action <action>", "allow or block")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        ruleId: string,
+        cmdOpts: { action: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rule = await inkbox.phoneIdentityContactRules.update(handle, ruleId, {
+          ...directionalRuleOptions(this),
+          action: cmdOpts.action as PhoneRuleAction,
+        });
+        output(rule as unknown as Record<string, unknown>, { json: !!opts.json });
+      }),
+    );
+
+  rules
+    .command("delete <handle> <rule-id>")
+    .description("Delete a phone contact rule (admin-only)")
+    .action(
+      withErrorHandler(async function (this: Command, handle: string, ruleId: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        await inkbox.phoneIdentityContactRules.delete(handle, ruleId);
+        printStatus(`Deleted phone contact rule '${ruleId}' on '${handle}'.`);
+      }),
+    );
+  addDirectionalRuleOptions(rules);
+}
+
+function registerIdentitySigningKeyCommands(parent: Command): void {
+  const signingKey = parent
+    .command("signing-key")
+    .description("Per-identity webhook signing key operations");
+
+  signingKey
+    .command("status <handle>")
+    .description("Report whether this identity has a webhook signing key")
+    .action(
+      withErrorHandler(async function (this: Command, handle: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const id = await inkbox.getIdentity(handle);
+        const status = await id.getSigningKeyStatus();
+        output(
+          { configured: status.configured, createdAt: status.createdAt },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  signingKey
+    .command("rotate <handle>")
+    .description("Create or rotate this identity's webhook signing key")
+    .action(
+      withErrorHandler(async function (this: Command, handle: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const id = await inkbox.getIdentity(handle);
+        const key = await id.createSigningKey();
+        output(
+          { signingKey: key.signingKey, createdAt: key.createdAt },
+          { json: !!opts.json },
+        );
+        console.error(
+          "Note: Store this key securely — it cannot be retrieved again.",
+        );
+      }),
+    );
+}
+
+export function registerIdentityCommands(program: Command): void {
+  const identity = program
+    .command("identity")
+    .description("Manage agent identities");
+
+  identity.command("contact-policies <handle>")
+    .description("List the contact permissions visible to an identity")
+    .option("--limit <number>", "Page size", "50")
+    .option("--offset <number>", "Page offset", "0")
+    .action(withErrorHandler(async function (
+      this: Command, handle: string, options: { limit: string; offset: string },
+    ): Promise<void> {
+      const opts = getGlobalOpts(this);
+      const page = await createClient(opts).contacts.communicationPolicy.listForIdentity(handle, parsePolicyPagination(options));
+      output(page as unknown as Record<string, unknown>, { json: !!opts.json });
+    }));
+
+  const affiliation = identity.command("domain-affiliation")
+    .description("Manage an agent's verified domain (admin API key required)");
+  affiliation.command("get <handle>")
+    .action(withErrorHandler(async function (this: Command, handle: string) {
+      output(await createClient(getGlobalOpts(this)).identities.getDomainAffiliation(handle), { json: !!getGlobalOpts(this).json });
+    }));
+  affiliation.command("set <handle> <claim-id>")
+    .action(withErrorHandler(async function (this: Command, handle: string, claimId: string) {
+      output(await createClient(getGlobalOpts(this)).identities.setDomainAffiliation(handle, {
+        domainClaimId: claimId,
+      }), { json: !!getGlobalOpts(this).json });
+    }));
+  affiliation.command("remove <handle>")
+    .action(withErrorHandler(async function (this: Command, handle: string) {
+      await createClient(getGlobalOpts(this)).identities.removeDomainAffiliation(handle);
+      output({ removed: handle }, { json: !!getGlobalOpts(this).json });
+    }));
+
+  identity
+    .command("list")
+    .description("List visible identities (agent-scoped credentials return only themselves)")
+    .action(
+      withErrorHandler(async function (this: Command) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const identities = await inkbox.listIdentities();
+        output(identities, {
+          json: !!opts.json,
+          columns: ["agentHandle", "id", "createdAt"],
+        });
+      }),
+    );
+
+  identity
+    .command("get <handle>")
+    .description("Get identity details")
+    .action(
+      withErrorHandler(async function (this: Command, handle: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const id = await inkbox.getIdentity(handle);
+        output(
+          {
+            agentHandle: id.agentHandle,
+            id: id.id,
+            displayName: id.displayName,
+            description: id.description,
+            mailbox: id.mailbox?.emailAddress ?? null,
+            phoneNumber: id.phoneNumber?.number ?? null,
+            phoneCountry: id.phoneNumber?.country ?? null,
+            phoneState: id.phoneNumber?.state ?? null,
+            imessageEnabled: id.imessageEnabled,
+            contactSharingEnabled: id.contactSharingEnabled,
+            imessageFilterMode: id.imessageFilterMode,
+            mailFilterMode: id.mailFilterMode,
+            phoneFilterMode: id.phoneFilterMode,
+            slackFilterMode: id.slackFilterMode,
+            slackInboundFilterMode: id.slackInboundFilterMode,
+            slackOutboundFilterMode: id.slackOutboundFilterMode,
+            mailInboundFilterMode: id.mailInboundFilterMode,
+            mailOutboundFilterMode: id.mailOutboundFilterMode,
+            phoneInboundFilterMode: id.phoneInboundFilterMode,
+            phoneOutboundFilterMode: id.phoneOutboundFilterMode,
+            signingKeyConfigured: id.signingKeyConfigured,
+            signingKeyCreatedAt: id.signingKeyCreatedAt,
+            tunnel: id.tunnel
+              ? {
+                  id: id.tunnel.id,
+                  publicHost: id.tunnel.publicHost,
+                  zone: id.tunnel.zone,
+                  tlsMode: id.tunnel.tlsMode,
+                  status: id.tunnel.status,
+                }
+              : null,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  identity
+    .command("create <handle>")
+    .description(
+      "Create a new agent identity. Atomically provisions a mailbox " +
+        "and tunnel; both come back on the JSON output.",
+    )
+    .option(
+      "--display-name <name>",
+      "Identity-level human-readable name. Defaults server-side to the handle.",
+    )
+    .option(
+      "--description <text>",
+      "Free-form org-internal description (never surfaces in outbound mail).",
+    )
+    .option(
+      "--imessage-enabled",
+      "Enable iMessage reachability for this identity.",
+      false,
+    )
+    .option(
+      "--contact-sharing-enabled <bool>",
+      "Share the identity's name and optional avatar from its personal iMessage line: true or false.",
+    )
+    .option(
+      "--email-local-part <part>",
+      "Requested mailbox local part. On the platform domain the server forces this to the handle.",
+    )
+    .option(
+      "--sending-domain <name>",
+      "Bare verified custom domain name to use for the agent's mailbox (e.g. 'mail.acme.com').",
+    )
+    .option(
+      "--platform-domain",
+      "Force the platform sending domain for the mailbox.",
+      false,
+    )
+    .option(
+      "--tls-mode <mode>",
+      "Tunnel TLS mode: edge (default) or passthrough.",
+    )
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        cmdOpts: {
+          displayName?: string;
+          description?: string;
+          imessageEnabled?: boolean;
+          contactSharingEnabled?: string;
+          emailLocalPart?: string;
+          sendingDomain?: string;
+          platformDomain?: boolean;
+          tlsMode?: string;
+        },
+      ) {
+        if (cmdOpts.sendingDomain !== undefined && cmdOpts.platformDomain) {
+          throw new Error("--sending-domain and --platform-domain are mutually exclusive");
+        }
+        if (cmdOpts.tlsMode !== undefined && cmdOpts.tlsMode !== "edge" && cmdOpts.tlsMode !== "passthrough") {
+          throw new Error("--tls-mode must be 'edge' or 'passthrough'");
+        }
+        if (cmdOpts.contactSharingEnabled !== undefined && cmdOpts.contactSharingEnabled !== "true" && cmdOpts.contactSharingEnabled !== "false") {
+          throw new Error("--contact-sharing-enabled must be 'true' or 'false'");
+        }
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const createOpts: {
+          displayName?: string;
+          description?: string | null;
+          imessageEnabled?: boolean;
+          contactSharingEnabled?: boolean;
+          emailLocalPart?: string;
+          sendingDomain?: string | null;
+          tunnel?: { tlsMode?: "edge" | "passthrough" };
+        } = {};
+        if (cmdOpts.displayName !== undefined) createOpts.displayName = cmdOpts.displayName;
+        if (cmdOpts.description !== undefined) createOpts.description = cmdOpts.description;
+        if (cmdOpts.imessageEnabled) createOpts.imessageEnabled = true;
+        if (cmdOpts.contactSharingEnabled !== undefined) {
+          createOpts.contactSharingEnabled = cmdOpts.contactSharingEnabled === "true";
+        }
+        if (cmdOpts.emailLocalPart !== undefined) createOpts.emailLocalPart = cmdOpts.emailLocalPart;
+        if (cmdOpts.sendingDomain !== undefined) {
+          createOpts.sendingDomain = cmdOpts.sendingDomain;
+        } else if (cmdOpts.platformDomain) {
+          createOpts.sendingDomain = null;
+        }
+        if (cmdOpts.tlsMode !== undefined) {
+          createOpts.tunnel = { tlsMode: cmdOpts.tlsMode as "edge" | "passthrough" };
+        }
+        const id = await inkbox.createIdentity(handle, createOpts);
+        output(
+          {
+            agentHandle: id.agentHandle,
+            id: id.id,
+            displayName: id.displayName,
+            description: id.description,
+            mailbox: id.mailbox?.emailAddress ?? null,
+            imessageEnabled: id.imessageEnabled,
+            contactSharingEnabled: id.contactSharingEnabled,
+            tunnel: id.tunnel
+              ? {
+                  id: id.tunnel.id,
+                  publicHost: id.tunnel.publicHost,
+                  zone: id.tunnel.zone,
+                  tlsMode: id.tunnel.tlsMode,
+                  status: id.tunnel.status,
+                }
+              : null,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  identity
+    .command("delete <handle>")
+    .description("Delete an identity. Cascades to the linked mailbox + tunnel and revokes scoped API keys.")
+    .action(
+      withErrorHandler(async function (this: Command, handle: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const id = await inkbox.getIdentity(handle);
+        await id.delete();
+        printStatus(`Deleted identity '${handle}'.`);
+      }),
+    );
+
+  identity
+    .command("update <handle>")
+    .description(
+      "Update an identity. For --description, an empty string clears " +
+        "the column (sends explicit null); omit the flag to leave " +
+        "untouched.",
+    )
+    .option("--display-name <name>", "New display name (pass '' to clear)")
+    .option("--description <text>", "New description (pass '' to clear)")
+    .option("--clear-description", "Explicitly clear the description (sends null)", false)
+    .option("--imessage-enabled <bool>", "Toggle identity-level iMessage reachability: true or false")
+    .option("--contact-sharing-enabled <bool>", "Toggle automatic name and optional photo sharing on a personal iMessage line: true or false")
+    .option("--imessage-filter-mode <mode>", "Alias for the shared phone and iMessage contact-rule mode (admin API key required)")
+    .option("--mail-filter-mode <mode>", "Mail contact-rule mode: whitelist or blacklist (admin-only)")
+    .option("--phone-filter-mode <mode>", "Shared phone and iMessage contact-rule mode: whitelist or blacklist (admin API key required)")
+    .option("--slack-filter-mode <mode>", "Slack contact-rule mode: whitelist or blacklist (admin-only)")
+    .option("--slack-inbound-filter-mode <mode>", "Inbound Slack mode: whitelist or blacklist")
+    .option("--slack-outbound-filter-mode <mode>", "Outbound Slack mode: whitelist or blacklist")
+    .option("--mail-inbound-filter-mode <mode>", "Inbound mail mode: whitelist or blacklist")
+    .option("--mail-outbound-filter-mode <mode>", "Outbound mail mode: whitelist or blacklist")
+    .option("--phone-inbound-filter-mode <mode>", "Inbound phone and iMessage mode: whitelist or blacklist")
+    .option("--phone-outbound-filter-mode <mode>", "Outbound phone and iMessage mode: whitelist or blacklist")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        cmdOpts: {
+          displayName?: string;
+          description?: string;
+          clearDescription?: boolean;
+          imessageEnabled?: string;
+          contactSharingEnabled?: string;
+          imessageFilterMode?: string;
+          mailFilterMode?: string;
+          phoneFilterMode?: string;
+          slackFilterMode?: string;
+          slackInboundFilterMode?: string;
+          slackOutboundFilterMode?: string;
+          mailInboundFilterMode?: string;
+          mailOutboundFilterMode?: string;
+          phoneInboundFilterMode?: string;
+          phoneOutboundFilterMode?: string;
+        },
+      ) {
+        if (cmdOpts.description !== undefined && cmdOpts.clearDescription) {
+          throw new Error("--description and --clear-description are mutually exclusive");
+        }
+        if (cmdOpts.imessageEnabled !== undefined && cmdOpts.imessageEnabled !== "true" && cmdOpts.imessageEnabled !== "false") {
+          throw new Error("--imessage-enabled must be 'true' or 'false'");
+        }
+        if (cmdOpts.contactSharingEnabled !== undefined && cmdOpts.contactSharingEnabled !== "true" && cmdOpts.contactSharingEnabled !== "false") {
+          throw new Error("--contact-sharing-enabled must be 'true' or 'false'");
+        }
+        for (const [flag, value] of [
+          ["--imessage-filter-mode", cmdOpts.imessageFilterMode],
+          ["--mail-filter-mode", cmdOpts.mailFilterMode],
+          ["--phone-filter-mode", cmdOpts.phoneFilterMode],
+          ["--slack-filter-mode", cmdOpts.slackFilterMode],
+          ["--slack-inbound-filter-mode", cmdOpts.slackInboundFilterMode],
+          ["--slack-outbound-filter-mode", cmdOpts.slackOutboundFilterMode],
+          ["--mail-inbound-filter-mode", cmdOpts.mailInboundFilterMode],
+          ["--mail-outbound-filter-mode", cmdOpts.mailOutboundFilterMode],
+          ["--phone-inbound-filter-mode", cmdOpts.phoneInboundFilterMode],
+          ["--phone-outbound-filter-mode", cmdOpts.phoneOutboundFilterMode],
+        ] as const) {
+          if (value !== undefined && value !== "whitelist" && value !== "blacklist") {
+            throw new Error(`${flag} must be 'whitelist' or 'blacklist'`);
+          }
+        }
+        for (const channel of ["mail", "phone", "slack"] as const) {
+          if ((cmdOpts[`${channel}FilterMode`] !== undefined || (channel === "phone" && cmdOpts.imessageFilterMode !== undefined))
+            && (cmdOpts[`${channel}InboundFilterMode`] !== undefined || cmdOpts[`${channel}OutboundFilterMode`] !== undefined)) {
+            throw new Error(`Shared and directional ${channel} filter modes cannot be combined`);
+          }
+        }
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const id = await inkbox.getIdentity(handle);
+        const updateOpts: {
+          mailInboundFilterMode?: "whitelist" | "blacklist";
+          mailOutboundFilterMode?: "whitelist" | "blacklist";
+          phoneInboundFilterMode?: "whitelist" | "blacklist";
+          phoneOutboundFilterMode?: "whitelist" | "blacklist";
+          displayName?: string | null;
+          description?: string | null;
+          imessageEnabled?: boolean;
+          contactSharingEnabled?: boolean;
+          imessageFilterMode?: "whitelist" | "blacklist";
+          mailFilterMode?: "whitelist" | "blacklist";
+          phoneFilterMode?: "whitelist" | "blacklist";
+          slackFilterMode?: "whitelist" | "blacklist";
+          slackInboundFilterMode?: "whitelist" | "blacklist";
+          slackOutboundFilterMode?: "whitelist" | "blacklist";
+        } = {};
+        for (const key of ["slackFilterMode", "slackInboundFilterMode", "slackOutboundFilterMode", "mailInboundFilterMode", "mailOutboundFilterMode", "phoneInboundFilterMode", "phoneOutboundFilterMode"] as const) {
+          if (cmdOpts[key] !== undefined) updateOpts[key] = cmdOpts[key] as "whitelist" | "blacklist";
+        }
+        if (cmdOpts.displayName !== undefined) {
+          updateOpts.displayName = cmdOpts.displayName === "" ? null : cmdOpts.displayName;
+        }
+        if (cmdOpts.description !== undefined) {
+          updateOpts.description = cmdOpts.description === "" ? null : cmdOpts.description;
+        } else if (cmdOpts.clearDescription) {
+          updateOpts.description = null;
+        }
+        if (cmdOpts.imessageEnabled !== undefined) {
+          updateOpts.imessageEnabled = cmdOpts.imessageEnabled === "true";
+        }
+        if (cmdOpts.contactSharingEnabled !== undefined) {
+          updateOpts.contactSharingEnabled = cmdOpts.contactSharingEnabled === "true";
+        }
+        if (cmdOpts.imessageFilterMode !== undefined) {
+          updateOpts.imessageFilterMode = cmdOpts.imessageFilterMode as "whitelist" | "blacklist";
+        }
+        if (cmdOpts.mailFilterMode !== undefined) {
+          updateOpts.mailFilterMode = cmdOpts.mailFilterMode as "whitelist" | "blacklist";
+        }
+        if (cmdOpts.phoneFilterMode !== undefined) {
+          updateOpts.phoneFilterMode = cmdOpts.phoneFilterMode as "whitelist" | "blacklist";
+        }
+        await id.update(updateOpts);
+        printStatus(`Updated identity '${handle}'.`);
+      }),
+    );
+
+  identity
+    .command("refresh <handle>")
+    .description("Re-fetch identity from API")
+    .action(
+      withErrorHandler(async function (this: Command, handle: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const id = await inkbox.getIdentity(handle);
+        await id.refresh();
+        output(
+          {
+            agentHandle: id.agentHandle,
+            id: id.id,
+            displayName: id.displayName,
+            description: id.description,
+            mailbox: id.mailbox?.emailAddress ?? null,
+            phoneNumber: id.phoneNumber?.number ?? null,
+            phoneCountry: id.phoneNumber?.country ?? null,
+            phoneState: id.phoneNumber?.state ?? null,
+            imessageEnabled: id.imessageEnabled,
+            contactSharingEnabled: id.contactSharingEnabled,
+            imessageFilterMode: id.imessageFilterMode,
+            mailFilterMode: id.mailFilterMode,
+            phoneFilterMode: id.phoneFilterMode,
+            slackFilterMode: id.slackFilterMode,
+            slackInboundFilterMode: id.slackInboundFilterMode,
+            slackOutboundFilterMode: id.slackOutboundFilterMode,
+            mailInboundFilterMode: id.mailInboundFilterMode,
+            mailOutboundFilterMode: id.mailOutboundFilterMode,
+            phoneInboundFilterMode: id.phoneInboundFilterMode,
+            phoneOutboundFilterMode: id.phoneOutboundFilterMode,
+            signingKeyConfigured: id.signingKeyConfigured,
+            signingKeyCreatedAt: id.signingKeyCreatedAt,
+            tunnel: id.tunnel
+              ? {
+                  id: id.tunnel.id,
+                  publicHost: id.tunnel.publicHost,
+                  zone: id.tunnel.zone,
+                  tlsMode: id.tunnel.tlsMode,
+                  status: id.tunnel.status,
+                }
+              : null,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  identity
+    .command("create-secret <handle>")
+    .description("Create a secret scoped to an identity (requires vault key)")
+    .requiredOption("--name <name>", "Secret display name")
+    .requiredOption(
+      "--type <type>",
+      "Secret type: login, api_key, ssh_key, key_pair, other",
+    )
+    .option("--description <desc>", "Optional description")
+    .option("--username <user>", "Username (for login type)")
+    .option("--password <pass>", "Password (for login type)")
+    .option("--email <email>", "Email (for login type)")
+    .option("--url <url>", "URL (for login type)")
+    .option("--totp-uri <uri>", "otpauth:// TOTP URI (for login type)")
+    .option("--key <key>", "API key value (for api_key type)")
+    .option("--access-key <key>", "Access key (for key_pair type)")
+    .option("--secret-key <key>", "Secret key (for key_pair type)")
+    .option("--endpoint <url>", "Endpoint URL (for api_key and key_pair types)")
+    .option("--private-key <key>", "Private key (for ssh_key type)")
+    .option("--public-key <key>", "Public key (for ssh_key type)")
+    .option("--fingerprint <fp>", "Key fingerprint (for ssh_key type)")
+    .option("--passphrase <pass>", "Key passphrase (for ssh_key type)")
+    .option("--data <json>", "JSON payload (for other type)")
+    .option("--notes <text>", "Optional notes")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        cmdOpts: {
+          name: string;
+          type: string;
+          description?: string;
+          username?: string;
+          password?: string;
+          email?: string;
+          url?: string;
+          totpUri?: string;
+          key?: string;
+          accessKey?: string;
+          secretKey?: string;
+          endpoint?: string;
+          privateKey?: string;
+          publicKey?: string;
+          fingerprint?: string;
+          passphrase?: string;
+          data?: string;
+          notes?: string;
+        },
+      ) {
+        const opts = getGlobalOpts(this);
+        const vaultKey = opts.vaultKey ?? process.env.INKBOX_VAULT_KEY;
+        if (!vaultKey) {
+          console.error(
+            "Error: Vault key required. Set INKBOX_VAULT_KEY or pass --vault-key.",
+          );
+          process.exit(1);
+        }
+        const inkbox = createClient(opts);
+        await inkbox.ready();
+        const id = await inkbox.getIdentity(handle);
+
+        let payload: SecretPayload;
+        switch (cmdOpts.type) {
+          case "login":
+            if (!cmdOpts.password) {
+              console.error(
+                "Error: --password is required for login secrets.",
+              );
+              process.exit(1);
+            }
+            payload = {
+              password: cmdOpts.password,
+              username: cmdOpts.username,
+              email: cmdOpts.email,
+              url: cmdOpts.url,
+              notes: cmdOpts.notes,
+              ...(cmdOpts.totpUri
+                ? { totp: parseTotpUri(cmdOpts.totpUri) }
+                : {}),
+            };
+            break;
+          case "api_key":
+            if (!cmdOpts.key) {
+              console.error(
+                "Error: --key is required for api_key secrets.",
+              );
+              process.exit(1);
+            }
+            payload = {
+              apiKey: cmdOpts.key,
+              endpoint: cmdOpts.endpoint,
+              notes: cmdOpts.notes,
+            };
+            break;
+          case "key_pair":
+            if (!cmdOpts.accessKey || !cmdOpts.secretKey) {
+              console.error(
+                "Error: --access-key and --secret-key are required for key_pair secrets.",
+              );
+              process.exit(1);
+            }
+            payload = {
+              accessKey: cmdOpts.accessKey,
+              secretKey: cmdOpts.secretKey,
+              endpoint: cmdOpts.endpoint,
+              notes: cmdOpts.notes,
+            };
+            break;
+          case "ssh_key":
+            if (!cmdOpts.privateKey) {
+              console.error(
+                "Error: --private-key is required for ssh_key secrets.",
+              );
+              process.exit(1);
+            }
+            payload = {
+              privateKey: cmdOpts.privateKey,
+              publicKey: cmdOpts.publicKey,
+              fingerprint: cmdOpts.fingerprint,
+              passphrase: cmdOpts.passphrase,
+              notes: cmdOpts.notes,
+            };
+            break;
+          case "other":
+            if (!cmdOpts.data) {
+              console.error(
+                "Error: --data (JSON string) is required for other secrets.",
+              );
+              process.exit(1);
+            }
+            payload = {
+              data: cmdOpts.data,
+              notes: cmdOpts.notes,
+            };
+            break;
+          default:
+            console.error(
+              `Error: Unknown secret type '${cmdOpts.type}'. Use: login, api_key, ssh_key, key_pair, other.`,
+            );
+            process.exit(1);
+        }
+
+        const secret = await id.createSecret({
+          name: cmdOpts.name,
+          description: cmdOpts.description,
+          payload,
+        });
+        output(
+          {
+            id: secret.id,
+            name: secret.name,
+            secretType: secret.secretType,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  identity
+    .command("get-secret <handle> <secret-id>")
+    .description("Get and decrypt a secret for an identity (requires vault key)")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        secretId: string,
+      ) {
+        const opts = getGlobalOpts(this);
+        const vaultKey = opts.vaultKey ?? process.env.INKBOX_VAULT_KEY;
+        if (!vaultKey) {
+          console.error(
+            "Error: Vault key required. Set INKBOX_VAULT_KEY or pass --vault-key.",
+          );
+          process.exit(1);
+        }
+        const inkbox = createClient(opts);
+        await inkbox.ready();
+        const id = await inkbox.getIdentity(handle);
+        const secret = await id.getSecret(secretId);
+        output(
+          {
+            id: secret.id,
+            name: secret.name,
+            secretType: secret.secretType,
+            createdAt: secret.createdAt,
+            payload: secret.payload,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  identity
+    .command("delete-secret <handle> <secret-id>")
+    .description("Delete a secret for an identity (requires vault key)")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        secretId: string,
+      ) {
+        const opts = getGlobalOpts(this);
+        const vaultKey = opts.vaultKey ?? process.env.INKBOX_VAULT_KEY;
+        if (!vaultKey) {
+          console.error(
+            "Error: Vault key required. Set INKBOX_VAULT_KEY or pass --vault-key.",
+          );
+          process.exit(1);
+        }
+        const inkbox = createClient(opts);
+        await inkbox.ready();
+        const id = await inkbox.getIdentity(handle);
+        await id.deleteSecret(secretId);
+        printStatus(`Deleted secret '${secretId}'.`);
+      }),
+    );
+
+  identity
+    .command("revoke-access <handle> <secret-id>")
+    .description("Revoke an identity's access to a secret")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        secretId: string,
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const id = await inkbox.getIdentity(handle);
+        await id.revokeCredentialAccess(secretId);
+        printStatus(
+          `Revoked access to secret '${secretId}' for identity '${handle}'.`,
+        );
+      }),
+    );
+
+  identity
+    .command("set-totp <handle> <secret-id>")
+    .description("Add TOTP to a login secret (requires vault key)")
+    .requiredOption("--uri <otpauth-uri>", "otpauth:// TOTP URI")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        secretId: string,
+        cmdOpts: { uri: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const vaultKey = opts.vaultKey ?? process.env.INKBOX_VAULT_KEY;
+        if (!vaultKey) {
+          console.error(
+            "Error: Vault key required. Set INKBOX_VAULT_KEY or pass --vault-key.",
+          );
+          process.exit(1);
+        }
+        const inkbox = createClient(opts);
+        await inkbox.ready();
+        const id = await inkbox.getIdentity(handle);
+        const secret = await id.setTotp(secretId, cmdOpts.uri);
+        output(
+          {
+            id: secret.id,
+            name: secret.name,
+            secretType: secret.secretType,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  identity
+    .command("remove-totp <handle> <secret-id>")
+    .description("Remove TOTP from a login secret (requires vault key)")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        secretId: string,
+      ) {
+        const opts = getGlobalOpts(this);
+        const vaultKey = opts.vaultKey ?? process.env.INKBOX_VAULT_KEY;
+        if (!vaultKey) {
+          console.error(
+            "Error: Vault key required. Set INKBOX_VAULT_KEY or pass --vault-key.",
+          );
+          process.exit(1);
+        }
+        const inkbox = createClient(opts);
+        await inkbox.ready();
+        const id = await inkbox.getIdentity(handle);
+        const secret = await id.removeTotp(secretId);
+        output(
+          {
+            id: secret.id,
+            name: secret.name,
+            secretType: secret.secretType,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  identity
+    .command("totp-code <handle> <secret-id>")
+    .description("Generate a TOTP code (requires vault key)")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        handle: string,
+        secretId: string,
+      ) {
+        const opts = getGlobalOpts(this);
+        const vaultKey = opts.vaultKey ?? process.env.INKBOX_VAULT_KEY;
+        if (!vaultKey) {
+          console.error(
+            "Error: Vault key required. Set INKBOX_VAULT_KEY or pass --vault-key.",
+          );
+          process.exit(1);
+        }
+        const inkbox = createClient(opts);
+        await inkbox.ready();
+        const id = await inkbox.getIdentity(handle);
+        const totp = await id.getTotpCode(secretId);
+        output(
+          {
+            code: totp.code,
+            periodStart: totp.periodStart,
+            periodEnd: totp.periodEnd,
+            secondsRemaining: totp.secondsRemaining,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  identity
+    .command("release-phone <handle>")
+    .description("Release the identity's phone number back to the carrier (permanent)")
+    .action(
+      withErrorHandler(async function (this: Command, handle: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const id = await inkbox.getIdentity(handle);
+        await id.releasePhoneNumber();
+        printStatus(`Released phone number from identity '${handle}'.`);
+      }),
+    );
+
+  registerIdentityMailRuleCommands(identity);
+  registerCompanionCommands(identity);
+  registerIdentityPhoneRuleCommands(identity);
+  registerIdentitySigningKeyCommands(identity);
+}

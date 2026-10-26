@@ -1,0 +1,85 @@
+# use-inkbox-signup
+
+Agent self-signup example — register without a pre-existing API key, become claimed through a human approval code or matching email-bound invitation, check restrictions, send a welcome email, and clean up.
+
+No Inkbox account or API key is required to start. The flow provisions a mailbox, identity, and one-time API key in a single call. Ordinary and unbound-invitation signup sends a verification email to the specified human; a matching email-bound invitation claims the agent immediately without another email.
+
+## Prerequisites
+
+1. Python ≥ 3.11 (for the Python script) or Node.js ≥ 22 (for TypeScript)
+2. A human email address (`INKBOX_HUMAN_EMAIL`) — owns or approves the agent; receives a verification code only when one is required
+3. After registration, save the one-time `INKBOX_API_KEY` from the output
+
+If another organization invited the agent, optionally set
+`INKBOX_A2A_INVITATION` (an exact-origin share URL or raw token). The signup and verification responses then
+report whether the invitation is awaiting verification or accepted.
+When registration reports `accepted` or an already-claimed status, skip
+`verify` and `resend`; no verification code is sent for that path.
+
+## Flow
+
+| Step | Command | Auth required |
+|------|---------|---------------|
+| 1. Register | `register` | None |
+| 2. Check status | `status` | Signup API key |
+| 3. Verify when still unclaimed | `verify` | Signup API key + 6-digit code from email |
+| 4. Send welcome | `send-welcome` | Signup API key (after claim) |
+| 5. Clean up | `cleanup` | Signup API key |
+
+While unclaimed, outbound email is restricted to the human email only (max 5 recipient sends per fixed 24-hour window). After verification or invitation acceptance, recipient restrictions lift and the organization's plan-based limits apply.
+
+## Run (Python)
+
+```bash
+cp .env.example .env
+# edit .env — set INKBOX_HUMAN_EMAIL at minimum
+
+cd ../../sdk/python
+uv run --env-file ../../examples/use-inkbox-signup/.env \
+  python ../../examples/use-inkbox-signup/agent_signup.py register
+
+# Save the printed API key into .env as INKBOX_API_KEY, then:
+uv run --env-file ../../examples/use-inkbox-signup/.env \
+  python ../../examples/use-inkbox-signup/agent_signup.py status
+
+# If registration is still unclaimed, after the human shares the 6-digit code:
+uv run --env-file ../../examples/use-inkbox-signup/.env \
+  python ../../examples/use-inkbox-signup/agent_signup.py verify --code 483921
+
+uv run --env-file ../../examples/use-inkbox-signup/.env \
+  python ../../examples/use-inkbox-signup/agent_signup.py send-welcome
+
+uv run --env-file ../../examples/use-inkbox-signup/.env \
+  python ../../examples/use-inkbox-signup/agent_signup.py cleanup
+```
+
+Other subcommands: `resend` (5-minute cooldown).
+
+## Run (TypeScript)
+
+```bash
+cp .env.example .env
+# edit .env — set INKBOX_HUMAN_EMAIL at minimum
+
+cd ../../sdk/typescript
+npm run build
+cd ../../examples/use-inkbox-signup
+npm install ../../sdk/typescript
+
+npx tsx --env-file .env agent-signup.ts register
+# Save the API key and check status. Run verify only when still unclaimed.
+npx tsx --env-file .env agent-signup.ts status
+npx tsx --env-file .env agent-signup.ts verify --code 483921
+npx tsx --env-file .env agent-signup.ts send-welcome
+npx tsx --env-file .env agent-signup.ts cleanup
+```
+
+## Restrictions (unclaimed vs claimed)
+
+| | Unclaimed | Claimed (after verification or invitation acceptance) |
+|---|---|---|
+| Recipient sends per fixed 24-hour window | 5 | Plan-based (100–5,000) |
+| Allowed recipients | `human_email` only | No restriction |
+| Can receive email | Yes | Yes |
+
+See [`skills/inkbox-agent-self-signup/SKILL.md`](../../skills/inkbox-agent-self-signup/SKILL.md) for the full reference.

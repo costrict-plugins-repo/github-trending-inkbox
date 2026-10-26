@@ -1,0 +1,37 @@
+//! Org-scoped contacts, memory, correspondence, and vCard import/export.
+
+pub mod correspondence;
+pub mod directional;
+pub mod resources;
+pub mod types;
+pub use directional::*;
+
+pub use correspondence::{
+    CallCorrespondenceItem, ContactCorrespondence, CorrespondenceAttachmentMetadata,
+    CorrespondenceChannel, CorrespondenceChannelResult, CorrespondenceChannelStatus,
+    CorrespondenceContentMode, CorrespondenceDirection, CorrespondenceItem, CorrespondenceItemBase,
+    CorrespondenceMediaMetadata, CorrespondenceOrder, CorrespondenceTranscriptEntry,
+    CorrespondenceTranscriptMarker, CorrespondenceTranscriptMode, EmailCorrespondenceItem,
+    IMessageCorrespondenceItem, SlackCorrespondenceItem, SmsCorrespondenceItem,
+};
+pub use resources::communication_policy::*;
+pub use resources::contact_access::ContactAccessResource;
+pub use resources::contact_facts::ContactFactsResource;
+pub use resources::contacts::{
+    ContactsResource, CreateContactParams, ListContactsParams, MergeContactsParams,
+    UpdateContactParams,
+};
+pub use resources::correspondence::{ContactCorrespondenceResource, CorrespondenceQuery};
+pub use resources::permissions::*;
+pub use resources::vcards::VCardsResource;
+pub use types::{
+    Contact, ContactAccess, ContactAccessSettings, ContactAddress, ContactBulkDeleteResult,
+    ContactBulkDeleteResultItem, ContactBulkDeleteStatus, ContactChannelAccess,
+    ContactChannelAccessUpdate, ContactCreatePermissions, ContactCreationSource,
+    ContactCustomField, ContactDate, ContactEmail, ContactFact, ContactFactCitation,
+    ContactFactCitationAvailability, ContactFactCitationDetail, ContactFactDeleteResult,
+    ContactFactKind, ContactFactOrigin, ContactImportResult, ContactImportResultItem,
+    ContactImportStatus, ContactMemorySummary, ContactNameSource, ContactPhone,
+    ContactReviewStatus, ContactSlackAccount, ContactVCardExportResult, ContactWebsite,
+    UpdateContactAccess,
+};

@@ -1,0 +1,326 @@
+/**
+ * inkbox-contacts/resources/contacts.ts
+ *
+ * Contacts CRUD + search + lookup.
+ */
+
+import { HttpTransport } from "../../_http.js";
+import { ContactAccessResource, contactAccessToWire, type ContactChannelAccessUpdate } from "./contactAccess.js";
+import { ContactCommunicationPolicyResource, type ContactAddressUpdate, type ContactDecision } from "./communicationPolicy.js";
+import { ContactPermissionsResource, contactPermissionsToWire, type UpdateContactPermissions } from "./permissions.js";
+import { ContactCorrespondenceResource } from "./correspondence.js";
+import { ContactFactsResource } from "./contactFacts.js";
+import { VCardsResource } from "./vcards.js";
+import {
+  Contact,
+  ContactAddress,
+  ContactBulkDeleteResult,
+  ContactCustomField,
+  ContactDate,
+  ContactEmail,
+  ContactPhone,
+  ContactReviewStatus,
+  ContactWebsite,
+  RawContact,
+  RawContactBulkDeleteResult,
+  contactAddressToWire,
+  contactCustomFieldToWire,
+  contactDateToWire,
+  contactEmailToWire,
+  contactPhoneToWire,
+  contactWebsiteToWire,
+  parseContact,
+  parseContactBulkDeleteResult,
+} from "../types.js";
+
+const BASE = "/contacts";
+
+export interface ListContactsOptions {
+  q?: string;
+  order?: "name" | "recent" | string;
+  limit?: number;
+  /** Offset from 0 through 10,000. */
+  offset?: number;
+  reviewStatus?: ContactReviewStatus[];
+}
+
+export interface LookupContactsOptions {
+  email?: string;
+  emailContains?: string;
+  emailDomain?: string;
+  phone?: string;
+  phoneContains?: string;
+}
+
+type ContactPermissionMaps = Omit<UpdateContactPermissions, "profile" | "memories">;
+
+interface ContactCreatePermissionsBase extends Pick<UpdateContactPermissions, "profile" | "memories"> {
+  identityId: string;
+}
+
+/** Use group access or boolean address maps without mixing shapes. */
+export type ContactCreatePermissions = ContactCreatePermissionsBase & (
+  | (ContactPermissionMaps & { email?: never; phone?: never; addresses?: never })
+  | ({ [Key in keyof ContactPermissionMaps]?: never } & { email?: ContactChannelAccessUpdate; phone?: ContactChannelAccessUpdate; addresses?: never })
+);
+
+/** Initial explicit address decisions, including independent choices for each direction. */
+export type ContactCreateAddressPermissions = { [Key in keyof ContactPermissionMaps]?: never } & {
+  identityId: string;
+  email?: never;
+  phone?: never;
+  addresses: Pick<ContactAddressUpdate, "kind" | "value" | "action" | "direction">[];
+  profile?: ContactDecision;
+  memories?: ContactDecision;
+};
+
+export interface CreateContactOptions {
+  preferredName?: string;
+  namePrefix?: string;
+  givenName?: string;
+  middleName?: string;
+  familyName?: string;
+  nameSuffix?: string;
+  companyName?: string;
+  jobTitle?: string;
+  /** ISO date (YYYY-MM-DD). */
+  birthday?: string;
+  notes?: string;
+  emails?: ContactEmail[];
+  phones?: ContactPhone[];
+  websites?: ContactWebsite[];
+  dates?: ContactDate[];
+  addresses?: ContactAddress[];
+  customFields?: ContactCustomField[];
+  /** Initial selected-agent access saved atomically; requires an admin API key. */
+  permissions?: ContactCreatePermissions;
+}
+
+export type CreateContactWithAddressPermissionsOptions = Omit<CreateContactOptions, "permissions"> & {
+  permissions: ContactCreateAddressPermissions;
+};
+
+export interface UpdateContactOptions {
+  preferredName?: string | null;
+  namePrefix?: string | null;
+  givenName?: string | null;
+  middleName?: string | null;
+  familyName?: string | null;
+  nameSuffix?: string | null;
+  companyName?: string | null;
+  jobTitle?: string | null;
+  /** ISO date (YYYY-MM-DD) or null to clear. */
+  birthday?: string | null;
+  notes?: string | null;
+  emails?: ContactEmail[] | null;
+  phones?: ContactPhone[] | null;
+  websites?: ContactWebsite[] | null;
+  dates?: ContactDate[] | null;
+  addresses?: ContactAddress[] | null;
+  customFields?: ContactCustomField[] | null;
+  reviewStatus?: ContactReviewStatus;
+}
+
+export type ContactMergeField =
+  | "preferredName"
+  | "namePrefix"
+  | "givenName"
+  | "middleName"
+  | "familyName"
+  | "nameSuffix"
+  | "companyName"
+  | "jobTitle"
+  | "birthday"
+  | "notes";
+
+export interface MergeContactsOptions {
+  losingContactIds: string[];
+  fieldSources?: Partial<Record<ContactMergeField, string>>;
+}
+
+export class ContactsResource {
+  readonly access: ContactAccessResource;
+  readonly correspondence: ContactCorrespondenceResource;
+  readonly facts: ContactFactsResource;
+  readonly vcards: VCardsResource;
+  readonly communicationPolicy: ContactCommunicationPolicyResource;
+  readonly permissions: ContactPermissionsResource;
+
+  constructor(private readonly http: HttpTransport) {
+    this.access = new ContactAccessResource(http);
+    this.communicationPolicy = new ContactCommunicationPolicyResource(http);
+    this.permissions = new ContactPermissionsResource(http);
+    this.correspondence = new ContactCorrespondenceResource(http);
+    this.facts = new ContactFactsResource(http);
+    this.vcards = new VCardsResource(http);
+  }
+
+  async list(options: ListContactsOptions = {}): Promise<Contact[]> {
+    const params: Record<string, string | number | readonly string[] | undefined> = {};
+    if (options.q !== undefined) params.q = options.q;
+    if (options.order !== undefined) params.order = options.order;
+    if (options.limit !== undefined) params.limit = options.limit;
+    if (options.offset !== undefined) params.offset = options.offset;
+    if (options.reviewStatus !== undefined) params.review_status = options.reviewStatus;
+    const data = await this.http.get<{ items: RawContact[] } | RawContact[]>(
+      BASE,
+      params,
+    );
+    const items = Array.isArray(data) ? data : data.items;
+    return items.map(parseContact);
+  }
+
+  async lookup(options: LookupContactsOptions): Promise<Contact[]> {
+    const supplied: Record<string, string | undefined> = {
+      email: options.email,
+      email_contains: options.emailContains,
+      email_domain: options.emailDomain,
+      phone: options.phone,
+      phone_contains: options.phoneContains,
+    };
+    const nonNil = Object.entries(supplied).filter(([, v]) => v !== undefined);
+    if (nonNil.length !== 1) {
+      throw new Error(
+        "lookup() requires exactly one of: email, emailContains, emailDomain, phone, phoneContains.",
+      );
+    }
+    const params = Object.fromEntries(nonNil);
+    const data = await this.http.get<{ items: RawContact[] } | RawContact[]>(
+      `${BASE}/lookup`,
+      params,
+    );
+    const items = Array.isArray(data) ? data : data.items;
+    return items.map(parseContact);
+  }
+
+  async get(contactId: string): Promise<Contact> {
+    const data = await this.http.get<RawContact>(`${BASE}/${contactId}`);
+    return parseContact(data);
+  }
+
+  async create(options: CreateContactWithAddressPermissionsOptions): Promise<Contact>;
+  async create(options?: CreateContactOptions): Promise<Contact>;
+  async create(options: CreateContactOptions | CreateContactWithAddressPermissionsOptions = {}): Promise<Contact> {
+    const body: Record<string, unknown> = {};
+    if (options.preferredName !== undefined) body.preferred_name = options.preferredName;
+    if (options.namePrefix !== undefined) body.name_prefix = options.namePrefix;
+    if (options.givenName !== undefined) body.given_name = options.givenName;
+    if (options.middleName !== undefined) body.middle_name = options.middleName;
+    if (options.familyName !== undefined) body.family_name = options.familyName;
+    if (options.nameSuffix !== undefined) body.name_suffix = options.nameSuffix;
+    if (options.companyName !== undefined) body.company_name = options.companyName;
+    if (options.jobTitle !== undefined) body.job_title = options.jobTitle;
+    if (options.birthday !== undefined) body.birthday = options.birthday;
+    if (options.notes !== undefined) body.notes = options.notes;
+    if (options.emails !== undefined) body.emails = options.emails.map(contactEmailToWire);
+    if (options.phones !== undefined) body.phones = options.phones.map(contactPhoneToWire);
+    if (options.websites !== undefined) body.websites = options.websites.map(contactWebsiteToWire);
+    if (options.dates !== undefined) body.dates = options.dates.map(contactDateToWire);
+    if (options.addresses !== undefined) body.addresses = options.addresses.map(contactAddressToWire);
+    if (options.customFields !== undefined) body.custom_fields = options.customFields.map(contactCustomFieldToWire);
+    if (options.permissions !== undefined) {
+      const { identityId, ...permissions } = options.permissions;
+      const usesMaps = [permissions.emails, permissions.phones, permissions.inboundEmails,
+        permissions.outboundEmails, permissions.inboundPhones, permissions.outboundPhones].some((value) => value !== undefined);
+      const usesGroups = permissions.email !== undefined || permissions.phone !== undefined;
+      if (usesMaps && usesGroups) throw new Error("Use boolean address maps or group access objects, not both");
+      if (permissions.addresses !== undefined) {
+        if (usesMaps || usesGroups) throw new Error("Address decisions cannot be combined with permission maps or groups");
+        if (!Array.isArray(permissions.addresses) || permissions.addresses.length > 200) {
+          throw new TypeError("Initial address decisions must be an array of at most 200 entries");
+        }
+        if (permissions.profile === "block" && (permissions.memories === "allow" || permissions.addresses.some((row) => row.action === "allow"))) {
+          throw new Error("Profile cannot be blocked while email, phone, or memories is allowed");
+        }
+        body.permissions = { ...permissions, identity_id: identityId };
+      } else {
+        body.permissions = { ...(usesGroups ? contactAccessToWire(permissions) : contactPermissionsToWire(permissions)), identity_id: identityId };
+      }
+    }
+    const data = await this.http.post<RawContact>(options.permissions !== undefined ? `${BASE}/with-permissions` : BASE, body);
+    return parseContact(data);
+  }
+
+  async update(contactId: string, options: UpdateContactOptions): Promise<Contact> {
+    const body: Record<string, unknown> = {};
+    for (const [key, wire] of [
+      ["preferredName", "preferred_name"],
+      ["namePrefix", "name_prefix"],
+      ["givenName", "given_name"],
+      ["middleName", "middle_name"],
+      ["familyName", "family_name"],
+      ["nameSuffix", "name_suffix"],
+      ["companyName", "company_name"],
+      ["jobTitle", "job_title"],
+      ["birthday", "birthday"],
+      ["notes", "notes"],
+      ["reviewStatus", "review_status"],
+    ] as const) {
+      if (key in options) body[wire] = (options as Record<string, unknown>)[key];
+    }
+    if ("emails" in options) {
+      body.emails = options.emails === null ? null : options.emails!.map(contactEmailToWire);
+    }
+    if ("phones" in options) {
+      body.phones = options.phones === null ? null : options.phones!.map(contactPhoneToWire);
+    }
+    if ("websites" in options) {
+      body.websites = options.websites === null ? null : options.websites!.map(contactWebsiteToWire);
+    }
+    if ("dates" in options) {
+      body.dates = options.dates === null ? null : options.dates!.map(contactDateToWire);
+    }
+    if ("addresses" in options) {
+      body.addresses = options.addresses === null ? null : options.addresses!.map(contactAddressToWire);
+    }
+    if ("customFields" in options) {
+      body.custom_fields =
+        options.customFields === null ? null : options.customFields!.map(contactCustomFieldToWire);
+    }
+    const data = await this.http.patch<RawContact>(`${BASE}/${contactId}`, body);
+    return parseContact(data);
+  }
+
+  /**
+   * Merge contacts using an admin-scoped API key.
+   *
+   * The merge is rejected atomically when a memory kind or the contact-wide
+   * total would go over. Delete a fact from each kind named by the error, or
+   * any active fact when it names `total`, then retry.
+   */
+  async merge(contactId: string, options: MergeContactsOptions): Promise<Contact> {
+    const fieldSources = Object.fromEntries(
+      Object.entries(options.fieldSources ?? {}).map(([key, value]) => [
+        {
+          preferredName: "preferred_name",
+          namePrefix: "name_prefix",
+          givenName: "given_name",
+          middleName: "middle_name",
+          familyName: "family_name",
+          nameSuffix: "name_suffix",
+          companyName: "company_name",
+          jobTitle: "job_title",
+          birthday: "birthday",
+          notes: "notes",
+        }[key as ContactMergeField],
+        value,
+      ]),
+    );
+    const data = await this.http.post<RawContact>(`${BASE}/${contactId}/merge`, {
+      losing_contact_ids: options.losingContactIds,
+      field_sources: fieldSources,
+    });
+    return parseContact(data);
+  }
+
+  async delete(contactId: string): Promise<void> {
+    await this.http.delete(`${BASE}/${contactId}`);
+  }
+
+  async bulkDelete(contactIds: string[]): Promise<ContactBulkDeleteResult> {
+    const data = await this.http.post<RawContactBulkDeleteResult>(`${BASE}/bulk-delete`, {
+      contact_ids: contactIds,
+    });
+    return parseContactBulkDeleteResult(data);
+  }
+}

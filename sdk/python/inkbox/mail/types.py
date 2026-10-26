@@ -1,0 +1,735 @@
+"""
+inkbox/mail/types.py
+
+Dataclasses mirroring the Inkbox Mail API response models.
+"""
+
+from __future__ import annotations
+from inkbox.contact_rules import ContactRuleDirection
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
+from typing import Any
+from uuid import UUID
+from inkbox.contacts.types import Contact
+
+
+class MessageDirection(StrEnum):
+    """
+    Whether a message was received by or sent from a mailbox.
+
+    Attributes:
+        INBOUND: Email received from an external sender.
+        OUTBOUND: Email sent by the mailbox.
+    """
+
+    INBOUND = "inbound"
+    OUTBOUND = "outbound"
+
+
+class ForwardMode(StrEnum):
+    """
+    Strategy for embedding the original message in a forward.
+
+    Attributes:
+        INLINE: Render the original body inline below a Gmail-style preamble.
+            May not perfectly preserve inline images or complex layouts.
+        WRAPPED: Attach the original raw MIME as a single ``message/rfc822``
+            part — semantically preserved.
+    """
+
+    INLINE = "inline"
+    WRAPPED = "wrapped"
+
+
+class DraftSendState(StrEnum):
+    """Current send state of an email draft."""
+
+    DRAFT = "draft"
+    SENDING = "sending"
+    UNCERTAIN = "uncertain"
+
+
+class FilterMode(StrEnum):
+    """
+    Contact-rule filter mode on a mailbox or phone number.
+
+    Attributes:
+        WHITELIST: Only contacts matching an ``allow`` rule are delivered;
+            everything else is blocked.
+        BLACKLIST: Everything is delivered except contacts matching a
+            ``block`` rule. This is the default.
+    """
+
+    WHITELIST = "whitelist"
+    BLACKLIST = "blacklist"
+
+
+class ThreadFolder(StrEnum):
+    """
+    Logical folder a thread lives in.
+
+    ``BLOCKED`` is server-assigned; clients cannot move a thread into
+    ``BLOCKED``.
+    """
+
+    INBOX = "inbox"
+    SPAM = "spam"
+    BLOCKED = "blocked"
+    ARCHIVE = "archive"
+
+
+class MailRuleAction(StrEnum):
+    """Whether a matching address is allowed through or blocked."""
+
+    ALLOW = "allow"
+    BLOCK = "block"
+
+
+class MailRuleMatchType(StrEnum):
+    """What a mail contact rule matches on."""
+
+    EXACT_EMAIL = "exact_email"
+    DOMAIN = "domain"
+
+
+class ContactRuleStatus(StrEnum):
+    """Whether a contact rule is currently enforced."""
+
+    ACTIVE = "active"
+    PAUSED = "paused"
+
+
+class SendingDomainStatus(StrEnum):
+    """Lifecycle status of a custom sending domain.
+
+    Only ``VERIFIED`` rows are usable for sending; the remaining states
+    are transitional (``NOT_STARTED``, ``AWAITING_OWNERSHIP``, ``PENDING``,
+    ``VERIFYING``), recoverable error states (``DNS_INVALID``, ``DEGRADED``),
+    in-flight admin operations (``PENDING_DKIM_ROTATION``, ``PENDING_DELETION``),
+    or terminal (``FAILED``).
+    """
+
+    NOT_STARTED = "not_started"
+    AWAITING_OWNERSHIP = "awaiting_ownership"
+    PENDING = "pending"
+    DNS_INVALID = "dns_invalid"
+    VERIFYING = "verifying"
+    VERIFIED = "verified"
+    FAILED = "failed"
+    PENDING_DKIM_ROTATION = "pending_dkim_rotation"
+    DEGRADED = "degraded"
+    PENDING_DELETION = "pending_deletion"
+
+
+class MailImportFormat(StrEnum):
+    AUTO = "auto"
+    MBOX = "mbox"
+    EML = "eml"
+    ZIP = "zip"
+
+
+class MailImportJobStatus(StrEnum):
+    PENDING_UPLOAD = "pending_upload"
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class FilterModeChangeNotice:
+    """Summary returned on PATCH when ``filter_mode`` actually changed.
+
+    Reports how many existing active rules are now redundant under the
+    new mode so the caller can prompt for cleanup. The blacklist <-> whitelist
+    flip does not touch the contact-rules table — redundant rules still
+    evaluate correctly, they just match the new default verdict.
+
+    Attributes:
+        new_filter_mode: The mode the resource was just flipped to.
+        redundant_rule_action: The action whose rules are now redundant —
+            ``"block"`` under whitelist, ``"allow"`` under blacklist. Typed as
+            a free-form string to tolerate new server values; match against
+            :class:`MailRuleAction` / :class:`PhoneRuleAction` values.
+        redundant_rule_count: Count of active rules whose action equals
+            ``redundant_rule_action``. ``0`` is a clean flip. Paused and
+            deleted rules are not counted.
+    """
+
+    new_filter_mode: FilterMode
+    redundant_rule_action: str
+    redundant_rule_count: int
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> FilterModeChangeNotice:
+        return cls(
+            new_filter_mode=FilterMode(d["new_filter_mode"]),
+            redundant_rule_action=str(d["redundant_rule_action"]),
+            redundant_rule_count=int(d["redundant_rule_count"]),
+        )
+
+
+def _dt(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
+@dataclass
+class Mailbox:
+    """An Inkbox mailbox (an email address owned by your organisation).
+
+    ``agent_identity_id`` is the UUID of the owning agent identity, or
+    ``None`` if the mailbox is standalone (not tied to any agent).
+    Always populated on every mailbox response.
+
+    ``sending_domain`` is the bare domain the mailbox sends from, derived
+    from ``email_address``. Either the platform default or a verified
+    custom domain registered to your org.
+
+    **Storage.** ``storage_used_bytes`` is what the mailbox currently holds;
+    ``storage_limit_bytes`` is the plan's cap (binary — 2 GiB is
+    ``2 * 1024 ** 3``), or ``None`` when the server didn't resolve it. Sends
+    over the cap are rejected with
+    :class:`inkbox.StorageLimitExceededError`; deleting messages or threads
+    frees space immediately.
+
+    **Webhooks.** To deliver ``message.*`` events to an HTTPS endpoint,
+    create a row on the channel-agnostic subscription resource:
+    ``inkbox.webhooks.subscriptions.create(mailbox_id=..., url=..., event_types=[...])``.
+    Up to 20 active subscriptions per mailbox.
+
+    See Also:
+        :class:`inkbox.WebhookSubscriptionsResource` on
+        ``inkbox.webhooks.subscriptions``.
+    """
+
+    id: UUID
+    email_address: str
+    filter_mode: FilterMode
+    created_at: datetime
+    updated_at: datetime
+    sending_domain: str = ""
+    agent_identity_id: UUID | None = None
+    filter_mode_change_notice: FilterModeChangeNotice | None = None
+    # Both absent on servers predating storage caps -> 0 / None.
+    storage_used_bytes: int = 0
+    storage_limit_bytes: int | None = None
+
+    signature_html: str | None = None
+    signature_text: str | None = None
+    signature_enabled: bool = False
+    inbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+    outbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        self.inbound_filter_mode = FilterMode(self.inbound_filter_mode or self.filter_mode)
+        self.outbound_filter_mode = FilterMode(self.outbound_filter_mode or self.filter_mode)
+        if self.inbound_filter_mode == self.outbound_filter_mode:
+            self.filter_mode = self.inbound_filter_mode
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> Mailbox:
+        notice = d.get("filter_mode_change_notice")
+        agent_identity_id = d.get("agent_identity_id")
+        sending_domain = d.get("sending_domain")
+        if not sending_domain:
+            email_address = d["email_address"]
+            _, _, sending_domain = email_address.partition("@")
+        storage_limit = d.get("storage_limit_bytes")
+
+        return cls(
+            inbound_filter_mode=d.get("inbound_filter_mode"),
+            outbound_filter_mode=d.get("outbound_filter_mode"),
+            signature_html=d.get("signature_html"),
+            signature_text=d.get("signature_text"),
+            signature_enabled=d.get("signature_enabled", False),
+            id=UUID(d["id"]),
+            email_address=d["email_address"],
+            sending_domain=sending_domain,
+            filter_mode=FilterMode(d.get("filter_mode", "blacklist")),
+            created_at=datetime.fromisoformat(d["created_at"]),
+            updated_at=datetime.fromisoformat(d["updated_at"]),
+            agent_identity_id=(UUID(agent_identity_id) if agent_identity_id else None),
+            filter_mode_change_notice=(
+                FilterModeChangeNotice._from_dict(notice) if notice else None
+            ),
+            storage_used_bytes=d.get("storage_used_bytes") or 0,
+            storage_limit_bytes=(
+                int(storage_limit) if storage_limit is not None else None
+            ),
+        )
+
+
+@dataclass
+class Domain:
+    """A custom sending domain registered to your organisation.
+
+    Returned by :meth:`Inkbox.domains.list`. Only ``VERIFIED`` rows
+    are usable for sending mail.
+
+    Attributes:
+        id: Sending-domain row id (e.g. ``"sending_domain_<uuid>"``).
+        domain: Bare registered domain (e.g. ``"mail.acme.com"``).
+        status: Current lifecycle status.
+        is_default: True if this is the org's default sending domain.
+        verified_at: First time this domain reached ``VERIFIED``, or
+            ``None`` if never verified.
+    """
+
+    id: str
+    domain: str
+    status: SendingDomainStatus
+    is_default: bool
+    verified_at: datetime | None
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> Domain:
+        verified_at = d.get("verified_at")
+        return cls(
+            id=d["id"],
+            domain=d["domain"],
+            status=SendingDomainStatus(d["status"]),
+            is_default=bool(d["is_default"]),
+            verified_at=datetime.fromisoformat(verified_at) if verified_at else None,
+        )
+
+
+@dataclass
+class Message:
+    """
+    Email message metadata.
+
+    Body content is excluded from list responses.
+    Call ``client.messages.get()`` to retrieve the full message with body.
+    """
+
+    id: UUID
+    mailbox_id: UUID
+    thread_id: UUID | None
+    message_id: str
+    from_address: str
+    to_addresses: list[str]
+    cc_addresses: list[str] | None
+    subject: str | None
+    snippet: str | None
+    direction: MessageDirection
+    status: str
+    is_read: bool
+    is_starred: bool
+    has_attachments: bool
+    created_at: datetime
+    # Open tracking (outbound sends with track_opens). ``first_opened_at`` is
+    # the reliable "was it ever opened" signal; ``open_count`` is approximate
+    # — proxy prefetch (Apple MPP, Gmail) inflates it while the per-window
+    # debounce collapses repeats, so it can read above OR below the true
+    # count. Both absent/None on old servers and untracked sends.
+    first_opened_at: datetime | None = None
+    open_count: int = 0
+    import_job_id: UUID | None = None
+    from_display_name: str | None = None
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> Message:
+        return cls(
+            id=UUID(d["id"]),
+            mailbox_id=UUID(d["mailbox_id"]),
+            thread_id=UUID(d["thread_id"]) if d.get("thread_id") else None,
+            message_id=d["message_id"],
+            from_address=d["from_address"],
+            from_display_name=d.get("from_display_name"),
+            to_addresses=d["to_addresses"],
+            cc_addresses=d.get("cc_addresses"),
+            subject=d.get("subject"),
+            snippet=d.get("snippet"),
+            direction=MessageDirection(d["direction"]),
+            status=d["status"],
+            is_read=d["is_read"],
+            is_starred=d["is_starred"],
+            has_attachments=d["has_attachments"],
+            created_at=datetime.fromisoformat(d["created_at"]),
+            first_opened_at=_dt(d.get("first_opened_at")),
+            open_count=d.get("open_count") or 0,
+            import_job_id=UUID(d["import_job_id"]) if d.get("import_job_id") else None,
+        )
+
+
+@dataclass
+class DraftRecipients:
+    """Optional recipient groups for an email draft."""
+
+    to: list[str] | None = None
+    cc: list[str] | None = None
+    bcc: list[str] | None = None
+
+    def to_wire(self) -> dict[str, list[str] | None]:
+        """Return recipient groups matching the draft API schema."""
+        return {"to": self.to, "cc": self.cc, "bcc": self.bcc}
+
+
+@dataclass
+class DraftAttachment:
+    """Attachment metadata for the current draft generation."""
+
+    part_index: int
+    filename: str
+    content_type: str
+    size: int
+    content_id: str | None = None
+    is_inline: bool = False
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> DraftAttachment:
+        return cls(
+            part_index=int(d["part_index"]),
+            filename=d["filename"],
+            content_type=d["content_type"],
+            size=int(d["size"]),
+            content_id=d.get("content_id"),
+            is_inline=bool(d.get("is_inline", False)),
+        )
+
+
+@dataclass
+class DraftSummary:
+    """Email draft metadata returned by list operations."""
+
+    id: UUID
+    mailbox_id: UUID
+    from_address: str
+    to_addresses: list[str]
+    cc_addresses: list[str]
+    bcc_addresses: list[str]
+    subject: str | None
+    snippet: str | None
+    has_attachments: bool
+    attachment_count: int
+    generation: int
+    send_state: DraftSendState
+    track_opens: bool
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> DraftSummary:
+        return cls(
+            id=UUID(d["id"]),
+            mailbox_id=UUID(d["mailbox_id"]),
+            from_address=d["from_address"],
+            to_addresses=d.get("to_addresses") or [],
+            cc_addresses=d.get("cc_addresses") or [],
+            bcc_addresses=d.get("bcc_addresses") or [],
+            subject=d.get("subject"),
+            snippet=d.get("snippet"),
+            has_attachments=bool(d.get("has_attachments", False)),
+            attachment_count=int(d.get("attachment_count", 0)),
+            generation=int(d["generation"]),
+            send_state=DraftSendState(d["send_state"]),
+            track_opens=bool(d.get("track_opens", False)),
+            created_at=datetime.fromisoformat(d["created_at"]),
+            updated_at=datetime.fromisoformat(d["updated_at"]),
+        )
+
+
+@dataclass
+class DraftDetail(DraftSummary):
+    """Complete parsed representation of an email draft."""
+
+    body_text: str | None = None
+    body_html: str | None = None
+    reply_to: str | None = None
+    thread_id: UUID | None = None
+    message_id: str | None = None
+    in_reply_to: str | None = None
+    references: list[str] = field(default_factory=list)
+    forward_source_message_id: UUID | None = None
+    forward_note_text: str | None = None
+    forward_note_html: str | None = None
+    attachment_metadata: list[DraftAttachment] = field(default_factory=list)
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> DraftDetail:  # type: ignore[override]
+        base = DraftSummary._from_dict(d)
+        return cls(
+            **base.__dict__,
+            body_text=d.get("body_text"),
+            body_html=d.get("body_html"),
+            reply_to=d.get("reply_to"),
+            thread_id=UUID(d["thread_id"]) if d.get("thread_id") else None,
+            message_id=d.get("message_id"),
+            in_reply_to=d.get("in_reply_to"),
+            references=d.get("references") or [],
+            forward_source_message_id=(
+                UUID(d["forward_source_message_id"])
+                if d.get("forward_source_message_id")
+                else None
+            ),
+            forward_note_text=d.get("forward_note_text"),
+            forward_note_html=d.get("forward_note_html"),
+            attachment_metadata=[
+                DraftAttachment._from_dict(item)
+                for item in d.get("attachment_metadata") or []
+            ],
+        )
+
+
+@dataclass
+class DraftAttachmentContent:
+    """Downloaded draft attachment content and response metadata."""
+
+    content: bytes
+    filename: str
+    content_type: str
+
+
+@dataclass
+class MailImportUploadTarget:
+    url: str
+    fields: dict[str, str]
+    expires_in_seconds: int
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> MailImportUploadTarget:
+        return cls(
+            url=d["url"],
+            fields=dict(d["fields"]),
+            expires_in_seconds=int(d["expires_in_seconds"]),
+        )
+
+
+@dataclass
+class MailImportJob:
+    id: UUID
+    mailbox_id: UUID
+    status: MailImportJobStatus
+    source_format: MailImportFormat
+    original_addresses: list[str] | None
+    mark_as_read: bool
+    upload_size_bytes: int | None
+    messages_processed: int
+    messages_imported: int
+    messages_skipped_duplicate: int
+    messages_failed: int
+    messages_rejected_unsafe: int
+    error_detail: str | None
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in {
+            MailImportJobStatus.COMPLETED,
+            MailImportJobStatus.FAILED,
+            MailImportJobStatus.CANCELLED,
+        }
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> MailImportJob:
+        return cls(
+            id=UUID(d["id"]),
+            mailbox_id=UUID(d["mailbox_id"]),
+            status=MailImportJobStatus(d["status"]),
+            source_format=MailImportFormat(d["source_format"]),
+            original_addresses=d.get("original_addresses"),
+            mark_as_read=bool(d["mark_as_read"]),
+            upload_size_bytes=d.get("upload_size_bytes"),
+            messages_processed=int(d.get("messages_processed", 0)),
+            messages_imported=int(d.get("messages_imported", 0)),
+            messages_skipped_duplicate=int(d.get("messages_skipped_duplicate", 0)),
+            messages_failed=int(d.get("messages_failed", 0)),
+            messages_rejected_unsafe=int(d.get("messages_rejected_unsafe", 0)),
+            error_detail=d.get("error_detail"),
+            created_at=datetime.fromisoformat(d["created_at"]),
+            updated_at=datetime.fromisoformat(d.get("updated_at", d["created_at"])),
+            started_at=_dt(d.get("started_at")),
+            finished_at=_dt(d.get("finished_at")),
+        )
+
+
+@dataclass
+class MailImportCreateResult:
+    job: MailImportJob
+    upload: MailImportUploadTarget
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> MailImportCreateResult:
+        return cls(
+            job=MailImportJob._from_dict(d["job"]),
+            upload=MailImportUploadTarget._from_dict(d["upload"]),
+        )
+
+
+@dataclass
+class MailImportJobPage:
+    items: list[MailImportJob]
+    next_cursor: str | None
+    has_more: bool
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> MailImportJobPage:
+        return cls(
+            items=[MailImportJob._from_dict(item) for item in d.get("items", [])],
+            next_cursor=d.get("next_cursor"),
+            has_more=bool(d.get("has_more", False)),
+        )
+
+
+@dataclass
+class ReplyAllRecipients:
+    """Server-suggested To/Cc for a reply-all (sending mailbox and BCC excluded)."""
+
+    to: list[str]
+    cc: list[str]
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> ReplyAllRecipients:
+        return cls(to=d.get("to") or [], cc=d.get("cc") or [])
+
+
+@dataclass
+class MessageDetail(Message):
+    """Full message including body content."""
+
+    body_text: str | None = None
+    body_html: str | None = None
+    bcc_addresses: list[str] | None = None
+    in_reply_to: str | None = None
+    references: list[str] | None = None
+    attachment_metadata: list[dict[str, Any]] | None = None
+    ses_message_id: str | None = None
+    updated_at: datetime | None = None  # type: ignore[assignment]
+    reply_all_recipients: ReplyAllRecipients | None = None
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> MessageDetail:  # type: ignore[override]
+        base = Message._from_dict(d)
+        reply_all = d.get("reply_all_recipients")
+        return cls(
+            **base.__dict__,
+            body_text=d.get("body_text"),
+            body_html=d.get("body_html"),
+            bcc_addresses=d.get("bcc_addresses"),
+            in_reply_to=d.get("in_reply_to"),
+            references=d.get("references"),
+            attachment_metadata=d.get("attachment_metadata"),
+            ses_message_id=d.get("ses_message_id"),
+            updated_at=_dt(d.get("updated_at")),
+            reply_all_recipients=(
+                ReplyAllRecipients._from_dict(reply_all) if reply_all else None
+            ),
+        )
+
+
+@dataclass
+class Thread:
+    """A conversation thread grouping related messages."""
+
+    id: UUID
+    mailbox_id: UUID
+    subject: str | None
+    folder: ThreadFolder
+    message_count: int
+    last_message_at: datetime
+    created_at: datetime
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> Thread:
+        return cls(
+            id=UUID(d["id"]),
+            mailbox_id=UUID(d["mailbox_id"]),
+            subject=d.get("subject"),
+            folder=ThreadFolder(d.get("folder", "inbox")),
+            message_count=d["message_count"],
+            last_message_at=datetime.fromisoformat(d["last_message_at"]),
+            created_at=datetime.fromisoformat(d["created_at"]),
+        )
+
+
+@dataclass
+class ThreadDetail(Thread):
+    """Thread with all messages inlined, ordered oldest-first."""
+
+    messages: list[Message] = field(default_factory=list)
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> ThreadDetail:  # type: ignore[override]
+        base = Thread._from_dict(d)
+        return cls(
+            **base.__dict__,
+            messages=[Message._from_dict(m) for m in d.get("messages", [])],
+        )
+
+
+@dataclass
+class MailContactRule:
+    """An inbound/outbound allow/block rule scoped to a mailbox.
+
+    Returned by the **legacy** per-mailbox routes
+    (``inkbox.mail_contact_rules``). The forward-looking, identity-keyed
+    shape is :class:`MailIdentityContactRule`.
+    """
+
+    id: UUID
+    mailbox_id: UUID
+    action: MailRuleAction
+    match_type: MailRuleMatchType
+    match_target: str
+    status: ContactRuleStatus
+    created_at: datetime
+    updated_at: datetime
+    direction: ContactRuleDirection = ContactRuleDirection.BOTH
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> MailContactRule:
+        return cls(
+            direction=ContactRuleDirection(d.get("direction", "both")),
+            id=UUID(d["id"]),
+            mailbox_id=UUID(d["mailbox_id"]),
+            action=MailRuleAction(d["action"]),
+            match_type=MailRuleMatchType(d["match_type"]),
+            match_target=d["match_target"],
+            status=ContactRuleStatus(d.get("status", "active")),
+            created_at=datetime.fromisoformat(d["created_at"]),
+            updated_at=datetime.fromisoformat(d["updated_at"]),
+        )
+
+
+@dataclass
+class MailIdentityContactRule:
+    """A mail allow/block rule scoped to an **agent identity**.
+
+    Returned by the identity-keyed routes
+    (``inkbox.mail_identity_contact_rules`` /
+    ``identity.list_mail_contact_rules()``). Same shape as
+    :class:`MailContactRule` but keyed by ``agent_identity_id`` instead
+    of ``mailbox_id``.
+    """
+
+    id: UUID
+    agent_identity_id: UUID
+    action: MailRuleAction
+    match_type: MailRuleMatchType
+    match_target: str
+    status: ContactRuleStatus
+    created_at: datetime
+    updated_at: datetime
+    contact: Contact | None = None
+    direction: ContactRuleDirection = ContactRuleDirection.BOTH
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> MailIdentityContactRule:
+        return cls(
+            direction=ContactRuleDirection(d.get("direction", "both")),
+            contact=Contact._from_dict(d["contact"]) if d.get("contact") is not None else None,
+            id=UUID(d["id"]),
+            agent_identity_id=UUID(d["agent_identity_id"]),
+            action=MailRuleAction(d["action"]),
+            match_type=MailRuleMatchType(d["match_type"]),
+            match_target=d["match_target"],
+            status=ContactRuleStatus(d.get("status", "active")),
+            created_at=datetime.fromisoformat(d["created_at"]),
+            updated_at=datetime.fromisoformat(d["updated_at"]),
+        )

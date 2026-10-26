@@ -1,0 +1,3126 @@
+//! [`AgentIdentity`]: a domain object representing one agent identity.
+//!
+//! Returned by `Inkbox::create_identity()` / `Inkbox::get_identity()`. The
+//! convenience methods (`send_email`, `place_call`, `send_text`, ...) are
+//! scoped to this agent's assigned channels so callers never need to pass an
+//! email address or phone number ID explicitly.
+//!
+//! Faithful port of `inkbox/agent_identity.py`. The Python object holds a
+//! back-reference to the `Inkbox` client and delegates each convenience method
+//! to the matching org-level resource, scoped to this identity's channels. In
+//! Rust the back-reference is an [`Arc<crate::client::Inkbox>`] and the
+//! delegation targets the client's resource accessors.
+//!
+//! ## Assumed `crate::client::Inkbox` accessors
+//!
+//! The `client` module is wired up by the orchestrator. This file assumes the
+//! following accessors exist (names follow the Python `@property` names, or the
+//! snake_case private attr where no public property exists):
+//!
+//! * `messages() -> &MessagesResource`
+//! * `threads() -> &ThreadsResource`
+//! * `calls() -> &CallsResource`  (transcripts folded in as `calls().transcripts(..)`)
+//! * `texts() -> &TextsResource`
+//! * `imessages() -> &IMessagesResource`
+//! * `phone_numbers() -> &PhoneNumbersResource`  (Python property `phone_numbers`, attr `_numbers`)
+//! * `identities() -> &IdentitiesResource`       (no Python property; attr `_ids_resource`)
+//! * `credentials() -> Credentials` + `get_secret(..)` (per-identity vault access)
+//!
+//! Interior mutability uses `RefCell` so the convenience methods can take
+//! `&self` while still refreshing the cached channels (`_data`, `_phone_number`)
+//! exactly as the Python mutates instance attributes.
+
+use std::cell::RefCell;
+use std::sync::Arc;
+
+use uuid::Uuid;
+
+use crate::a2a::{
+    A2AContext, A2AContextListOptions, A2AContextPage, A2AHistoryMessagePage,
+    A2AMessageListOptions, A2ASentTaskListOptions, A2ATask, A2ATaskListOptions, A2ATaskPage,
+};
+use crate::client::Inkbox;
+use crate::credentials::Credentials;
+use crate::error::{InkboxError, Result};
+use crate::filters::DateRangeFilter;
+use crate::identities::types::{AgentIdentityData, IdentityMailbox, IdentityPhoneNumber, Unset};
+use crate::imessage::types::{
+    IMessage, IMessageAssignment, IMessageConversation, IMessageConversationSummary,
+    IMessageMarkReadResult, IMessageMediaUpload, IMessageReaction, IMessageReactionType,
+    IMessageSendStyle, IMessageThread, IMessageThreadListOptions, IdentityIMessageNumber,
+    ThreadedIMessage,
+};
+use crate::mail::types::{
+    DraftDetail, DraftSummary, FilterMode, ForwardMode, MailIdentityContactRule, MailRuleAction,
+    MailRuleMatchType, Message, MessageDetail, MessageDirection, ThreadDetail,
+};
+use crate::mail::{CreateDraftOptions, UpdateDraftOptions};
+use crate::phone::resources::texts::TextRecipients;
+use crate::phone::types::{
+    CallOrigin, CallPlacementOptions, HostedAgentAuthorityMode, HostedAgentConfig,
+    HostedAgentToolInvocationPage, HostedCallPlacementOptions, IncomingCallAction,
+    IncomingCallActionConfig, PhoneCall, PhoneCallWithRateLimit, PhoneIdentityContactRule,
+    PhoneRuleAction, PhoneRuleMatchType, PhoneTranscript, TextConversationSummary,
+    TextConversationUpdateResult, TextMessage,
+};
+use crate::signing_keys::{SigningKey, SigningKeyStatus};
+use crate::tunnels::types::TunnelSummary;
+use crate::vault::resources::vault::UnlockedVault;
+use crate::vault::totp::{TOTPCode, TOTPConfig};
+use crate::vault::types::{DecryptedVaultSecret, SecretPayload, VaultSecret};
+
+/// An agent identity with convenience methods for its assigned channels.
+///
+/// Obtain an instance via `inkbox.create_identity("support-bot")` or
+/// `inkbox.get_identity("support-bot")`. If the identity has a mailbox you can
+/// communicate directly:
+///
+/// ```ignore
+/// identity.send_email(&["user@example.com".into()], "Hi", Some("Hello"), None, None, None, None, None, false)?;
+/// for msg in identity.iter_emails(None, None)? { println!("{:?}", msg.subject); }
+/// ```
+pub struct AgentIdentity {
+    /// Latest identity payload (handle, display name, channels). Mutated on
+    /// `update` / `refresh`, mirroring the Python `self._data`.
+    data: RefCell<AgentIdentityData>,
+    /// Back-reference to the owning client.
+    inkbox: Arc<Inkbox>,
+    /// Cached mailbox channel.
+    mailbox: RefCell<Option<IdentityMailbox>>,
+    /// Cached phone-number channel, cleared on release and refreshed on provision.
+    phone_number: RefCell<Option<IdentityPhoneNumber>>,
+    /// Cached tunnel channel.
+    tunnel: RefCell<Option<TunnelSummary>>,
+}
+
+macro_rules! directional_identity_rules {
+    ($resource:ident, $list:ident, $get:ident, $create:ident, $update:ident, $rule:ty, $action:ty, $match:ty) => {
+        impl AgentIdentity {
+            pub fn $list(
+                &self,
+                options: &crate::ContactRuleListOptions<$action, $match>,
+            ) -> Result<Vec<crate::DirectionalContactRule<$rule>>> {
+                self.inkbox
+                    .$resource()
+                    .list_with_options(&self.agent_handle(), options)
+            }
+            pub fn $get(&self, rule_id: &str) -> Result<crate::DirectionalContactRule<$rule>> {
+                self.inkbox
+                    .$resource()
+                    .get_with_options(&self.agent_handle(), rule_id)
+            }
+            pub fn $create(
+                &self,
+                options: &crate::ContactRuleCreateOptions<$action, $match>,
+            ) -> Result<crate::DirectionalContactRule<$rule>> {
+                self.inkbox
+                    .$resource()
+                    .create_with_options(&self.agent_handle(), options)
+            }
+            pub fn $update(
+                &self,
+                rule_id: &str,
+                options: &crate::ContactRuleUpdateOptions<$action>,
+            ) -> Result<crate::DirectionalContactRule<$rule>> {
+                self.inkbox
+                    .$resource()
+                    .update_with_options(&self.agent_handle(), rule_id, options)
+            }
+        }
+    };
+}
+
+directional_identity_rules!(
+    mail_identity_contact_rules,
+    list_mail_contact_rules_with_options,
+    get_mail_contact_rule_with_options,
+    create_mail_contact_rule_with_options,
+    update_mail_contact_rule_with_options,
+    MailIdentityContactRule,
+    MailRuleAction,
+    MailRuleMatchType
+);
+directional_identity_rules!(
+    phone_identity_contact_rules,
+    list_phone_contact_rules_with_options,
+    get_phone_contact_rule_with_options,
+    create_phone_contact_rule_with_options,
+    update_phone_contact_rule_with_options,
+    PhoneIdentityContactRule,
+    PhoneRuleAction,
+    PhoneRuleMatchType
+);
+directional_identity_rules!(
+    imessage_contact_rules,
+    list_imessage_contact_rules_with_options,
+    get_imessage_contact_rule_with_options,
+    create_imessage_contact_rule_with_options,
+    update_imessage_contact_rule_with_options,
+    crate::imessage::types::IMessageContactRule,
+    crate::imessage::types::IMessageRuleAction,
+    crate::imessage::types::IMessageRuleMatchType
+);
+
+impl AgentIdentity {
+    /// Fetch effective modes without projecting away directional differences.
+    pub fn get_with_options(&self) -> Result<crate::identities::DirectionalAgentIdentityData> {
+        self.inkbox
+            .identities()
+            .get_with_options(&self.agent_handle())
+    }
+
+    pub fn update_filter_modes(
+        &self,
+        options: &crate::identities::IdentityFilterModeOptions,
+    ) -> Result<crate::identities::DirectionalAgentIdentityData> {
+        let result = self
+            .inkbox
+            .identities()
+            .update_filter_modes(&self.agent_handle(), options)?;
+        let data = result.clone().into_legacy();
+        *self.mailbox.borrow_mut() = data.mailbox.clone();
+        *self.phone_number.borrow_mut() = data.phone_number.clone();
+        *self.tunnel.borrow_mut() = data.tunnel.clone();
+        *self.data.borrow_mut() = data;
+        Ok(result)
+    }
+
+    /// Run existing identity helpers through an isolated metadata scope.
+    pub fn with_response_metadata<T>(
+        &self,
+        operation: impl FnOnce(&AgentIdentity) -> Result<T>,
+    ) -> Result<crate::APIResponse<T>> {
+        self.inkbox.with_response_metadata(|client| {
+            let scoped = AgentIdentity::new(self.data.borrow().clone(), client.clone());
+            *scoped.mailbox.borrow_mut() = self.mailbox.borrow().clone();
+            *scoped.phone_number.borrow_mut() = self.phone_number.borrow().clone();
+            *scoped.tunnel.borrow_mut() = self.tunnel.borrow().clone();
+            operation(&scoped)
+        })
+    }
+    /// Build a facade from an identity-create / identity-get payload and the
+    /// owning client. Mirrors the Python `AgentIdentity.__init__`.
+    pub fn new(data: AgentIdentityData, inkbox: Arc<Inkbox>) -> Self {
+        let mailbox = data.mailbox.clone();
+        let phone_number = data.phone_number.clone();
+        let tunnel = data.tunnel.clone();
+        Self {
+            data: RefCell::new(data),
+            inkbox,
+            mailbox: RefCell::new(mailbox),
+            phone_number: RefCell::new(phone_number),
+            tunnel: RefCell::new(tunnel),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity properties
+    // -----------------------------------------------------------------------
+
+    /// This identity's agent handle.
+    pub fn agent_handle(&self) -> String {
+        self.data.borrow().summary.agent_handle.clone()
+    }
+
+    pub fn a2a_tasks(&self, options: &A2ATaskListOptions) -> Result<A2ATaskPage> {
+        self.inkbox.a2a().tasks(&self.agent_handle(), options)
+    }
+
+    pub fn a2a_sent_tasks(&self, options: &A2ASentTaskListOptions) -> Result<A2ATaskPage> {
+        self.inkbox.a2a().sent_tasks(&self.agent_handle(), options)
+    }
+
+    pub fn a2a_task(&self, task_id: Uuid) -> Result<A2ATask> {
+        self.inkbox.a2a().task(&self.agent_handle(), task_id)
+    }
+
+    pub fn a2a_sent_task(&self, task_id: Uuid) -> Result<A2ATask> {
+        self.inkbox.a2a().sent_task(&self.agent_handle(), task_id)
+    }
+
+    pub fn a2a_messages(&self, options: &A2AMessageListOptions) -> Result<A2AHistoryMessagePage> {
+        self.inkbox.a2a().messages(&self.agent_handle(), options)
+    }
+
+    pub fn a2a_contexts(&self, options: &A2AContextListOptions) -> Result<A2AContextPage> {
+        self.inkbox.a2a().contexts(&self.agent_handle(), options)
+    }
+
+    pub fn a2a_sent_contexts(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<A2AContextPage> {
+        self.inkbox
+            .a2a()
+            .sent_contexts(&self.agent_handle(), cursor, limit)
+    }
+
+    pub fn a2a_context(&self, context_id: Uuid) -> Result<A2AContext> {
+        self.inkbox.a2a().context(&self.agent_handle(), context_id)
+    }
+
+    /// Rename a context shared with this identity.
+    pub fn a2a_update_context(&self, context_id: Uuid, name: &str) -> Result<A2AContext> {
+        self.inkbox
+            .a2a()
+            .update_context(&self.agent_handle(), context_id, name)
+    }
+
+    pub fn a2a_sent_context(&self, context_id: Uuid) -> Result<A2AContext> {
+        self.inkbox
+            .a2a()
+            .sent_context(&self.agent_handle(), context_id)
+    }
+
+    /// This identity's UUID.
+    pub fn id(&self) -> Uuid {
+        self.data.borrow().summary.id
+    }
+
+    /// Human-readable display name. Defaults server-side to `agent_handle` if unset.
+    pub fn display_name(&self) -> Option<String> {
+        self.data.borrow().summary.display_name.clone()
+    }
+
+    /// Free-form org-internal description, or `None` if unset.
+    ///
+    /// Never surfaces in outbound mail / call audio / public payloads.
+    pub fn description(&self) -> Option<String> {
+        self.data.borrow().summary.description.clone()
+    }
+
+    /// The email address assigned to this identity at creation time.
+    ///
+    /// Always trust this value — do not derive it from `agent_handle`.
+    pub fn email_address(&self) -> Option<String> {
+        self.data.borrow().summary.email_address.clone()
+    }
+
+    /// Whether this identity can be reached over iMessage.
+    pub fn imessage_enabled(&self) -> bool {
+        self.data.borrow().summary.imessage_enabled
+    }
+
+    /// Whether an attached dedicated iMessage line automatically shares this profile.
+    pub fn contact_sharing_enabled(&self) -> bool {
+        self.data.borrow().summary.contact_sharing_enabled
+    }
+
+    /// Toggle automatic name and optional photo sharing for this identity's
+    /// attached dedicated iMessage line.
+    pub fn set_contact_sharing_enabled(&self, enabled: bool) -> Result<()> {
+        let data = self
+            .inkbox
+            .identities()
+            .set_contact_sharing_enabled(&self.agent_handle(), enabled)?;
+        *self.mailbox.borrow_mut() = data.mailbox.clone();
+        *self.phone_number.borrow_mut() = data.phone_number.clone();
+        *self.tunnel.borrow_mut() = data.tunnel.clone();
+        *self.data.borrow_mut() = data;
+        Ok(())
+    }
+
+    /// Whitelist/blacklist mode for this identity's iMessage contact rules.
+    pub fn imessage_filter_mode(&self) -> FilterMode {
+        self.data.borrow().summary.imessage_filter_mode
+    }
+
+    /// Whitelist/blacklist mode for this identity's mail contact rules.
+    pub fn mail_filter_mode(&self) -> FilterMode {
+        self.data.borrow().summary.mail_filter_mode
+    }
+
+    /// Whitelist/blacklist mode for this identity's phone contact rules.
+    pub fn phone_filter_mode(&self) -> FilterMode {
+        self.data.borrow().summary.phone_filter_mode
+    }
+
+    /// Mailbox linked to this identity, when included.
+    pub fn mailbox(&self) -> Option<IdentityMailbox> {
+        self.mailbox.borrow().clone()
+    }
+
+    /// Phone number linked to this identity, if one is assigned.
+    pub fn phone_number(&self) -> Option<IdentityPhoneNumber> {
+        self.phone_number.borrow().clone()
+    }
+
+    /// Dedicated iMessage line attached to this identity, if any.
+    pub fn imessage_number(&self) -> Option<IdentityIMessageNumber> {
+        self.data.borrow().imessage_number.clone()
+    }
+
+    /// Summary of this identity's tunnel. For connection state and certificate
+    /// material, fetch the full tunnel with `inkbox.tunnels().get(...)`.
+    pub fn tunnel(&self) -> Option<TunnelSummary> {
+        self.tunnel.borrow().clone()
+    }
+
+    // -----------------------------------------------------------------------
+    // Channel management
+    // -----------------------------------------------------------------------
+
+    /// Provision a new phone number and link it to this identity.
+    ///
+    /// # Arguments
+    /// * `r#type` - Number type to provision. Only `"local"` is supported.
+    /// * `state` - US state abbreviation (e.g. `"NY"`) to request a number in
+    ///   that state.
+    ///
+    /// # Returns
+    /// The newly provisioned and linked phone number.
+    pub fn provision_phone_number(
+        &self,
+        r#type: &str,
+        state: Option<&str>,
+    ) -> Result<IdentityPhoneNumber> {
+        // Provision at the org level scoped to this handle, then refetch to pick
+        // up the freshly-linked channel (mirrors the Python two-step).
+        self.inkbox
+            .phone_numbers()
+            .provision(&self.agent_handle(), r#type, state)?;
+        let data = self.inkbox.identities().get(&self.agent_handle())?;
+        let phone = data.phone_number.clone();
+        *self.phone_number.borrow_mut() = phone.clone();
+        *self.data.borrow_mut() = data;
+        phone.ok_or_else(|| {
+            InkboxError::InvalidArgument("phone number missing after provision".into())
+        })
+    }
+
+    /// Release this identity's phone number (vendor + local).
+    pub fn release_phone_number(&self) -> Result<()> {
+        self.require_phone()?;
+        self.inkbox
+            .identities()
+            .release_phone_number(&self.agent_handle())?;
+        *self.phone_number.borrow_mut() = None;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Mail helpers
+    // -----------------------------------------------------------------------
+
+    /// Send an email from this identity's mailbox.
+    ///
+    /// # Arguments
+    /// * `to` - Primary recipient addresses (at least one required).
+    /// * `subject` - Email subject line.
+    /// * `body_text` / `body_html` - Plain-text / HTML body.
+    /// * `cc` / `bcc` - Carbon-copy / blind carbon-copy recipients.
+    /// * `in_reply_to_message_id` - RFC 5322 Message-ID to thread a reply.
+    /// * `attachments` - File attachments (see
+    ///   [`crate::mail::resources::Attachment`]).
+    /// * `track_opens` - Embed an open-tracking pixel when `body_html` is
+    ///   present; opens surface as `first_opened_at` / `open_count`.
+    ///
+    /// To make a send safe to retry, use
+    /// [`send_email_with_idempotency_key`](Self::send_email_with_idempotency_key).
+    ///
+    /// Returns [`InkboxError::StorageLimitExceeded`](crate::error::InkboxError)
+    /// (HTTP 402) when the mailbox has reached its plan's storage cap. Delete
+    /// messages/threads to free space (reclaim is immediate), or upgrade the
+    /// plan at the error's `upgrade_url`.
+    ///
+    /// On the Free plan a footer is appended to the *stored* body, so the body
+    /// read back later is not byte-for-byte what you sent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_email(
+        &self,
+        to: &[String],
+        subject: &str,
+        body_text: Option<&str>,
+        body_html: Option<&str>,
+        cc: Option<&[String]>,
+        bcc: Option<&[String]>,
+        in_reply_to_message_id: Option<&str>,
+        attachments: Option<&[crate::mail::resources::Attachment]>,
+        track_opens: bool,
+    ) -> Result<Message> {
+        let email = self.require_mailbox()?;
+        self.inkbox.messages().send(
+            &email,
+            to,
+            subject,
+            body_text,
+            body_html,
+            cc,
+            bcc,
+            in_reply_to_message_id,
+            attachments,
+            track_opens,
+        )
+    }
+
+    /// [`send_email`](Self::send_email) carrying an `Idempotency-Key` — see
+    /// [`crate::mail::resources::MessagesResource::send_with_idempotency_key`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_email_with_idempotency_key(
+        &self,
+        to: &[String],
+        subject: &str,
+        body_text: Option<&str>,
+        body_html: Option<&str>,
+        cc: Option<&[String]>,
+        bcc: Option<&[String]>,
+        in_reply_to_message_id: Option<&str>,
+        attachments: Option<&[crate::mail::resources::Attachment]>,
+        track_opens: bool,
+        idempotency_key: &str,
+    ) -> Result<Message> {
+        let email = self.require_mailbox()?;
+        self.inkbox.messages().send_with_idempotency_key(
+            &email,
+            to,
+            subject,
+            body_text,
+            body_html,
+            cc,
+            bcc,
+            in_reply_to_message_id,
+            attachments,
+            track_opens,
+            idempotency_key,
+        )
+    }
+
+    /// Fetch all saved drafts for this identity's mailbox, newest first.
+    pub fn iter_email_drafts(&self, page_size: Option<u32>) -> Result<Vec<DraftSummary>> {
+        let email = self.require_mailbox()?;
+        self.inkbox.drafts().list(&email, page_size)
+    }
+
+    /// Create a saved draft in this identity's mailbox.
+    pub fn create_email_draft(&self, options: &CreateDraftOptions) -> Result<DraftDetail> {
+        let email = self.require_mailbox()?;
+        self.inkbox.drafts().create(&email, options)
+    }
+
+    /// Get one saved draft from this identity's mailbox.
+    pub fn get_email_draft(&self, draft_id: &Uuid) -> Result<DraftDetail> {
+        let email = self.require_mailbox()?;
+        self.inkbox.drafts().get(&email, draft_id)
+    }
+
+    /// Apply generation-checked changes to a saved draft.
+    pub fn update_email_draft(
+        &self,
+        draft_id: &Uuid,
+        generation: u64,
+        options: &UpdateDraftOptions,
+    ) -> Result<DraftDetail> {
+        let email = self.require_mailbox()?;
+        self.inkbox
+            .drafts()
+            .update(&email, draft_id, generation, options)
+    }
+
+    /// Duplicate a saved draft at the generation the caller read.
+    pub fn duplicate_email_draft(&self, draft_id: &Uuid, generation: u64) -> Result<DraftDetail> {
+        let email = self.require_mailbox()?;
+        self.inkbox.drafts().duplicate(&email, draft_id, generation)
+    }
+
+    /// Delete a saved draft at the generation the caller read.
+    pub fn delete_email_draft(&self, draft_id: &Uuid, generation: u64) -> Result<()> {
+        let email = self.require_mailbox()?;
+        self.inkbox.drafts().delete(&email, draft_id, generation)
+    }
+
+    /// Send a saved draft at the generation the caller read.
+    pub fn send_email_draft(&self, draft_id: &Uuid, generation: u64) -> Result<Message> {
+        let email = self.require_mailbox()?;
+        self.inkbox.drafts().send(&email, draft_id, generation)
+    }
+
+    /// Reply to everyone on a stored message from this identity's mailbox.
+    ///
+    /// Recipients are resolved server-side from the source message.
+    ///
+    /// # Arguments
+    /// * `message_id` - UUID of the message being replied to.
+    /// * `subject` - Optional override; defaults to `"Re: " + original.subject`.
+    /// * `body_text` / `body_html` - Optional reply body.
+    /// * `attachments` - Optional file attachments.
+    /// * `reply_to` - Optional Reply-To address.
+    ///
+    /// To make a reply safe to retry, use
+    /// [`reply_all_email_with_idempotency_key`](Self::reply_all_email_with_idempotency_key).
+    ///
+    /// Subject to the same storage cap and Free-plan footer as
+    /// [`send_email`](Self::send_email).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reply_all_email(
+        &self,
+        message_id: &str,
+        subject: Option<&str>,
+        body_text: Option<&str>,
+        body_html: Option<&str>,
+        attachments: Option<&[crate::mail::resources::Attachment]>,
+        reply_to: Option<&str>,
+    ) -> Result<Message> {
+        let email = self.require_mailbox()?;
+        self.inkbox.messages().reply_all(
+            &email,
+            message_id,
+            subject,
+            body_text,
+            body_html,
+            attachments,
+            reply_to,
+        )
+    }
+
+    /// [`reply_all_email`](Self::reply_all_email) carrying an
+    /// `Idempotency-Key` — see
+    /// [`crate::mail::resources::MessagesResource::send_with_idempotency_key`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn reply_all_email_with_idempotency_key(
+        &self,
+        message_id: &str,
+        subject: Option<&str>,
+        body_text: Option<&str>,
+        body_html: Option<&str>,
+        attachments: Option<&[crate::mail::resources::Attachment]>,
+        reply_to: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<Message> {
+        let email = self.require_mailbox()?;
+        self.inkbox.messages().reply_all_with_idempotency_key(
+            &email,
+            message_id,
+            subject,
+            body_text,
+            body_html,
+            attachments,
+            reply_to,
+            idempotency_key,
+        )
+    }
+
+    /// Forward a stored message out from this identity's mailbox.
+    ///
+    /// # Arguments
+    /// * `message_id` - UUID of the message being forwarded.
+    /// * `to` / `cc` / `bcc` - Recipients (at least one required across all three).
+    /// * `mode` - `Inline` (default) or `Wrapped`.
+    /// * `subject` - Optional override; defaults to `"Fwd: " + original.subject`.
+    /// * `body_text` / `body_html` - Optional caller note.
+    /// * `additional_attachments` - Optional caller-authored attachments.
+    /// * `include_original_attachments` - `inline` mode only; default `true`.
+    /// * `reply_to` - Optional Reply-To address for the forward's envelope.
+    /// * `track_opens` - Embed an open-tracking pixel (requires an HTML part —
+    ///   `inline` inherits the original email's HTML, `wrapped` needs a caller
+    ///   `body_html`); opens surface as `first_opened_at` / `open_count`.
+    ///
+    /// To make a forward safe to retry, use
+    /// [`forward_email_with_idempotency_key`](Self::forward_email_with_idempotency_key).
+    ///
+    /// Subject to the same storage cap and Free-plan footer as
+    /// [`send_email`](Self::send_email).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_email(
+        &self,
+        message_id: &str,
+        to: Option<&[String]>,
+        cc: Option<&[String]>,
+        bcc: Option<&[String]>,
+        mode: ForwardMode,
+        subject: Option<&str>,
+        body_text: Option<&str>,
+        body_html: Option<&str>,
+        additional_attachments: Option<&[crate::mail::resources::Attachment]>,
+        include_original_attachments: bool,
+        reply_to: Option<&str>,
+        track_opens: bool,
+    ) -> Result<Message> {
+        let email = self.require_mailbox()?;
+        self.inkbox.messages().forward(
+            &email,
+            message_id,
+            to,
+            cc,
+            bcc,
+            mode,
+            subject,
+            body_text,
+            body_html,
+            additional_attachments,
+            include_original_attachments,
+            reply_to,
+            track_opens,
+        )
+    }
+
+    /// [`forward_email`](Self::forward_email) carrying an `Idempotency-Key` —
+    /// see
+    /// [`crate::mail::resources::MessagesResource::send_with_idempotency_key`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_email_with_idempotency_key(
+        &self,
+        message_id: &str,
+        to: Option<&[String]>,
+        cc: Option<&[String]>,
+        bcc: Option<&[String]>,
+        mode: ForwardMode,
+        subject: Option<&str>,
+        body_text: Option<&str>,
+        body_html: Option<&str>,
+        additional_attachments: Option<&[crate::mail::resources::Attachment]>,
+        include_original_attachments: bool,
+        reply_to: Option<&str>,
+        track_opens: bool,
+        idempotency_key: &str,
+    ) -> Result<Message> {
+        let email = self.require_mailbox()?;
+        self.inkbox.messages().forward_with_idempotency_key(
+            &email,
+            message_id,
+            to,
+            cc,
+            bcc,
+            mode,
+            subject,
+            body_text,
+            body_html,
+            additional_attachments,
+            include_original_attachments,
+            reply_to,
+            track_opens,
+            idempotency_key,
+        )
+    }
+
+    /// Fetch all emails in this identity's inbox, newest first (pagination
+    /// handled automatically). The Python returns a lazy iterator; the Rust
+    /// resource collects every page into a `Vec`.
+    ///
+    /// # Arguments
+    /// * `page_size` - Messages fetched per API call (1-100); `None` for 50.
+    /// * `direction` - Filter by direction.
+    pub fn iter_emails(
+        &self,
+        page_size: Option<i64>,
+        direction: Option<MessageDirection>,
+    ) -> Result<Vec<Message>> {
+        // Empty (default) date range — wire-identical to the original.
+        self.iter_emails_filtered(page_size, direction, &DateRangeFilter::default())
+    }
+
+    /// Fetch all emails in this identity's inbox, newest first, additionally
+    /// narrowed by a `created_at` [`DateRangeFilter`].
+    ///
+    /// Identical to [`AgentIdentity::iter_emails`] but also forwards the
+    /// filter's `start_datetime` / `end_datetime` / `tz`. A default filter sends
+    /// nothing extra.
+    pub fn iter_emails_filtered(
+        &self,
+        page_size: Option<i64>,
+        direction: Option<MessageDirection>,
+        filter: &DateRangeFilter,
+    ) -> Result<Vec<Message>> {
+        let email = self.require_mailbox()?;
+        self.inkbox
+            .messages()
+            .list_filtered(&email, page_size, direction, filter)
+    }
+
+    /// Fetch all unread emails in this identity's inbox, newest first.
+    ///
+    /// Fetches all messages and filters client-side (`is_read == false`),
+    /// matching the Python generator.
+    pub fn iter_unread_emails(
+        &self,
+        page_size: Option<i64>,
+        direction: Option<MessageDirection>,
+    ) -> Result<Vec<Message>> {
+        // Empty (default) date range — wire-identical to the original.
+        self.iter_unread_emails_filtered(page_size, direction, &DateRangeFilter::default())
+    }
+
+    /// Fetch all unread emails, additionally narrowed by a `created_at`
+    /// [`DateRangeFilter`]. A default filter behaves exactly like
+    /// [`AgentIdentity::iter_unread_emails`].
+    pub fn iter_unread_emails_filtered(
+        &self,
+        page_size: Option<i64>,
+        direction: Option<MessageDirection>,
+        filter: &DateRangeFilter,
+    ) -> Result<Vec<Message>> {
+        let all = self.iter_emails_filtered(page_size, direction, filter)?;
+        Ok(all.into_iter().filter(|m| !m.is_read).collect())
+    }
+
+    /// Mark a list of messages as read.
+    pub fn mark_emails_read(&self, message_ids: &[String]) -> Result<()> {
+        let email = self.require_mailbox()?;
+        for mid in message_ids {
+            self.inkbox.messages().mark_read(&email, mid)?;
+        }
+        Ok(())
+    }
+
+    /// Mark a list of messages as unread.
+    pub fn mark_emails_unread(&self, message_ids: &[String]) -> Result<()> {
+        let email = self.require_mailbox()?;
+        for mid in message_ids {
+            self.inkbox.messages().mark_unread(&email, mid)?;
+        }
+        Ok(())
+    }
+
+    /// Get a single message with full body content.
+    pub fn get_message(&self, message_id: &str) -> Result<MessageDetail> {
+        let email = self.require_mailbox()?;
+        self.inkbox.messages().get(&email, message_id)
+    }
+
+    /// Get a thread with all its messages inlined (oldest-first).
+    pub fn get_thread(&self, thread_id: &str) -> Result<ThreadDetail> {
+        let email = self.require_mailbox()?;
+        self.inkbox.threads().get(&email, thread_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Phone helpers
+    // -----------------------------------------------------------------------
+
+    /// Place an outbound call as this identity.
+    ///
+    /// For `dedicated_number` origination the call rides this identity's
+    /// provisioned phone number (requires one). Either iMessage origination
+    /// is scoped by this identity's id instead.
+    ///
+    /// # Arguments
+    /// * `to_number` - E.164 destination number.
+    /// * `origination` - How to place the call (defaults to
+    ///   [`CallOrigin::DedicatedNumber`]).
+    /// * `client_websocket_url` - WebSocket URL (wss://) for audio bridging.
+    pub fn place_call(
+        &self,
+        to_number: &str,
+        origination: CallOrigin,
+        client_websocket_url: Option<&str>,
+    ) -> Result<PhoneCallWithRateLimit> {
+        match origination {
+            CallOrigin::DedicatedNumber => {
+                // Dedicated origination needs this identity's own number.
+                let number = self.require_phone()?;
+                self.inkbox.calls().place(
+                    to_number,
+                    origination,
+                    Some(&number),
+                    None,
+                    client_websocket_url,
+                )
+            }
+            CallOrigin::SharedImessageNumber | CallOrigin::DedicatedImessageNumber => {
+                // Shared-line origination scopes by identity id, no from_number.
+                let id = self.id().to_string();
+                self.inkbox.calls().place(
+                    to_number,
+                    origination,
+                    None,
+                    Some(&id),
+                    client_websocket_url,
+                )
+            }
+        }
+    }
+
+    /// Place an outbound call with optional call controls.
+    pub fn place_call_with_options(
+        &self,
+        to_number: &str,
+        origination: CallOrigin,
+        client_websocket_url: Option<&str>,
+        options: &CallPlacementOptions,
+    ) -> Result<PhoneCallWithRateLimit> {
+        match origination {
+            CallOrigin::DedicatedNumber => {
+                let number = self.require_phone()?;
+                self.inkbox.calls().place_with_options(
+                    to_number,
+                    origination,
+                    Some(&number),
+                    None,
+                    client_websocket_url,
+                    options,
+                )
+            }
+            CallOrigin::SharedImessageNumber | CallOrigin::DedicatedImessageNumber => {
+                let id = self.id().to_string();
+                self.inkbox.calls().place_with_options(
+                    to_number,
+                    origination,
+                    None,
+                    Some(&id),
+                    client_websocket_url,
+                    options,
+                )
+            }
+        }
+    }
+
+    /// List calls made to/from this identity.
+    ///
+    /// Identity-scoped credentials never see contact-rule-blocked rows
+    /// regardless of `is_blocked` (server-side access policy). Scopes by
+    /// identity id — no phone number required (a shared-only identity can
+    /// still have calls).
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of results (default 50).
+    /// * `offset` - Pagination offset (default 0).
+    /// * `is_blocked` - Tri-state filter (`None` for all).
+    pub fn list_calls(
+        &self,
+        limit: i64,
+        offset: i64,
+        is_blocked: Option<bool>,
+    ) -> Result<Vec<PhoneCall>> {
+        // Empty (default) date range — wire-identical to the original.
+        self.list_calls_filtered(limit, offset, is_blocked, &DateRangeFilter::default())
+    }
+
+    /// List calls made to/from this identity, additionally narrowed by a
+    /// `created_at` [`DateRangeFilter`].
+    ///
+    /// Identical to [`AgentIdentity::list_calls`] but also forwards the
+    /// filter's `start_datetime` / `end_datetime` / `tz`. A default filter sends
+    /// nothing extra.
+    pub fn list_calls_filtered(
+        &self,
+        limit: i64,
+        offset: i64,
+        is_blocked: Option<bool>,
+        filter: &DateRangeFilter,
+    ) -> Result<Vec<PhoneCall>> {
+        let id = self.id().to_string();
+        self.inkbox
+            .calls()
+            .list_filtered(Some(&id), limit, offset, is_blocked, filter)
+    }
+
+    /// Place an outbound call driven by Inkbox Voice AI.
+    ///
+    /// Sibling of [`AgentIdentity::place_call`] (which stays client-driven);
+    /// origination resolution is identical — dedicated phone calls ride this
+    /// identity's own number, while iMessage calls scope by its id.
+    ///
+    /// # Arguments
+    /// * `to_number` - E.164 destination number.
+    /// * `origination` - How to place the call.
+    /// * `reason` - Voice AI's task brief for the call.
+    pub fn place_hosted_call(
+        &self,
+        to_number: &str,
+        origination: CallOrigin,
+        reason: &str,
+    ) -> Result<PhoneCallWithRateLimit> {
+        match origination {
+            CallOrigin::DedicatedNumber => {
+                let number = self.require_phone()?;
+                self.inkbox.calls().place_hosted(
+                    to_number,
+                    origination,
+                    Some(&number),
+                    None,
+                    reason,
+                )
+            }
+            CallOrigin::SharedImessageNumber | CallOrigin::DedicatedImessageNumber => {
+                let id = self.id().to_string();
+                self.inkbox
+                    .calls()
+                    .place_hosted(to_number, origination, None, Some(&id), reason)
+            }
+        }
+    }
+
+    /// Place an outbound hosted-agent call with optional call controls.
+    pub fn place_hosted_call_with_options(
+        &self,
+        to_number: &str,
+        origination: CallOrigin,
+        reason: &str,
+        options: &HostedCallPlacementOptions,
+    ) -> Result<PhoneCallWithRateLimit> {
+        match origination {
+            CallOrigin::DedicatedNumber => {
+                let number = self.require_phone()?;
+                self.inkbox.calls().place_hosted_with_options(
+                    to_number,
+                    origination,
+                    Some(&number),
+                    None,
+                    reason,
+                    options,
+                )
+            }
+            CallOrigin::SharedImessageNumber | CallOrigin::DedicatedImessageNumber => {
+                let id = self.id().to_string();
+                self.inkbox.calls().place_hosted_with_options(
+                    to_number,
+                    origination,
+                    None,
+                    Some(&id),
+                    reason,
+                    options,
+                )
+            }
+        }
+    }
+
+    /// Place a hosted-agent call with an explicit authority mode.
+    pub fn place_hosted_call_with_authority(
+        &self,
+        to_number: &str,
+        origination: CallOrigin,
+        reason: &str,
+        authority_mode: HostedAgentAuthorityMode,
+    ) -> Result<PhoneCallWithRateLimit> {
+        match origination {
+            CallOrigin::DedicatedNumber => {
+                // Dedicated origination needs this identity's own number.
+                let number = self.require_phone()?;
+                self.inkbox.calls().place_hosted_with_authority(
+                    to_number,
+                    origination,
+                    Some(&number),
+                    None,
+                    reason,
+                    authority_mode,
+                )
+            }
+            CallOrigin::SharedImessageNumber | CallOrigin::DedicatedImessageNumber => {
+                // Shared-line origination scopes by identity id, no from_number.
+                let id = self.id().to_string();
+                self.inkbox.calls().place_hosted_with_authority(
+                    to_number,
+                    origination,
+                    None,
+                    Some(&id),
+                    reason,
+                    authority_mode,
+                )
+            }
+        }
+    }
+
+    /// List transcript segments for a specific call.
+    pub fn list_transcripts(&self, call_id: &str) -> Result<Vec<PhoneTranscript>> {
+        self.inkbox.calls().transcripts(call_id)
+    }
+
+    /// List a page of Voice AI tool activity for a specific call.
+    pub fn list_tool_invocations(
+        &self,
+        call_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<HostedAgentToolInvocationPage> {
+        self.inkbox.calls().tool_invocations(call_id, limit, offset)
+    }
+
+    /// Get this identity's Inkbox Voice AI config.
+    pub fn hosted_agent_config(&self) -> Result<HostedAgentConfig> {
+        self.inkbox
+            .hosted_agent()
+            .get_config(Some(&self.id().to_string()))
+    }
+
+    /// Set this identity's Inkbox Voice AI config (full replace).
+    ///
+    /// Voice and instructions left `None` reset to their defaults. The model
+    /// argument remains accepted for compatibility but is ignored.
+    pub fn set_hosted_agent_config(
+        &self,
+        voice: Option<&str>,
+        model: Option<&str>,
+        instructions: Option<&str>,
+    ) -> Result<HostedAgentConfig> {
+        self.inkbox.hosted_agent().set_config(
+            Some(&self.id().to_string()),
+            voice,
+            model,
+            instructions,
+        )
+    }
+
+    /// Set the saved Voice AI authority with an admin API key.
+    ///
+    /// Incoming calls use this value. Outbound calls inherit it when the
+    /// placement options omit `authority_mode`.
+    pub fn set_hosted_agent_authority_mode(
+        &self,
+        authority_mode: HostedAgentAuthorityMode,
+    ) -> Result<HostedAgentConfig> {
+        self.inkbox
+            .hosted_agent()
+            .set_authority_mode(&self.id().to_string(), authority_mode)
+    }
+
+    /// Hang up one of this identity's live calls, from outside the call.
+    pub fn hangup_call(&self, call_id: &str) -> Result<PhoneCall> {
+        self.inkbox.calls().hangup(call_id)
+    }
+
+    /// Get this identity's inbound-call handling config.
+    pub fn get_incoming_call_action(&self) -> Result<IncomingCallActionConfig> {
+        self.inkbox
+            .incoming_call_action()
+            .get(Some(&self.id().to_string()))
+    }
+
+    /// Set this identity's inbound-call handling config.
+    pub fn set_incoming_call_action(
+        &self,
+        incoming_call_action: IncomingCallAction,
+        client_websocket_url: Option<&str>,
+        incoming_call_webhook_url: Option<&str>,
+    ) -> Result<IncomingCallActionConfig> {
+        self.inkbox.incoming_call_action().set(
+            incoming_call_action,
+            Some(&self.id().to_string()),
+            client_websocket_url,
+            incoming_call_webhook_url,
+        )
+    }
+
+    /// Set this identity's inbound-call action with forwarding options.
+    pub fn set_incoming_call_action_with_options(
+        &self,
+        incoming_call_action: IncomingCallAction,
+        mut options: crate::phone::IncomingCallActionSetOptions,
+    ) -> Result<IncomingCallActionConfig> {
+        options.agent_identity_id = Some(self.id().to_string());
+        self.inkbox
+            .incoming_call_action()
+            .set_with_options(incoming_call_action, options)
+    }
+
+    // -----------------------------------------------------------------------
+    // Text message helpers
+    // -----------------------------------------------------------------------
+
+    /// Send an outbound SMS/MMS from this identity's phone number.
+    ///
+    /// # Arguments
+    /// * `to` - E.164 destination number, or a list for a group send. Mutually
+    ///   exclusive with `conversation_id`.
+    /// * `conversation_id` - Existing conversation UUID to reply into.
+    /// * `text` - Message body.
+    /// * `media_urls` - MMS media URLs.
+    pub fn send_text(
+        &self,
+        to: Option<TextRecipients>,
+        conversation_id: Option<&str>,
+        text: Option<&str>,
+        media_urls: Option<&[String]>,
+    ) -> Result<TextMessage> {
+        let number_id = self.require_phone_id()?;
+        self.inkbox
+            .texts()
+            .send(&number_id, to, conversation_id, text, media_urls)
+    }
+
+    /// Submit or retry one text with a caller-preserved request key.
+    pub fn send_text_with_idempotency_key(
+        &self,
+        to: Option<TextRecipients>,
+        conversation_id: Option<&str>,
+        text: Option<&str>,
+        media_urls: Option<&[String]>,
+        key: &str,
+    ) -> Result<TextMessage> {
+        self.inkbox.texts().send_with_idempotency_key(
+            &self.require_phone_id()?,
+            to,
+            conversation_id,
+            text,
+            media_urls,
+            key,
+        )
+    }
+
+    /// List text messages for this identity's phone number.
+    ///
+    /// Identity-scoped credentials never see contact-rule-blocked rows
+    /// regardless of `is_blocked`.
+    ///
+    /// # Arguments
+    /// * `limit` / `offset` - Pagination (defaults 50 / 0).
+    /// * `is_read` - Filter by read state (`None` for all).
+    /// * `is_blocked` - Tri-state filter (`None` for all).
+    pub fn list_texts(
+        &self,
+        limit: i64,
+        offset: i64,
+        is_read: Option<bool>,
+        is_blocked: Option<bool>,
+    ) -> Result<Vec<TextMessage>> {
+        // Empty (default) date range — wire-identical to the original.
+        self.list_texts_filtered(
+            limit,
+            offset,
+            is_read,
+            is_blocked,
+            &DateRangeFilter::default(),
+        )
+    }
+
+    /// List text messages for this identity's phone number, additionally
+    /// narrowed by a `created_at` [`DateRangeFilter`].
+    ///
+    /// Identical to [`AgentIdentity::list_texts`] but also forwards the
+    /// filter's `start_datetime` / `end_datetime` / `tz`. A default filter sends
+    /// nothing extra.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_texts_filtered(
+        &self,
+        limit: i64,
+        offset: i64,
+        is_read: Option<bool>,
+        is_blocked: Option<bool>,
+        filter: &DateRangeFilter,
+    ) -> Result<Vec<TextMessage>> {
+        let number_id = self.require_phone_id()?;
+        self.inkbox
+            .texts()
+            .list_filtered(&number_id, limit, offset, is_read, is_blocked, filter)
+    }
+
+    /// Get a single text message by ID.
+    pub fn get_text(&self, text_id: &str) -> Result<TextMessage> {
+        let number_id = self.require_phone_id()?;
+        self.inkbox.texts().get(&number_id, text_id)
+    }
+
+    /// List text conversations.
+    ///
+    /// Identity-scoped credentials never see blocked rows in conversation
+    /// summaries.
+    ///
+    /// # Arguments
+    /// * `limit` / `offset` - Pagination (defaults 50 / 0).
+    /// * `is_blocked` - Tri-state filter (`None` for all).
+    /// * `include_groups` - Include group conversations (default `false`).
+    pub fn list_text_conversations(
+        &self,
+        limit: i64,
+        offset: i64,
+        is_blocked: Option<bool>,
+        include_groups: bool,
+    ) -> Result<Vec<TextConversationSummary>> {
+        // Empty (default) date range — wire-identical to the original.
+        self.list_text_conversations_filtered(
+            limit,
+            offset,
+            is_blocked,
+            include_groups,
+            &DateRangeFilter::default(),
+        )
+    }
+
+    /// List text conversations, additionally narrowed by a `created_at`
+    /// [`DateRangeFilter`].
+    ///
+    /// Identical to [`AgentIdentity::list_text_conversations`] but also
+    /// forwards the filter's `start_datetime` / `end_datetime` / `tz`. A default filter
+    /// sends nothing extra.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_text_conversations_filtered(
+        &self,
+        limit: i64,
+        offset: i64,
+        is_blocked: Option<bool>,
+        include_groups: bool,
+        filter: &DateRangeFilter,
+    ) -> Result<Vec<TextConversationSummary>> {
+        let number_id = self.require_phone_id()?;
+        self.inkbox.texts().list_conversations_filtered(
+            &number_id,
+            limit,
+            offset,
+            is_blocked,
+            include_groups,
+            filter,
+        )
+    }
+
+    /// Get all messages in a conversation.
+    ///
+    /// # Arguments
+    /// * `remote_number` - E.164 one-to-one remote number, or conversation UUID.
+    /// * `limit` / `offset` - Pagination (defaults 50 / 0).
+    pub fn get_text_conversation(
+        &self,
+        remote_number: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TextMessage>> {
+        let number_id = self.require_phone_id()?;
+        self.inkbox
+            .texts()
+            .get_conversation(&number_id, remote_number, limit, offset)
+    }
+
+    /// Mark a single text message as read.
+    pub fn mark_text_read(&self, text_id: &str) -> Result<TextMessage> {
+        let number_id = self.require_phone_id()?;
+        self.inkbox.texts().update(&number_id, text_id, Some(true))
+    }
+
+    /// Mark all messages in a conversation as read.
+    ///
+    /// # Arguments
+    /// * `remote_number` - E.164 one-to-one remote number, or conversation UUID.
+    ///
+    /// # Returns
+    /// [`TextConversationUpdateResult`] with `conversation_id`,
+    /// `remote_phone_number`, `is_read`, and `updated_count`.
+    pub fn mark_text_conversation_read(
+        &self,
+        remote_number: &str,
+    ) -> Result<TextConversationUpdateResult> {
+        let number_id = self.require_phone_id()?;
+        self.inkbox
+            .texts()
+            .update_conversation(&number_id, remote_number, true)
+    }
+
+    // -----------------------------------------------------------------------
+    // iMessage helpers
+    // -----------------------------------------------------------------------
+
+    /// Read one iMessage including thread metadata, scoped to this identity.
+    pub fn get_imessage_with_thread(&self, message_id: &Uuid) -> Result<ThreadedIMessage> {
+        self.require_imessage()?;
+        self.inkbox
+            .imessages()
+            .get_with_thread(message_id, Some(&self.id()))
+    }
+
+    /// Read a chronological thread page using any message in it.
+    pub fn get_imessage_thread(
+        &self,
+        message_id: &Uuid,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<IMessageThread> {
+        self.require_imessage()?;
+        self.inkbox
+            .imessages()
+            .get_thread(message_id, Some(&self.id()), limit, cursor)
+    }
+
+    /// Read a thread by its opaque ID within a conversation.
+    pub fn get_imessage_conversation_thread(
+        &self,
+        conversation_id: &Uuid,
+        thread_id: &Uuid,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<IMessageThread> {
+        self.require_imessage()?;
+        self.inkbox.imessages().get_conversation_thread(
+            conversation_id,
+            thread_id,
+            Some(&self.id()),
+            limit,
+            cursor,
+        )
+    }
+
+    /// List this identity's messages with nullable thread metadata.
+    pub fn list_imessages_with_threads(
+        &self,
+        options: &IMessageThreadListOptions,
+    ) -> Result<Vec<ThreadedIMessage>> {
+        self.require_imessage()?;
+        let mut scoped = options.clone();
+        scoped.agent_identity_id = Some(self.id());
+        self.inkbox.imessages().list_with_threads(&scoped)
+    }
+
+    /// Reply to a message, allowing an ordinary send when native threading is unsupported.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_imessage_reply(
+        &self,
+        conversation_id: &Uuid,
+        reply_to_message_id: &Uuid,
+        text: Option<&str>,
+        media_urls: Option<&[String]>,
+        send_style: Option<IMessageSendStyle>,
+        idempotency_key: Option<&str>,
+    ) -> Result<ThreadedIMessage> {
+        self.send_imessage_reply_with_fallback(
+            conversation_id,
+            reply_to_message_id,
+            text,
+            media_urls,
+            send_style,
+            idempotency_key,
+            true,
+        )
+    }
+
+    /// Reply with explicit fallback behavior. False requires a native reply.
+    /// Fallback stays in the same conversation and is handled by the API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_imessage_reply_with_fallback(
+        &self,
+        conversation_id: &Uuid,
+        reply_to_message_id: &Uuid,
+        text: Option<&str>,
+        media_urls: Option<&[String]>,
+        send_style: Option<IMessageSendStyle>,
+        idempotency_key: Option<&str>,
+        plain_reply_fallback: bool,
+    ) -> Result<ThreadedIMessage> {
+        self.require_imessage()?;
+        self.inkbox.imessages().send_reply_with_fallback(
+            conversation_id,
+            reply_to_message_id,
+            text,
+            media_urls,
+            send_style,
+            Some(&self.id()),
+            idempotency_key,
+            plain_reply_fallback,
+        )
+    }
+
+    /// Send an outbound iMessage as this identity.
+    ///
+    /// Shared service requires the recipient to connect first. A dedicated
+    /// iMessage line may initiate a conversation, subject to server-side consent
+    /// and rate limits.
+    ///
+    /// # Arguments
+    /// * `to` - E.164 recipient number. Mutually exclusive with `conversation_id`.
+    /// * `conversation_id` - Existing conversation UUID to reply into.
+    /// * `text` - Message body.
+    /// * `media_urls` - Media URLs (at most one).
+    /// * `send_style` - Optional expressive send style. The same
+    ///   [`IMessageSendStyle`] values work for one-to-one and group replies,
+    ///   including sends with one media URL.
+    pub fn send_imessage(
+        &self,
+        to: Option<&str>,
+        conversation_id: Option<&Uuid>,
+        text: Option<&str>,
+        media_urls: Option<&[String]>,
+        send_style: Option<IMessageSendStyle>,
+    ) -> Result<IMessage> {
+        self.require_imessage()?;
+        let id = self.id();
+        self.inkbox
+            .imessages()
+            .send(to, conversation_id, text, media_urls, send_style, Some(&id))
+    }
+
+    /// Submit or retry one iMessage with a caller-preserved request key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_imessage_with_idempotency_key(
+        &self,
+        to: Option<&str>,
+        conversation_id: Option<&Uuid>,
+        text: Option<&str>,
+        media_urls: Option<&[String]>,
+        send_style: Option<IMessageSendStyle>,
+        key: &str,
+    ) -> Result<IMessage> {
+        self.require_imessage()?;
+        self.inkbox.imessages().send_with_idempotency_key(
+            to,
+            conversation_id,
+            text,
+            media_urls,
+            send_style,
+            Some(&self.id()),
+            key,
+        )
+    }
+
+    /// Send to 2–8 distinct recipients as a dedicated iMessage group.
+    ///
+    /// `send_style` accepts the same [`IMessageSendStyle`] values as one-to-one
+    /// sends and may be combined with the single supported media URL.
+    pub fn send_imessage_group(
+        &self,
+        to: &[String],
+        text: Option<&str>,
+        media_urls: Option<&[String]>,
+        send_style: Option<IMessageSendStyle>,
+    ) -> Result<IMessage> {
+        self.require_imessage()?;
+        let id = self.id();
+        self.inkbox
+            .imessages()
+            .send_group(to, text, media_urls, send_style, Some(&id))
+    }
+
+    /// Submit or retry one group message with a caller-preserved request key.
+    pub fn send_imessage_group_with_idempotency_key(
+        &self,
+        to: &[String],
+        text: Option<&str>,
+        media_urls: Option<&[String]>,
+        send_style: Option<IMessageSendStyle>,
+        key: &str,
+    ) -> Result<IMessage> {
+        self.require_imessage()?;
+        self.inkbox.imessages().send_group_with_idempotency_key(
+            to,
+            text,
+            media_urls,
+            send_style,
+            Some(&self.id()),
+            key,
+        )
+    }
+
+    /// List this identity's iMessages, newest first.
+    ///
+    /// Identity-scoped credentials never see contact-rule-blocked rows
+    /// regardless of `is_blocked`.
+    pub fn list_imessages(
+        &self,
+        conversation_id: Option<&Uuid>,
+        limit: i64,
+        offset: i64,
+        is_read: Option<bool>,
+        is_blocked: Option<bool>,
+    ) -> Result<Vec<IMessage>> {
+        // Empty (default) date range — wire-identical to the original.
+        self.list_imessages_filtered(
+            conversation_id,
+            limit,
+            offset,
+            is_read,
+            is_blocked,
+            &DateRangeFilter::default(),
+        )
+    }
+
+    /// List this identity's iMessages with explicit group visibility.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_imessages_with_groups(
+        &self,
+        conversation_id: Option<&Uuid>,
+        limit: i64,
+        offset: i64,
+        is_read: Option<bool>,
+        is_blocked: Option<bool>,
+        include_groups: bool,
+    ) -> Result<Vec<IMessage>> {
+        self.list_imessages_filtered_with_groups(
+            conversation_id,
+            limit,
+            offset,
+            is_read,
+            is_blocked,
+            &DateRangeFilter::default(),
+            include_groups,
+        )
+    }
+
+    /// List this identity's date-filtered iMessages with explicit group visibility.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_imessages_filtered_with_groups(
+        &self,
+        conversation_id: Option<&Uuid>,
+        limit: i64,
+        offset: i64,
+        is_read: Option<bool>,
+        is_blocked: Option<bool>,
+        filter: &DateRangeFilter,
+        include_groups: bool,
+    ) -> Result<Vec<IMessage>> {
+        self.require_imessage()?;
+        let id = self.id();
+        self.inkbox.imessages().list_filtered_with_groups(
+            Some(&id),
+            conversation_id,
+            limit,
+            offset,
+            is_read,
+            is_blocked,
+            filter,
+            include_groups,
+        )
+    }
+
+    /// List this identity's iMessages, additionally narrowed by a `created_at`
+    /// [`DateRangeFilter`].
+    ///
+    /// Identical to [`AgentIdentity::list_imessages`] but also forwards the
+    /// filter's `start_datetime` / `end_datetime` / `tz`. A default filter sends
+    /// nothing extra.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_imessages_filtered(
+        &self,
+        conversation_id: Option<&Uuid>,
+        limit: i64,
+        offset: i64,
+        is_read: Option<bool>,
+        is_blocked: Option<bool>,
+        filter: &DateRangeFilter,
+    ) -> Result<Vec<IMessage>> {
+        self.require_imessage()?;
+        let id = self.id();
+        self.inkbox.imessages().list_filtered(
+            Some(&id),
+            conversation_id,
+            limit,
+            offset,
+            is_read,
+            is_blocked,
+            filter,
+        )
+    }
+
+    /// List recipients actively connected to this identity, newest first.
+    pub fn list_imessage_assignments(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<IMessageAssignment>> {
+        self.require_imessage()?;
+        let id = self.id();
+        self.inkbox
+            .imessages()
+            .list_assignments(Some(&id), limit, offset)
+    }
+
+    /// Disconnect a recipient from this identity.
+    ///
+    /// Requires an admin API key; identity-scoped keys are rejected. Inbound
+    /// from them stops routing here and the shared line can be reassigned.
+    /// They are not notified and can reconnect by texting the triage number
+    /// again.
+    ///
+    /// # Arguments
+    /// * `assignment_id` - UUID of the connection, from `list_imessage_assignments`.
+    pub fn release_imessage_assignment(&self, assignment_id: &Uuid) -> Result<()> {
+        self.require_imessage()?;
+        self.inkbox.imessages().release_assignment(assignment_id)
+    }
+
+    /// List this identity's iMessage conversations.
+    pub fn list_imessage_conversations(
+        &self,
+        limit: i64,
+        offset: i64,
+        is_blocked: Option<bool>,
+    ) -> Result<Vec<IMessageConversationSummary>> {
+        // Empty (default) date range — wire-identical to the original.
+        self.list_imessage_conversations_filtered(
+            limit,
+            offset,
+            is_blocked,
+            &DateRangeFilter::default(),
+        )
+    }
+
+    /// List this identity's conversations with explicit group visibility.
+    pub fn list_imessage_conversations_with_groups(
+        &self,
+        limit: i64,
+        offset: i64,
+        is_blocked: Option<bool>,
+        include_groups: bool,
+    ) -> Result<Vec<IMessageConversationSummary>> {
+        self.list_imessage_conversations_filtered_with_groups(
+            limit,
+            offset,
+            is_blocked,
+            &DateRangeFilter::default(),
+            include_groups,
+        )
+    }
+
+    /// List this identity's date-filtered conversations with explicit group visibility.
+    pub fn list_imessage_conversations_filtered_with_groups(
+        &self,
+        limit: i64,
+        offset: i64,
+        is_blocked: Option<bool>,
+        filter: &DateRangeFilter,
+        include_groups: bool,
+    ) -> Result<Vec<IMessageConversationSummary>> {
+        self.require_imessage()?;
+        let id = self.id();
+        self.inkbox
+            .imessages()
+            .list_conversations_filtered_with_groups(
+                Some(&id),
+                limit,
+                offset,
+                is_blocked,
+                filter,
+                include_groups,
+            )
+    }
+
+    /// List this identity's iMessage conversations, additionally narrowed by a
+    /// `created_at` [`DateRangeFilter`].
+    ///
+    /// Identical to [`AgentIdentity::list_imessage_conversations`] but also
+    /// forwards the filter's `start_datetime` / `end_datetime` / `tz`. A default filter
+    /// sends nothing extra.
+    pub fn list_imessage_conversations_filtered(
+        &self,
+        limit: i64,
+        offset: i64,
+        is_blocked: Option<bool>,
+        filter: &DateRangeFilter,
+    ) -> Result<Vec<IMessageConversationSummary>> {
+        self.require_imessage()?;
+        let id = self.id();
+        self.inkbox.imessages().list_conversations_filtered(
+            Some(&id),
+            limit,
+            offset,
+            is_blocked,
+            filter,
+        )
+    }
+
+    /// Get one of this identity's iMessage conversations by ID.
+    pub fn get_imessage_conversation(
+        &self,
+        conversation_id: &Uuid,
+    ) -> Result<IMessageConversation> {
+        self.require_imessage()?;
+        let id = self.id();
+        self.inkbox
+            .imessages()
+            .get_conversation(conversation_id, Some(&id))
+    }
+
+    /// React to an inbound one-to-one or group message owned by this identity.
+    ///
+    /// # Arguments
+    /// * `message_id` - UUID of the message being reacted to.
+    /// * `reaction` - Tapback kind.
+    /// * `part_index` - Part of a multi-part message to react to.
+    pub fn send_imessage_reaction(
+        &self,
+        message_id: &Uuid,
+        reaction: IMessageReactionType,
+        part_index: i64,
+    ) -> Result<IMessageReaction> {
+        self.require_imessage()?;
+        self.inkbox
+            .imessages()
+            .send_reaction(message_id, reaction, part_index)
+    }
+
+    /// Take back a tapback this identity sent.
+    ///
+    /// Only the sender can remove a tapback, so one the other party sent is
+    /// rejected. A tapback Inkbox already shows as gone succeeds without
+    /// contacting the messaging network, and a failed removal leaves it in
+    /// place rather than clearing it locally, so the call can be retried.
+    ///
+    /// # Arguments
+    /// * `reaction_id` - UUID of the reaction to take back.
+    pub fn remove_imessage_reaction(&self, reaction_id: &Uuid) -> Result<()> {
+        self.require_imessage()?;
+        self.inkbox.imessages().remove_reaction(reaction_id)
+    }
+
+    /// Send a one-to-one read receipt and mark inbound messages read.
+    /// Group conversations return 409.
+    pub fn mark_imessage_conversation_read(
+        &self,
+        conversation_id: &Uuid,
+    ) -> Result<IMessageMarkReadResult> {
+        self.require_imessage()?;
+        self.inkbox
+            .imessages()
+            .mark_conversation_read(conversation_id)
+    }
+
+    /// Show a typing indicator to a one-to-one recipient.
+    /// Group conversations return 409.
+    pub fn send_imessage_typing(&self, conversation_id: &Uuid) -> Result<()> {
+        self.require_imessage()?;
+        self.inkbox.imessages().send_typing(conversation_id)
+    }
+
+    /// Upload media and get back a URL usable in `media_urls`.
+    ///
+    /// # Arguments
+    /// * `content` - Raw file bytes (max 10 MiB).
+    /// * `filename` - Original filename, used for type inference.
+    /// * `content_type` - Optional MIME type.
+    pub fn upload_imessage_media(
+        &self,
+        content: Vec<u8>,
+        filename: &str,
+        content_type: Option<&str>,
+    ) -> Result<IMessageMediaUpload> {
+        self.require_imessage()?;
+        self.inkbox
+            .imessages()
+            .upload_media(content, filename, content_type)
+    }
+
+    // -----------------------------------------------------------------------
+    // Mail contact rules (identity-keyed)
+    // -----------------------------------------------------------------------
+
+    /// List this identity's mail allow/block rules, newest first.
+    pub fn list_mail_contact_rules(
+        &self,
+        action: Option<MailRuleAction>,
+        match_type: Option<MailRuleMatchType>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<MailIdentityContactRule>> {
+        self.inkbox.mail_identity_contact_rules().list(
+            &self.agent_handle(),
+            action,
+            match_type,
+            limit,
+            offset,
+        )
+    }
+
+    /// Get one of this identity's mail contact rules by id.
+    pub fn get_mail_contact_rule(&self, rule_id: &str) -> Result<MailIdentityContactRule> {
+        self.inkbox
+            .mail_identity_contact_rules()
+            .get(&self.agent_handle(), rule_id)
+    }
+
+    /// Create a mail allow/block rule for this identity.
+    pub fn create_mail_contact_rule(
+        &self,
+        action: MailRuleAction,
+        match_type: MailRuleMatchType,
+        match_target: &str,
+    ) -> Result<MailIdentityContactRule> {
+        self.inkbox.mail_identity_contact_rules().create(
+            &self.agent_handle(),
+            action,
+            match_type,
+            match_target,
+        )
+    }
+
+    /// Update a mail rule's `action` (admin-only).
+    pub fn update_mail_contact_rule(
+        &self,
+        rule_id: &str,
+        action: MailRuleAction,
+    ) -> Result<MailIdentityContactRule> {
+        self.inkbox
+            .mail_identity_contact_rules()
+            .update(&self.agent_handle(), rule_id, action)
+    }
+
+    /// Delete one of this identity's mail contact rules (admin-only).
+    pub fn delete_mail_contact_rule(&self, rule_id: &str) -> Result<()> {
+        self.inkbox
+            .mail_identity_contact_rules()
+            .delete(&self.agent_handle(), rule_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Phone contact rules (identity-keyed)
+    // -----------------------------------------------------------------------
+
+    /// List this identity's phone allow/block rules, newest first.
+    ///
+    /// Rules also apply to iMessage and do not require a dedicated phone number.
+    pub fn list_phone_contact_rules(
+        &self,
+        action: Option<PhoneRuleAction>,
+        match_type: Option<PhoneRuleMatchType>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<PhoneIdentityContactRule>> {
+        self.inkbox.phone_identity_contact_rules().list(
+            &self.agent_handle(),
+            action,
+            match_type,
+            limit,
+            offset,
+        )
+    }
+
+    /// Get one of this identity's phone contact rules by id.
+    pub fn get_phone_contact_rule(&self, rule_id: &str) -> Result<PhoneIdentityContactRule> {
+        self.inkbox
+            .phone_identity_contact_rules()
+            .get(&self.agent_handle(), rule_id)
+    }
+
+    /// Create a phone allow/block rule for this identity.
+    /// Requires admin credentials; channel provisioning is not required.
+    pub fn create_phone_contact_rule(
+        &self,
+        action: PhoneRuleAction,
+        match_target: &str,
+        match_type: PhoneRuleMatchType,
+    ) -> Result<PhoneIdentityContactRule> {
+        self.inkbox.phone_identity_contact_rules().create(
+            &self.agent_handle(),
+            action,
+            match_target,
+            match_type,
+        )
+    }
+
+    /// Update a phone rule's `action` (admin-only).
+    pub fn update_phone_contact_rule(
+        &self,
+        rule_id: &str,
+        action: PhoneRuleAction,
+    ) -> Result<PhoneIdentityContactRule> {
+        self.inkbox
+            .phone_identity_contact_rules()
+            .update(&self.agent_handle(), rule_id, action)
+    }
+
+    /// Delete one of this identity's phone contact rules (admin-only).
+    pub fn delete_phone_contact_rule(&self, rule_id: &str) -> Result<()> {
+        self.inkbox
+            .phone_identity_contact_rules()
+            .delete(&self.agent_handle(), rule_id)
+    }
+
+    /// List this identity's permission-filtered contact views.
+    pub fn list_contact_communication_policies(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<crate::contacts::ContactCommunicationPolicyPage> {
+        self.inkbox
+            .contacts()
+            .communication_policy()
+            .list_for_identity(&self.agent_handle(), limit, offset)
+    }
+
+    // -----------------------------------------------------------------------
+    // Signing key (identity-keyed)
+    // -----------------------------------------------------------------------
+
+    /// Report whether this identity has a webhook signing key.
+    pub fn get_signing_key_status(&self) -> Result<SigningKeyStatus> {
+        self.inkbox.signing_keys().get_status(&self.agent_handle())
+    }
+
+    /// Create or rotate this identity's webhook signing key.
+    ///
+    /// The plaintext `signing_key` is returned **once** — store it securely, it
+    /// cannot be retrieved again.
+    pub fn create_signing_key(&self) -> Result<SigningKey> {
+        self.inkbox
+            .signing_keys()
+            .create_or_rotate(&self.agent_handle())
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity management
+    // -----------------------------------------------------------------------
+
+    /// Update this identity's display name, description, iMessage
+    /// reachability and contact-rule filter modes.
+    ///
+    /// Only provided fields are applied; omitted fields are left unchanged. For
+    /// `display_name` and `description`, `Unset::Value(None)` clears the column;
+    /// `Unset::Omit` leaves it untouched.
+    ///
+    /// # Arguments
+    /// * `display_name` - New display name, or `Unset::Value(None)` to clear.
+    /// * `description` - New description, or `Unset::Value(None)` to clear.
+    /// * `imessage_enabled` - Toggle identity-level iMessage reachability.
+    /// * `imessage_filter_mode` - `"whitelist"` or `"blacklist"` (admin-only).
+    /// * `mail_filter_mode` - `"whitelist"` or `"blacklist"` for this identity's
+    ///   mail contact rules (admin-only).
+    /// * `phone_filter_mode` - `"whitelist"` or `"blacklist"` for this identity's
+    ///   phone contact rules (admin-only). Rejected with 422 when the identity
+    ///   has no phone number.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(
+        &self,
+        display_name: crate::identities::types::Unset<String>,
+        description: crate::identities::types::Unset<String>,
+        imessage_enabled: Option<bool>,
+        imessage_filter_mode: Option<&str>,
+        mail_filter_mode: Option<&str>,
+        phone_filter_mode: Option<&str>,
+    ) -> Result<()> {
+        self.update_with_imessage_number(
+            display_name,
+            description,
+            imessage_enabled,
+            imessage_filter_mode,
+            mail_filter_mode,
+            phone_filter_mode,
+            Unset::Omit,
+            None,
+            None,
+        )
+    }
+
+    /// Update this identity and optionally change its dedicated iMessage line.
+    ///
+    /// Use `Unset::Value(Some(id))` to attach an already-owned number,
+    /// `Unset::Value(None)` to move back to shared iMessage service, or
+    /// `claim_imessage_number` to atomically claim and attach a new line.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_with_imessage_number(
+        &self,
+        display_name: Unset<String>,
+        description: Unset<String>,
+        imessage_enabled: Option<bool>,
+        imessage_filter_mode: Option<&str>,
+        mail_filter_mode: Option<&str>,
+        phone_filter_mode: Option<&str>,
+        imessage_number_id: Unset<Uuid>,
+        claim_imessage_number: Option<bool>,
+        idempotency_key: Option<&str>,
+    ) -> Result<()> {
+        self.update_with_contact_sharing_and_imessage_number(
+            display_name,
+            description,
+            imessage_enabled,
+            None,
+            imessage_filter_mode,
+            mail_filter_mode,
+            phone_filter_mode,
+            imessage_number_id,
+            claim_imessage_number,
+            idempotency_key,
+        )
+    }
+
+    /// Update this identity while explicitly controlling automatic contact
+    /// sharing and optionally changing its dedicated iMessage line atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_with_contact_sharing_and_imessage_number(
+        &self,
+        display_name: Unset<String>,
+        description: Unset<String>,
+        imessage_enabled: Option<bool>,
+        contact_sharing_enabled: Option<bool>,
+        imessage_filter_mode: Option<&str>,
+        mail_filter_mode: Option<&str>,
+        phone_filter_mode: Option<&str>,
+        imessage_number_id: Unset<Uuid>,
+        claim_imessage_number: Option<bool>,
+        idempotency_key: Option<&str>,
+    ) -> Result<()> {
+        let data = self
+            .inkbox
+            .identities()
+            .update_with_contact_sharing_and_imessage_number(
+                &self.agent_handle(),
+                display_name,
+                description,
+                imessage_enabled,
+                contact_sharing_enabled,
+                imessage_filter_mode,
+                mail_filter_mode,
+                phone_filter_mode,
+                imessage_number_id,
+                claim_imessage_number,
+                idempotency_key,
+            )?;
+        *self.mailbox.borrow_mut() = data.mailbox.clone();
+        *self.phone_number.borrow_mut() = data.phone_number.clone();
+        *self.tunnel.borrow_mut() = data.tunnel.clone();
+        *self.data.borrow_mut() = data;
+        Ok(())
+    }
+
+    /// Re-fetch this identity from the API and update cached channels.
+    pub fn refresh(&self) -> Result<()> {
+        let data = self.inkbox.identities().get(&self.agent_handle())?;
+        *self.mailbox.borrow_mut() = data.mailbox.clone();
+        *self.phone_number.borrow_mut() = data.phone_number.clone();
+        *self.tunnel.borrow_mut() = data.tunnel.clone();
+        *self.data.borrow_mut() = data;
+        Ok(())
+    }
+
+    /// Delete this identity.
+    ///
+    /// Cascades: flips the linked mailbox to `deleted`, force-finalizes the
+    /// linked tunnel to `deleted`, revokes any identity-scoped API keys, and
+    /// releases any linked phone number (vendor + local).
+    pub fn delete(&self) -> Result<()> {
+        self.inkbox.identities().delete(&self.agent_handle())
+    }
+
+    // -----------------------------------------------------------------------
+    // Vault / credentials (identity-scoped)
+    // -----------------------------------------------------------------------
+
+    /// Identity-scoped credential access. The vault must be unlocked first via
+    /// `inkbox.vault().unlock(...)`. Mirrors the Python `credentials` property
+    /// (built from the unlocked vault's decrypted secrets).
+    ///
+    /// Unlike Python this is not cached on the facade — each call rebuilds the
+    /// view from the current unlock snapshot, which is always consistent.
+    pub fn credentials(&self) -> Result<Credentials> {
+        let unlocked = self.require_vault_unlocked()?;
+        Ok(Credentials::new(unlocked.secrets()))
+    }
+
+    /// Revoke this identity's access to a vault secret.
+    pub fn revoke_credential_access(&self, secret_id: &str) -> Result<()> {
+        self.inkbox
+            .vault()
+            .revoke_access(secret_id, &self.id().to_string())
+    }
+
+    /// Create a vault secret and grant this identity access to it. The vault
+    /// must be unlocked first.
+    ///
+    /// Note: the new secret is not added to the in-memory unlock snapshot;
+    /// re-unlock the vault to surface it in [`Self::credentials`].
+    pub fn create_secret(
+        &self,
+        name: &str,
+        payload: &SecretPayload,
+        description: Option<&str>,
+    ) -> Result<VaultSecret> {
+        let mut unlocked = self.require_vault_unlocked()?;
+        let secret = unlocked.create_secret(name, payload, description)?;
+        self.inkbox
+            .vault()
+            .grant_access(&secret.id.to_string(), &self.id().to_string())?;
+        Ok(secret)
+    }
+
+    /// Fetch and decrypt a vault secret this identity has access to.
+    pub fn get_secret(&self, secret_id: &str) -> Result<DecryptedVaultSecret> {
+        let unlocked = self.require_vault_unlocked()?;
+        unlocked.get_secret(secret_id)
+    }
+
+    /// Add or replace TOTP on a login secret using a [`TOTPConfig`].
+    pub fn set_totp(&self, secret_id: &str, totp: TOTPConfig) -> Result<VaultSecret> {
+        let mut unlocked = self.require_vault_unlocked()?;
+        unlocked.set_totp(secret_id, totp)
+    }
+
+    /// Add or replace TOTP on a login secret from an `otpauth://totp/...` URI.
+    pub fn set_totp_uri(&self, secret_id: &str, uri: &str) -> Result<VaultSecret> {
+        let mut unlocked = self.require_vault_unlocked()?;
+        unlocked.set_totp_uri(secret_id, uri)
+    }
+
+    /// Remove TOTP from a login secret this identity has access to.
+    pub fn remove_totp(&self, secret_id: &str) -> Result<VaultSecret> {
+        let mut unlocked = self.require_vault_unlocked()?;
+        unlocked.remove_totp(secret_id)
+    }
+
+    /// Generate the current TOTP code for a login secret.
+    pub fn get_totp_code(&self, secret_id: &str) -> Result<TOTPCode> {
+        let unlocked = self.require_vault_unlocked()?;
+        unlocked.get_totp_code(secret_id)
+    }
+
+    /// Delete a vault secret this identity has access to.
+    pub fn delete_secret(&self, secret_id: &str) -> Result<()> {
+        let mut unlocked = self.require_vault_unlocked()?;
+        unlocked.delete_secret(secret_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal guards
+    // -----------------------------------------------------------------------
+
+    /// Return the unlocked vault snapshot or an error (mirrors
+    /// `_require_vault_unlocked`).
+    fn require_vault_unlocked(&self) -> Result<UnlockedVault> {
+        self.inkbox.vault().unlocked().ok_or_else(|| {
+            InkboxError::VaultKey(
+                "Vault has not been unlocked. Call inkbox.vault().unlock(vault_key) first.".into(),
+            )
+        })
+    }
+
+    /// Return the mailbox email address or an error (mirrors `_require_mailbox`).
+    fn require_mailbox(&self) -> Result<String> {
+        match self.mailbox.borrow().as_ref() {
+            Some(m) => Ok(m.email_address.clone()),
+            None => Err(InkboxError::InvalidArgument(format!(
+                "Identity '{}' has no mailbox — this should only be reachable on a deleted identity.",
+                self.agent_handle()
+            ))),
+        }
+    }
+
+    /// Return the phone-number id (as string) or an error (mirrors `_require_phone`).
+    fn require_phone_id(&self) -> Result<String> {
+        Ok(self.require_phone_number()?.id.to_string())
+    }
+
+    /// Return the phone number's E.164 string or an error.
+    fn require_phone(&self) -> Result<String> {
+        Ok(self.require_phone_number()?.number)
+    }
+
+    /// Shared phone-presence guard returning a clone of the channel.
+    fn require_phone_number(&self) -> Result<IdentityPhoneNumber> {
+        match self.phone_number.borrow().as_ref() {
+            Some(p) => Ok(p.clone()),
+            None => Err(InkboxError::InvalidArgument(format!(
+                "Identity '{}' has no phone number assigned. Call \
+                 identity.provision_phone_number() first, or pass phone_number to create_identity().",
+                self.agent_handle()
+            ))),
+        }
+    }
+
+    /// Error out when this identity is not iMessage-enabled (mirrors `_require_imessage`).
+    fn require_imessage(&self) -> Result<()> {
+        if !self.data.borrow().summary.imessage_enabled {
+            return Err(InkboxError::InvalidArgument(format!(
+                "Identity '{}' is not iMessage-enabled. Call \
+                 identity.update(imessage_enabled=True) first, or pass \
+                 imessage_enabled=True to create_identity().",
+                self.agent_handle()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for AgentIdentity {
+    /// Mirrors the Python `__repr__`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mailbox = self
+            .mailbox
+            .borrow()
+            .as_ref()
+            .map(|m| m.email_address.clone());
+        let phone = self
+            .phone_number
+            .borrow()
+            .as_ref()
+            .map(|p| p.number.clone());
+        f.debug_struct("AgentIdentity")
+            .field("agent_handle", &self.agent_handle())
+            .field("mailbox", &mailbox)
+            .field("phone", &phone)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use httpmock::prelude::*;
+    use serde_json::json;
+
+    use super::*;
+    use crate::identities::types::AgentIdentityData;
+    use crate::phone::types::{OnVoicemail, VoicemailDetection};
+
+    /// The fixture identity's UUID, shared by the scoping assertions below.
+    const IDENTITY_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+    /// Build an identity (optionally with a phone number) backed by a client
+    /// pointed at `base_url`.
+    fn identity_at(base_url: &str, with_phone: bool) -> AgentIdentity {
+        let mut payload = json!({
+            "id": IDENTITY_ID,
+            "organization_id": "org_x",
+            "agent_handle": "support-bot",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "updated_at": "2026-06-01T00:00:00+00:00",
+        });
+        if with_phone {
+            payload["phone_number"] = json!({
+                "id": "44444444-4444-4444-4444-444444444444",
+                "number": "+15550001111",
+                "type": "local",
+                "status": "active",
+                "incoming_call_action": "auto_reject",
+                "created_at": "2026-06-01T00:00:00+00:00",
+                "updated_at": "2026-06-01T00:00:00+00:00",
+            });
+        }
+        let data: AgentIdentityData = serde_json::from_value(payload).unwrap();
+        let inkbox = Inkbox::builder("test-key")
+            .base_url(base_url)
+            .build()
+            .unwrap();
+        AgentIdentity::new(data, inkbox)
+    }
+
+    fn imessage_identity_at(base_url: &str) -> AgentIdentity {
+        let identity = identity_at(base_url, false);
+        identity.data.borrow_mut().summary.imessage_enabled = true;
+        identity
+    }
+
+    #[test]
+    fn imessage_thread_reads_preserve_identity_scope_and_pagination() {
+        let server = MockServer::start();
+        let identity = imessage_identity_at(&server.base_url());
+        let message_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let conversation_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+        let thread_id = Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+        let message = json!({
+            "id": message_id, "conversation_id": conversation_id, "direction": "inbound",
+            "message_type": "message", "service": "imessage", "is_read": false,
+            "created_at": "2026-06-01T00:00:00Z", "updated_at": "2026-06-01T00:00:00Z",
+            "thread_id": thread_id, "thread_root_message_id": message_id,
+            "reply_to_message_id": null
+        });
+        let page = json!({
+            "thread_id": thread_id, "conversation_id": conversation_id,
+            "thread_root_message_id": message_id, "messages": [message],
+            "next_cursor": "next+/="
+        });
+        let read = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/api/v1/imessage/messages/{message_id}"))
+                .query_param("agent_identity_id", IDENTITY_ID);
+            then.status(200).json_body(message.clone());
+        });
+        let by_message = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/api/v1/imessage/messages/{message_id}/thread"))
+                .query_param("agent_identity_id", IDENTITY_ID)
+                .query_param("limit", "2")
+                .query_param("cursor", "prior+/=");
+            then.status(200).json_body(page.clone());
+        });
+        let by_conversation = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!(
+                    "/api/v1/imessage/conversations/{conversation_id}/threads/{thread_id}"
+                ))
+                .query_param("agent_identity_id", IDENTITY_ID)
+                .query_param("limit", "3")
+                .query_param("cursor", "next+/=");
+            then.status(200).json_body(page.clone());
+        });
+        let list = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/imessage/messages")
+                .query_param("agent_identity_id", IDENTITY_ID)
+                .query_param("conversation_id", conversation_id.to_string())
+                .query_param("thread_id", thread_id.to_string())
+                .query_param("limit", "4")
+                .query_param("offset", "8")
+                .query_param("is_read", "false")
+                .query_param("is_blocked", "false")
+                .query_param("include_groups", "true")
+                .query_param("start_datetime", "2026-06-01")
+                .query_param("end_datetime", "2026-06-02")
+                .query_param("tz", "America/New_York");
+            then.status(200).json_body(json!([message]));
+        });
+        let read_result = identity.get_imessage_with_thread(&message_id).unwrap();
+        assert_eq!(read_result.message.id, message_id);
+        assert_eq!(read_result.thread_id, Some(thread_id));
+        assert_eq!(read_result.reply_to_message_id, None);
+        let page_result = identity
+            .get_imessage_thread(&message_id, 2, Some("prior+/="))
+            .unwrap();
+        assert_eq!(
+            page_result.messages[0].thread_root_message_id,
+            Some(message_id)
+        );
+        assert_eq!(page_result.next_cursor.as_deref(), Some("next+/="));
+        let conversation_result = identity
+            .get_imessage_conversation_thread(
+                &conversation_id,
+                &thread_id,
+                3,
+                page_result.next_cursor.as_deref(),
+            )
+            .unwrap();
+        assert_eq!(conversation_result.thread_id, Some(thread_id));
+        assert_eq!(conversation_result.conversation_id, conversation_id);
+        let other_identity = Uuid::new_v4();
+        let options = IMessageThreadListOptions {
+            agent_identity_id: Some(other_identity),
+            conversation_id: Some(conversation_id),
+            thread_id: Some(thread_id),
+            limit: 4,
+            offset: 8,
+            is_read: Some(false),
+            is_blocked: Some(false),
+            include_groups: true,
+            date_range: DateRangeFilter {
+                start_datetime: Some("2026-06-01".into()),
+                end_datetime: Some("2026-06-02".into()),
+                tz: Some("America/New_York".into()),
+            },
+        };
+        let messages = identity.list_imessages_with_threads(&options).unwrap();
+        assert_eq!(messages[0].thread_id, Some(thread_id));
+        assert_eq!(options.agent_identity_id, Some(other_identity));
+        for request in [read, by_message, by_conversation, list] {
+            request.assert_hits(1);
+        }
+    }
+
+    #[test]
+    fn imessage_thread_helpers_reject_disabled_identity_before_http() {
+        let server = MockServer::start();
+        let request = server.mock(|when, then| {
+            when.method(GET);
+            then.status(500);
+        });
+        let identity = identity_at(&server.base_url(), false);
+        let id = Uuid::new_v4();
+        let errors = [
+            identity.get_imessage_with_thread(&id).err(),
+            identity.get_imessage_thread(&id, 50, None).err(),
+            identity
+                .get_imessage_conversation_thread(&id, &id, 50, None)
+                .err(),
+            identity
+                .list_imessages_with_threads(&IMessageThreadListOptions::default())
+                .err(),
+        ];
+        for error in errors {
+            assert!(matches!(error, Some(InkboxError::InvalidArgument(_))));
+        }
+        request.assert_hits(0);
+    }
+
+    #[test]
+    fn imessage_thread_identity_filter_requires_conversation_before_http() {
+        let server = MockServer::start();
+        let request = server.mock(|when, then| {
+            when.method(GET);
+            then.status(500);
+        });
+        let identity = imessage_identity_at(&server.base_url());
+        let result = identity.list_imessages_with_threads(&IMessageThreadListOptions {
+            thread_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        });
+        assert!(matches!(result, Err(InkboxError::InvalidArgument(_))));
+        request.assert_hits(0);
+    }
+
+    #[test]
+    fn imessage_reply_fallback_delegates_with_identity_and_request_key() {
+        let server = MockServer::start();
+        let identity = imessage_identity_at(&server.base_url());
+        let conversation = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        for plain_reply_fallback in [true, false] {
+            let send = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/api/v1/imessage/messages")
+                    .query_param("agent_identity_id", IDENTITY_ID)
+                    .header("Idempotency-Key", "reply-one")
+                    .json_body(json!({"conversation_id": conversation,
+                        "reply_to_message_id": target, "plain_reply_fallback": plain_reply_fallback,
+                        "text": "Agreed"}));
+                then.status(422)
+                    .json_body(json!({"detail": {"error": "imessage_reply_target_unavailable"}}));
+            });
+            let result = if plain_reply_fallback {
+                identity.send_imessage_reply(
+                    &conversation,
+                    &target,
+                    Some("Agreed"),
+                    None,
+                    None,
+                    Some("reply-one"),
+                )
+            } else {
+                identity.send_imessage_reply_with_fallback(
+                    &conversation,
+                    &target,
+                    Some("Agreed"),
+                    None,
+                    None,
+                    Some("reply-one"),
+                    false,
+                )
+            };
+            assert!(matches!(
+                result,
+                Err(InkboxError::Api {
+                    status_code: 422,
+                    ..
+                })
+            ));
+            send.assert_hits(1);
+        }
+    }
+
+    /// Build a phoneless identity backed by a client pointed at an unreachable
+    /// localhost port, so any real request fails fast instead of hanging.
+    fn phoneless_identity() -> AgentIdentity {
+        identity_at("http://127.0.0.1:1", false)
+    }
+
+    /// A `PhoneCall` response payload for the delegator tests.
+    fn call_json(origin: &str, local: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": "22222222-2222-2222-2222-222222222222",
+            "local_phone_number": local,
+            "remote_phone_number": "+15550002222",
+            "direction": "outbound",
+            "status": "initiated",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "updated_at": "2026-06-01T00:00:00+00:00",
+            "is_blocked": false,
+            "origin": origin
+        })
+    }
+
+    #[test]
+    fn list_phone_contact_rules_does_not_prethrow_without_phone() {
+        let identity = phoneless_identity();
+        // List must not prethrow the phone guard: with no server it surfaces a
+        // transport error, never InvalidArgument("no phone number").
+        if let Err(InkboxError::InvalidArgument(m)) =
+            identity.list_phone_contact_rules(None, None, None, None)
+        {
+            panic!("list prethrew the phone guard: {m}");
+        }
+    }
+
+    #[test]
+    fn phone_rule_mutations_delegate_without_a_phone_number() {
+        let identity = phoneless_identity();
+        let results = [
+            identity.get_phone_contact_rule("rid").err(),
+            identity
+                .create_phone_contact_rule(
+                    PhoneRuleAction::Block,
+                    "+14155550199",
+                    PhoneRuleMatchType::ExactNumber,
+                )
+                .err(),
+            identity
+                .update_phone_contact_rule("rid", PhoneRuleAction::Block)
+                .err(),
+            identity.delete_phone_contact_rule("rid").err(),
+        ];
+        for res in results {
+            assert!(res.is_some(), "the test transport has no listening server");
+            assert!(!matches!(res, Some(InkboxError::InvalidArgument(_))));
+        }
+    }
+
+    #[test]
+    fn place_call_dedicated_uses_identitys_own_number() {
+        let server = MockServer::start();
+        // Exact body: from_number is this identity's provisioned number, and
+        // no agent_identity_id key rides along for dedicated origination.
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "from_number": "+15550001111"
+                }));
+            then.status(200)
+                .json_body(call_json("dedicated_number", json!("+15550001111")));
+        });
+        let identity = identity_at(&server.base_url(), true);
+        let placed = identity
+            .place_call("+15550002222", CallOrigin::DedicatedNumber, None)
+            .unwrap();
+        mock.assert();
+        assert_eq!(placed.call.origin, CallOrigin::DedicatedNumber);
+    }
+
+    #[test]
+    fn place_call_shared_scopes_by_identity_id_without_phone() {
+        let server = MockServer::start();
+        // Exact body: identity id in, from_number key never serialized. A
+        // phoneless identity proves shared origination needs no number.
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "shared_imessage_number",
+                    "agent_identity_id": IDENTITY_ID
+                }));
+            then.status(200)
+                .json_body(call_json("shared_imessage_number", serde_json::Value::Null));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        let placed = identity
+            .place_call("+15550002222", CallOrigin::SharedImessageNumber, None)
+            .unwrap();
+        mock.assert();
+        assert_eq!(placed.call.origin, CallOrigin::SharedImessageNumber);
+        assert_eq!(placed.call.local_phone_number, None);
+    }
+
+    #[test]
+    fn place_call_forwards_client_websocket_url() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "shared_imessage_number",
+                    "agent_identity_id": IDENTITY_ID,
+                    "client_websocket_url": "wss://example.com/audio"
+                }));
+            then.status(200)
+                .json_body(call_json("shared_imessage_number", serde_json::Value::Null));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        identity
+            .place_call(
+                "+15550002222",
+                CallOrigin::SharedImessageNumber,
+                Some("wss://example.com/audio"),
+            )
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn place_call_with_options_forwards_voicemail_detection() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "from_number": "+15550001111",
+                    "voicemail_detection": "disabled"
+                }));
+            then.status(200)
+                .json_body(call_json("dedicated_number", json!("+15550001111")));
+        });
+        let identity = identity_at(&server.base_url(), true);
+        identity
+            .place_call_with_options(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                None,
+                &CallPlacementOptions {
+                    voicemail_detection: Some(VoicemailDetection::Disabled),
+                    on_voicemail: None,
+                    voicemail_message: None,
+                },
+            )
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn place_call_with_options_forwards_on_voicemail() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "from_number": "+15550001111",
+                    "on_voicemail": "hang_up"
+                }));
+            then.status(200)
+                .json_body(call_json("dedicated_number", json!("+15550001111")));
+        });
+        let identity = identity_at(&server.base_url(), true);
+        identity
+            .place_call_with_options(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                None,
+                &CallPlacementOptions {
+                    on_voicemail: Some(OnVoicemail::HangUp),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn place_hosted_call_dedicated_uses_identitys_own_number() {
+        let server = MockServer::start();
+        // Exact body: hosted_agent mode + reason ride the wire, no ws-url key.
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "dedicated_number",
+                    "mode": "hosted_agent",
+                    "reason": "Book a cleaning next week",
+                    "from_number": "+15550001111"
+                }));
+            then.status(200).json_body({
+                let mut v = call_json("dedicated_number", json!("+15550001111"));
+                v["mode"] = json!("hosted_agent");
+                v["reason"] = json!("Book a cleaning next week");
+                v
+            });
+        });
+        let identity = identity_at(&server.base_url(), true);
+        let placed = identity
+            .place_hosted_call(
+                "+15550002222",
+                CallOrigin::DedicatedNumber,
+                "Book a cleaning next week",
+            )
+            .unwrap();
+        mock.assert();
+        assert_eq!(placed.call.mode, "hosted_agent");
+        assert_eq!(
+            placed.call.reason.as_deref(),
+            Some("Book a cleaning next week")
+        );
+    }
+
+    #[test]
+    fn place_hosted_call_shared_scopes_by_identity_id() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "shared_imessage_number",
+                    "mode": "hosted_agent",
+                    "reason": "Confirm the appointment",
+                    "agent_identity_id": IDENTITY_ID
+                }));
+            then.status(200)
+                .json_body(call_json("shared_imessage_number", serde_json::Value::Null));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        identity
+            .place_hosted_call(
+                "+15550002222",
+                CallOrigin::SharedImessageNumber,
+                "Confirm the appointment",
+            )
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn place_hosted_call_with_options_forwards_voicemail_detection() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "shared_imessage_number",
+                    "mode": "hosted_agent",
+                    "reason": "Leave a voicemail",
+                    "agent_identity_id": IDENTITY_ID,
+                    "voicemail_detection": "disabled"
+                }));
+            then.status(200)
+                .json_body(call_json("shared_imessage_number", serde_json::Value::Null));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        identity
+            .place_hosted_call_with_options(
+                "+15550002222",
+                CallOrigin::SharedImessageNumber,
+                "Leave a voicemail",
+                &HostedCallPlacementOptions {
+                    authority_mode: None,
+                    voicemail_detection: Some(VoicemailDetection::Disabled),
+                    on_voicemail: None,
+                    voicemail_message: None,
+                },
+            )
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn place_hosted_call_with_options_forwards_on_voicemail_and_message() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/place-call")
+                .json_body(json!({
+                    "to_number": "+15550002222",
+                    "origination": "shared_imessage_number",
+                    "mode": "hosted_agent",
+                    "reason": "Confirm the appointment",
+                    "agent_identity_id": IDENTITY_ID,
+                    "on_voicemail": "leave_message",
+                    "voicemail_message": "Please call us back."
+                }));
+            then.status(200)
+                .json_body(call_json("shared_imessage_number", serde_json::Value::Null));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        identity
+            .place_hosted_call_with_options(
+                "+15550002222",
+                CallOrigin::SharedImessageNumber,
+                "Confirm the appointment",
+                &HostedCallPlacementOptions {
+                    on_voicemail: Some(OnVoicemail::LeaveMessage),
+                    voicemail_message: Some("Please call us back.".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn hosted_agent_config_scopes_by_own_identity_id() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/hosted-agent-config")
+                .query_param("agent_identity_id", IDENTITY_ID);
+            then.status(200).json_body(json!({
+                "agent_identity_id": IDENTITY_ID,
+                "voice": "warm-voice",
+                "model": null,
+                "effective_voice": "warm-voice",
+                "effective_model": "realtime-default",
+                "instructions": null
+            }));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        let config = identity.hosted_agent_config().unwrap();
+        mock.assert();
+        assert_eq!(config.voice.as_deref(), Some("warm-voice"));
+        assert_eq!(config.model, None);
+    }
+
+    #[test]
+    fn set_hosted_agent_config_forwards_args_and_own_identity_id() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/api/v1/phone/hosted-agent-config")
+                .json_body(json!({
+                    "agent_identity_id": IDENTITY_ID,
+                    "voice": "warm-voice",
+                    "instructions": "Be brief."
+                }));
+            then.status(200).json_body(json!({
+                "agent_identity_id": IDENTITY_ID,
+                "voice": "warm-voice",
+                "model": null,
+                "effective_voice": "warm-voice",
+                "effective_model": "realtime-default",
+                "instructions": "Be brief."
+            }));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        let config = identity
+            .set_hosted_agent_config(Some("warm-voice"), None, Some("Be brief."))
+            .unwrap();
+        mock.assert();
+        assert_eq!(config.instructions.as_deref(), Some("Be brief."));
+    }
+
+    #[test]
+    fn list_calls_scopes_by_own_identity_id() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls")
+                .query_param("agent_identity_id", IDENTITY_ID)
+                .query_param("limit", "10")
+                .query_param("offset", "2")
+                .query_param("is_blocked", "false");
+            then.status(200).json_body(json!([call_json(
+                "dedicated_number",
+                json!("+15550001111")
+            )]));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        let calls = identity.list_calls(10, 2, Some(false)).unwrap();
+        mock.assert();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn filtered_group_imessage_lists_scope_by_identity_and_preserve_date_filters() {
+        let server = MockServer::start();
+        let message_list = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/imessage/messages")
+                .query_param("agent_identity_id", IDENTITY_ID)
+                .query_param("limit", "25")
+                .query_param("offset", "5")
+                .query_param("is_read", "false")
+                .query_param("is_blocked", "false")
+                .query_param("include_groups", "true")
+                .query_param("start_datetime", "2026-07-01")
+                .query_param("end_datetime", "2026-07-02")
+                .query_param("tz", "America/New_York");
+            then.status(200).json_body(json!([]));
+        });
+        let conversation_list = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/imessage/conversations")
+                .query_param("agent_identity_id", IDENTITY_ID)
+                .query_param("limit", "25")
+                .query_param("offset", "5")
+                .query_param("is_blocked", "false")
+                .query_param("include_groups", "true")
+                .query_param("start_datetime", "2026-07-01")
+                .query_param("end_datetime", "2026-07-02")
+                .query_param("tz", "America/New_York");
+            then.status(200).json_body(json!([]));
+        });
+        let identity = imessage_identity_at(&server.base_url());
+        let filter = DateRangeFilter {
+            start_datetime: Some("2026-07-01".into()),
+            end_datetime: Some("2026-07-02".into()),
+            tz: Some("America/New_York".into()),
+        };
+
+        identity
+            .list_imessages_filtered_with_groups(
+                None,
+                25,
+                5,
+                Some(false),
+                Some(false),
+                &filter,
+                true,
+            )
+            .unwrap();
+        identity
+            .list_imessage_conversations_filtered_with_groups(25, 5, Some(false), &filter, true)
+            .unwrap();
+
+        message_list.assert();
+        conversation_list.assert();
+    }
+
+    #[test]
+    fn hangup_call_delegates_to_calls_resource() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/phone/calls/22222222-2222-2222-2222-222222222222/hangup");
+            then.status(200).json_body(json!({
+                "id": "22222222-2222-2222-2222-222222222222",
+                "local_phone_number": "+15550001111",
+                "remote_phone_number": "+15550002222",
+                "direction": "outbound",
+                "status": "answered",
+                "hangup_reason": "local",
+                "created_at": "2026-06-01T00:00:00+00:00",
+                "updated_at": "2026-06-01T00:00:01+00:00",
+                "is_blocked": false,
+                "origin": "dedicated_number"
+            }));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        let call = identity
+            .hangup_call("22222222-2222-2222-2222-222222222222")
+            .unwrap();
+        mock.assert();
+        assert_eq!(call.hangup_reason.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn list_transcripts_delegates_to_calls_resource() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls/22222222-2222-2222-2222-222222222222/transcripts");
+            then.status(200).json_body(json!([{
+                "id": "55555555-5555-5555-5555-555555555555",
+                "call_id": "22222222-2222-2222-2222-222222222222",
+                "seq": 0,
+                "ts_ms": 0,
+                "party": "remote",
+                "text": "Hi",
+                "created_at": "2026-06-01T00:00:02+00:00"
+            }]));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        let segments = identity
+            .list_transcripts("22222222-2222-2222-2222-222222222222")
+            .unwrap();
+        mock.assert();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "Hi");
+    }
+
+    #[test]
+    fn list_tool_invocations_delegates_to_calls_resource() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/calls/22222222-2222-2222-2222-222222222222/tool-invocations")
+                .query_param("limit", "10")
+                .query_param("offset", "20");
+            then.status(200).json_body(json!({
+                "items": [],
+                "limit": 10,
+                "offset": 20,
+                "has_more": false
+            }));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        let page = identity
+            .list_tool_invocations("22222222-2222-2222-2222-222222222222", 10, 20)
+            .unwrap();
+        mock.assert();
+        assert!(page.items.is_empty());
+        assert_eq!(page.offset, 20);
+    }
+
+    #[test]
+    fn get_incoming_call_action_scopes_by_own_identity_id() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/phone/incoming-call-action")
+                .query_param("agent_identity_id", IDENTITY_ID);
+            then.status(200).json_body(json!({
+                "agent_identity_id": IDENTITY_ID,
+                "incoming_call_action": "auto_accept",
+                "client_websocket_url": "wss://example.com/audio"
+            }));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        let config = identity.get_incoming_call_action().unwrap();
+        mock.assert();
+        assert_eq!(config.incoming_call_action, IncomingCallAction::AutoAccept);
+        assert_eq!(config.agent_identity_id.to_string(), IDENTITY_ID);
+    }
+
+    #[test]
+    fn set_incoming_call_action_forwards_args_and_own_identity_id() {
+        let server = MockServer::start();
+        // Exact PUT body: action + this identity's id + both forwarded URLs.
+        let mock = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/api/v1/phone/incoming-call-action")
+                .json_body(json!({
+                    "incoming_call_action": "webhook",
+                    "agent_identity_id": IDENTITY_ID,
+                    "client_websocket_url": "wss://example.com/audio",
+                    "incoming_call_webhook_url": "https://example.com/route"
+                }));
+            then.status(200).json_body(json!({
+                "agent_identity_id": IDENTITY_ID,
+                "incoming_call_action": "webhook",
+                "client_websocket_url": "wss://example.com/audio",
+                "incoming_call_webhook_url": "https://example.com/route"
+            }));
+        });
+        let identity = identity_at(&server.base_url(), false);
+        let config = identity
+            .set_incoming_call_action(
+                IncomingCallAction::Webhook,
+                Some("wss://example.com/audio"),
+                Some("https://example.com/route"),
+            )
+            .unwrap();
+        mock.assert();
+        assert_eq!(config.incoming_call_action, IncomingCallAction::Webhook);
+        assert_eq!(
+            config.incoming_call_webhook_url.as_deref(),
+            Some("https://example.com/route")
+        );
+    }
+
+    #[test]
+    fn number_aware_update_uses_detailed_patch_response() {
+        let server = MockServer::start();
+        let patch = server.mock(|when, then| {
+            when.method("PATCH")
+                .path("/api/v1/identities/support-bot")
+                .header("Idempotency-Key", "identity-claim-123")
+                .json_body(json!({
+                    "claim_imessage_number": true
+                }));
+            then.status(200).json_body(json!({
+                "id": IDENTITY_ID,
+                "organization_id": "org_x",
+                "agent_handle": "support-bot",
+                "created_at": "2026-06-01T00:00:00+00:00",
+                "updated_at": "2026-06-01T00:00:01+00:00",
+                "imessage_enabled": true,
+                "imessage_number": {
+                    "id": "66666666-6666-6666-6666-666666666666",
+                    "number": "+15550006666",
+                    "type": "dedicated_outbound"
+                }
+            }));
+        });
+
+        let identity = identity_at(&server.base_url(), false);
+        identity
+            .update_with_imessage_number(
+                Unset::Omit,
+                Unset::Omit,
+                None,
+                None,
+                None,
+                None,
+                Unset::Omit,
+                Some(true),
+                Some("identity-claim-123"),
+            )
+            .unwrap();
+        patch.assert();
+        let number = identity.imessage_number().unwrap();
+        assert_eq!(number.number, "+15550006666");
+        assert_eq!(number.r#type, "dedicated_outbound");
+    }
+
+    #[test]
+    fn disabling_imessage_uses_detailed_response_for_detached_number() {
+        let server = MockServer::start();
+        let patch = server.mock(|when, then| {
+            when.method("PATCH")
+                .path("/api/v1/identities/support-bot")
+                .json_body(json!({ "imessage_enabled": false }));
+            then.status(200).json_body(json!({
+                "id": IDENTITY_ID,
+                "organization_id": "org_x",
+                "agent_handle": "support-bot",
+                "created_at": "2026-06-01T00:00:00+00:00",
+                "updated_at": "2026-06-01T00:00:01+00:00",
+                "imessage_enabled": false,
+                "imessage_number": null
+            }));
+        });
+
+        let identity = identity_at(&server.base_url(), false);
+        identity.data.borrow_mut().imessage_number = Some(IdentityIMessageNumber {
+            id: Uuid::parse_str("66666666-6666-6666-6666-666666666666").unwrap(),
+            number: "+15550006666".into(),
+            r#type: "dedicated_outbound".into(),
+        });
+        identity
+            .update(Unset::Omit, Unset::Omit, Some(false), None, None, None)
+            .unwrap();
+
+        patch.assert();
+        assert!(identity.imessage_number().is_none());
+    }
+}

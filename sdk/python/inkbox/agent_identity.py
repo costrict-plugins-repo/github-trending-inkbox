@@ -1,0 +1,2269 @@
+"""
+inkbox/agent_identity.py
+
+AgentIdentity: a domain object representing one agent identity.
+Returned by inkbox.create_identity() and inkbox.get_identity().
+
+Convenience methods (send_email, place_call, etc.) are scoped to this
+agent's assigned channels so callers never need to pass an email address
+or phone number ID explicitly.
+"""
+
+from __future__ import annotations
+from inkbox.contact_rules import ContactRuleDirection, _UNSET as _RULE_UNSET, _direction_fields, _rule_update
+
+from inkbox.contacts.resources.communication_policy import ContactCommunicationPolicyPage
+
+from typing import TYPE_CHECKING, Any, Iterator, Literal
+from uuid import UUID
+
+from inkbox.credentials import Credentials
+from inkbox.a2a.client import A2AClient
+from inkbox.a2a.resource import skills_wire
+from inkbox.a2a.types import (
+    A2AContactRule,
+    A2AContext,
+    A2AContextPage,
+    A2AHistoryDirection,
+    A2AHistoryMessage,
+    A2AHistoryMessagePage,
+    A2AMessageRole,
+    A2AReplyIntent,
+    A2ARuleAction,
+    A2ARuleDirection,
+    A2ASettings,
+    A2ASkill,
+    A2ATask,
+    A2ATaskPage,
+    A2ATaskState,
+)
+from inkbox.vault.totp import TOTPCode, TOTPConfig
+from inkbox.vault.types import DecryptedVaultSecret, SecretPayload, VaultSecret
+from inkbox.identities.types import (
+    _UNSET,
+    _AgentIdentityData,
+    IdentityIMessageNumber,
+    IdentityMailbox,
+    IdentityPhoneNumber,
+)
+from inkbox.tunnels.types import TunnelSummary
+from inkbox.exceptions import InkboxError
+from inkbox.imessage.types import (
+    IMessage,
+    IMessageThread,
+    IMessageAssignment,
+    IMessageConversation,
+    IMessageConversationSummary,
+    IMessageMarkReadResult,
+    IMessageMediaUpload,
+    IMessageReaction,
+    IMessageReactionType,
+    IMessageSendStyle,
+)
+from inkbox.mail.types import (
+    DraftDetail,
+    DraftSummary,
+    FilterMode,
+    ForwardMode,
+    MailIdentityContactRule,
+    MailRuleAction,
+    MailRuleMatchType,
+    Message,
+    MessageDetail,
+    MessageDirection,
+    ThreadDetail,
+)
+from inkbox.phone.types import (
+    CallMode,
+    CallOrigin,
+    HostedAgentAuthorityMode,
+    HostedAgentConfig,
+    HostedAgentToolInvocationPage,
+    IncomingCallAction,
+    IncomingCallActionConfig,
+    PhoneCall,
+    PhoneCallWithRateLimit,
+    PhoneIdentityContactRule,
+    PhoneRuleAction,
+    PhoneRuleMatchType,
+    PhoneTranscript,
+    TextConversationSummary,
+    OnVoicemail,
+    VoicemailDetection,
+    TextConversationUpdateResult,
+    TextMessage,
+)
+from inkbox.signing_keys import SigningKey, SigningKeyStatus
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from inkbox.client import Inkbox
+
+# `_UNSET` is imported from inkbox.identities.types above. Identity-based
+# `is not _UNSET` checks must compare against the SAME object across all
+# layers; a module-local `object()` here would leak the sentinel through
+# to the wire body and crash JSON encoding.
+
+
+class AgentIdentity:
+    """An agent identity with convenience methods for its assigned channels.
+
+    Obtain an instance via::
+
+        identity = inkbox.create_identity("support-bot")
+        # or
+        identity = inkbox.get_identity("support-bot")
+
+    If the identity has a mailbox, you can communicate directly::
+
+        identity.send_email(to=["user@example.com"], subject="Hi", body_text="Hello")
+        identity.place_call(to_number="+15555550100", client_websocket_url="wss://my-app.com/ws")
+
+        for msg in identity.iter_emails():
+            print(msg.subject)
+    """
+
+    def __init__(self, data: _AgentIdentityData, inkbox: Inkbox) -> None:
+        self._data = data
+        self._inkbox = inkbox
+        self._mailbox: IdentityMailbox | None = data.mailbox
+        self._phone_number: IdentityPhoneNumber | None = data.phone_number
+        self._imessage_number: IdentityIMessageNumber | None = data.imessage_number
+        self._tunnel: TunnelSummary | None = data.tunnel
+        self._credentials: Credentials | None = None
+        self._credentials_vault_ref: object | None = (
+            None  # tracks which _unlocked built the cache
+        )
+
+    ## Identity properties
+
+    @property
+    def agent_handle(self) -> str:
+        return self._data.agent_handle
+
+    @property
+    def id(self):
+        return self._data.id
+
+    @property
+    def display_name(self) -> str | None:
+        """Human-readable display name. Defaults server-side to ``agent_handle`` if unset."""
+        return self._data.display_name
+
+    @property
+    def description(self) -> str | None:
+        """Free-form org-internal description, or ``None`` if unset.
+
+        Never surfaces in outbound mail / call audio / public payloads.
+        """
+        return self._data.description
+
+    @property
+    def email_address(self) -> str | None:
+        """The email address assigned to this identity at creation time.
+
+        Always trust this value — do not derive it from ``agent_handle``.
+        """
+        return self._data.email_address
+
+    @property
+    def imessage_enabled(self) -> bool:
+        """Whether this identity can use iMessage."""
+        return self._data.imessage_enabled
+
+    @property
+    def contact_sharing_enabled(self) -> bool:
+        """Whether an attached dedicated iMessage line shares this profile."""
+        return self._data.contact_sharing_enabled
+
+    @property
+    def imessage_filter_mode(self) -> FilterMode:
+        """Whitelist/blacklist mode for this identity's iMessage contact rules."""
+        return self._data.imessage_filter_mode
+
+    @property
+    def mail_filter_mode(self) -> FilterMode:
+        """Whitelist/blacklist mode for this identity's mail contact rules."""
+        return self._data.mail_filter_mode
+
+    @property
+    def slack_filter_mode(self) -> FilterMode:
+        return self._data.slack_filter_mode
+
+    @property
+    def slack_inbound_filter_mode(self) -> FilterMode:
+        return self._data.slack_inbound_filter_mode
+
+    @property
+    def slack_outbound_filter_mode(self) -> FilterMode:
+        return self._data.slack_outbound_filter_mode
+
+    @property
+    def phone_filter_mode(self) -> FilterMode:
+        """Whitelist/blacklist mode for this identity's phone contact rules."""
+        return self._data.phone_filter_mode
+
+    @property
+    def mail_inbound_filter_mode(self) -> FilterMode:
+        return self._data.mail_inbound_filter_mode
+
+    @property
+    def mail_outbound_filter_mode(self) -> FilterMode:
+        return self._data.mail_outbound_filter_mode
+
+    @property
+    def phone_inbound_filter_mode(self) -> FilterMode:
+        return self._data.phone_inbound_filter_mode
+
+    @property
+    def phone_outbound_filter_mode(self) -> FilterMode:
+        return self._data.phone_outbound_filter_mode
+
+    @property
+    def signing_key_configured(self) -> bool:
+        """Whether this identity has a webhook signing key configured (status only)."""
+        return self._data.signing_key_configured
+
+    @property
+    def signing_key_created_at(self) -> datetime | None:
+        """When this identity's signing key was created, or ``None`` if unset."""
+        return self._data.signing_key_created_at
+
+    @property
+    def mailbox(self) -> IdentityMailbox | None:
+        """Mailbox linked to this identity, when included."""
+        return self._mailbox
+
+    @property
+    def phone_number(self) -> IdentityPhoneNumber | None:
+        return self._phone_number
+
+    @property
+    def imessage_number(self) -> IdentityIMessageNumber | None:
+        """Dedicated iMessage line attached to this identity, if any."""
+        return self._imessage_number
+
+    @property
+    def tunnel(self) -> TunnelSummary | None:
+        """Summary of this identity's tunnel, when included. For connection
+        state and certificate material, fetch the full tunnel with
+        ``inkbox.tunnels.get(identity.tunnel.id)``.
+        """
+        return self._tunnel
+
+    @property
+    def credentials(self) -> Credentials:
+        """Identity-scoped credential access.
+
+        Returns a :class:`~inkbox.credentials.Credentials` object filtered
+        to the secrets this identity has been granted access to.  The vault
+        must be unlocked first via ``inkbox.vault.unlock(vault_key)``.
+
+        The result is cached and automatically invalidated when the
+        vault is re-unlocked.  Call :meth:`refresh` to manually clear
+        the cache (e.g. after access-rule changes).
+
+        Raises:
+            InkboxError: If the vault has not been unlocked.
+        """
+        vault = self._inkbox._vault_resource
+        # Invalidate cache if the vault was re-unlocked since we last built it.
+        if (
+            self._credentials is not None
+            and vault._unlocked is self._credentials_vault_ref
+        ):
+            return self._credentials
+        self._require_vault_unlocked()
+        unlocked = vault._unlocked
+        self._credentials = Credentials(unlocked.secrets)  # type: ignore[union-attr]
+        self._credentials_vault_ref = unlocked
+        return self._credentials
+
+    def revoke_credential_access(self, secret_id: UUID | str) -> None:
+        """
+        Revoke this identity's access to a vault secret.
+
+        Also clears the credentials cache so the next access to
+        :attr:`credentials` reflects the change.
+
+        Args:
+            secret_id: UUID of the secret to revoke access from.
+        """
+        self._inkbox._vault_resource.revoke_access(
+            secret_id,
+            identity_id=self.id,
+        )
+        self._credentials = None
+
+    ## Vault secret management
+
+    def create_secret(
+        self,
+        name: str,
+        payload: SecretPayload,
+        *,
+        description: str | None = None,
+    ) -> VaultSecret:
+        """Create a vault secret and grant this identity access to it.
+
+        The vault must be unlocked first.
+
+        Args:
+            name: Display name (max 255 characters).
+            payload: One of :class:`LoginPayload`, :class:`SSHKeyPayload`,
+                :class:`APIKeyPayload`, or :class:`OtherPayload`.
+            description: Optional description.
+
+        Returns:
+            :class:`~inkbox.vault.types.VaultSecret` metadata.
+        """
+        self._require_vault_unlocked()
+        unlocked = self._inkbox._vault_resource._unlocked
+        secret = unlocked.create_secret(name, payload, description=description)  # type: ignore[union-attr]
+        self._inkbox._vault_resource.grant_access(
+            str(secret.id),
+            identity_id=str(self.id),
+        )
+        self._credentials = None  # invalidate cache
+        return secret
+
+    def get_secret(self, secret_id: UUID | str) -> DecryptedVaultSecret:
+        """Fetch and decrypt a vault secret this identity has access to.
+
+        Args:
+            secret_id: UUID of the secret.
+
+        Returns:
+            :class:`~inkbox.vault.types.DecryptedVaultSecret`.
+        """
+        self._require_vault_unlocked()
+        unlocked = self._inkbox._vault_resource._unlocked
+        return unlocked.get_secret(secret_id)  # type: ignore[union-attr]
+
+    def set_totp(
+        self,
+        secret_id: UUID | str,
+        totp: TOTPConfig | str,
+    ) -> VaultSecret:
+        """Add or replace TOTP on a login secret this identity has access to.
+
+        Args:
+            secret_id: UUID of the login secret.
+            totp: A :class:`~inkbox.vault.totp.TOTPConfig` or an
+                ``otpauth://totp/...`` URI string.
+
+        Returns:
+            Updated :class:`~inkbox.vault.types.VaultSecret` metadata.
+        """
+        self._require_vault_unlocked()
+        unlocked = self._inkbox._vault_resource._unlocked
+        result = unlocked.set_totp(secret_id, totp)  # type: ignore[union-attr]
+        self._credentials = None
+        return result
+
+    def remove_totp(self, secret_id: UUID | str) -> VaultSecret:
+        """Remove TOTP from a login secret this identity has access to.
+
+        Args:
+            secret_id: UUID of the login secret.
+
+        Returns:
+            Updated :class:`~inkbox.vault.types.VaultSecret` metadata.
+        """
+        self._require_vault_unlocked()
+        unlocked = self._inkbox._vault_resource._unlocked
+        result = unlocked.remove_totp(secret_id)  # type: ignore[union-attr]
+        self._credentials = None
+        return result
+
+    def get_totp_code(self, secret_id: UUID | str) -> TOTPCode:
+        """Generate the current TOTP code for a login secret.
+
+        Args:
+            secret_id: UUID of the login secret.
+
+        Returns:
+            A :class:`~inkbox.vault.totp.TOTPCode`.
+        """
+        self._require_vault_unlocked()
+        unlocked = self._inkbox._vault_resource._unlocked
+        return unlocked.get_totp_code(secret_id)  # type: ignore[union-attr]
+
+    def delete_secret(self, secret_id: UUID | str) -> None:
+        """Delete a vault secret and revoke this identity's access.
+
+        Args:
+            secret_id: UUID of the secret to delete.
+        """
+        self._require_vault_unlocked()
+        unlocked = self._inkbox._vault_resource._unlocked
+        unlocked.delete_secret(secret_id)  # type: ignore[union-attr]
+        self._credentials = None
+
+    ## Channel management
+
+    def provision_phone_number(
+        self, *, type: str = "local", state: str | None = None
+    ) -> IdentityPhoneNumber:
+        """Provision a new phone number and link it to this identity.
+
+        Args:
+            type: Number type to provision. Only ``"local"`` is supported. Defaults to ``"local"``.
+            state: US state abbreviation (e.g. ``"NY"``) to request a number in that state.
+
+        Returns:
+            The newly provisioned and linked phone number.
+        """
+        self._inkbox._numbers.provision(
+            agent_handle=self.agent_handle, type=type, state=state
+        )
+        data = self._inkbox._ids_resource.get(self.agent_handle)
+        self._phone_number = data.phone_number
+        self._data = data
+        return self._phone_number  # type: ignore[return-value]
+
+    def release_phone_number(self) -> None:
+        """Release this identity's phone number (vendor + local)."""
+        self._require_phone()
+        self._inkbox._ids_resource.release_phone_number(self.agent_handle)
+        self._phone_number = None
+
+    ## Mail helpers
+
+    def iter_email_drafts(self, *, page_size: int = 50) -> Iterator[DraftSummary]:
+        """Iterate over this identity's email drafts, newest first."""
+        self._require_mailbox()
+        return self._inkbox._drafts.list(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            page_size=page_size,
+        )
+
+    def create_email_draft(
+        self,
+        *,
+        to: list[str] | None = None,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        subject: str | None = None,
+        body_text: str | None = None,
+        body_html: str | None = None,
+        reply_to: str | None = None,
+        thread_id: UUID | str | None = None,
+        in_reply_to_message_id: str | None = None,
+        references: list[str] | None = None,
+        forward_message_id: UUID | str | None = None,
+        forward_mode: Any = _UNSET,
+        forward_note_text: Any = _UNSET,
+        forward_note_html: Any = _UNSET,
+        include_original_attachments: Any = _UNSET,
+        attachments: list[dict[str, str]] | None = None,
+        track_opens: bool = False,
+        idempotency_key: str | None = None,
+    ) -> DraftDetail:
+        """Create an email draft in this identity's mailbox."""
+        self._require_mailbox()
+        return self._inkbox._drafts.create(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            reply_to=reply_to,
+            thread_id=thread_id,
+            in_reply_to_message_id=in_reply_to_message_id,
+            references=references,
+            forward_message_id=forward_message_id,
+            forward_mode=forward_mode,
+            forward_note_text=forward_note_text,
+            forward_note_html=forward_note_html,
+            include_original_attachments=include_original_attachments,
+            attachments=attachments,
+            track_opens=track_opens,
+            idempotency_key=idempotency_key,
+        )
+
+    def get_email_draft(self, draft_id: UUID | str) -> DraftDetail:
+        """Get one email draft from this identity's mailbox."""
+        self._require_mailbox()
+        return self._inkbox._drafts.get(
+            self._mailbox.email_address,
+            draft_id,  # type: ignore[union-attr]
+        )
+
+    def update_email_draft(
+        self,
+        draft_id: UUID | str,
+        *,
+        generation: int,
+        recipients: Any = _UNSET,
+        subject: Any = _UNSET,
+        body_text: Any = _UNSET,
+        body_html: Any = _UNSET,
+        reply_to: Any = _UNSET,
+        thread_id: Any = _UNSET,
+        in_reply_to_message_id: Any = _UNSET,
+        references: Any = _UNSET,
+        track_opens: Any = _UNSET,
+        forward_note_text: Any = _UNSET,
+        forward_note_html: Any = _UNSET,
+    ) -> DraftDetail:
+        """Update supplied fields on an email draft."""
+        self._require_mailbox()
+        return self._inkbox._drafts.update(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            draft_id,
+            generation=generation,
+            recipients=recipients,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            reply_to=reply_to,
+            thread_id=thread_id,
+            in_reply_to_message_id=in_reply_to_message_id,
+            references=references,
+            track_opens=track_opens,
+            forward_note_text=forward_note_text,
+            forward_note_html=forward_note_html,
+        )
+
+    def duplicate_email_draft(
+        self, draft_id: UUID | str, *, generation: int
+    ) -> DraftDetail:
+        """Create an independent copy of an email draft."""
+        self._require_mailbox()
+        return self._inkbox._drafts.duplicate(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            draft_id,
+            generation=generation,
+        )
+
+    def delete_email_draft(self, draft_id: UUID | str, *, generation: int) -> None:
+        """Delete an email draft."""
+        self._require_mailbox()
+        self._inkbox._drafts.delete(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            draft_id,
+            generation=generation,
+        )
+
+    def send_email_draft(self, draft_id: UUID | str, *, generation: int) -> Message:
+        """Send an email draft."""
+        self._require_mailbox()
+        return self._inkbox._drafts.send(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            draft_id,
+            generation=generation,
+        )
+
+    def send_email(
+        self,
+        *,
+        to: list[str],
+        subject: str,
+        body_text: str | None = None,
+        body_html: str | None = None,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        in_reply_to_message_id: str | None = None,
+        attachments: list[dict] | None = None,
+        track_opens: bool = False,
+        idempotency_key: str | None = None,
+    ) -> Message:
+        """Send an email from this identity's mailbox.
+
+        Args:
+            to: Primary recipient addresses (at least one required).
+            subject: Email subject line.
+            body_text: Plain-text body.
+            body_html: HTML body.
+            cc: Carbon-copy recipients.
+            bcc: Blind carbon-copy recipients.
+            in_reply_to_message_id: RFC 5322 Message-ID to thread a reply.
+            attachments: List of file attachment dicts with ``filename``,
+                ``content_type``, and ``content_base64`` keys. Add ``content_id``
+                to render an entry inline in the HTML body (``cid:<content_id>``);
+                requires ``body_html`` and an ``image/*`` ``content_type``.
+            track_opens: Embed an open-tracking pixel when ``body_html`` is
+                present; opens surface as ``first_opened_at``/``open_count``.
+            idempotency_key: Makes this send safe to retry — see
+                :meth:`inkbox.mail.resources.messages.MessagesResource.send`.
+
+        Raises:
+            StorageLimitExceededError: 402 — the mailbox is at its plan's
+                storage cap. Delete messages/threads to free space (reclaim is
+                immediate), or upgrade the plan.
+
+        Note:
+            On the **Free plan** a footer is appended to the *stored* body, so
+            the body read back from the API is not byte-for-byte what you sent.
+        """
+        self._require_mailbox()
+        return self._inkbox._messages.send(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            to=to,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            cc=cc,
+            bcc=bcc,
+            in_reply_to_message_id=in_reply_to_message_id,
+            attachments=attachments,
+            track_opens=track_opens,
+            idempotency_key=idempotency_key,
+        )
+
+    def reply_all_email(
+        self,
+        message_id: str,
+        *,
+        subject: str | None = None,
+        body_text: str | None = None,
+        body_html: str | None = None,
+        attachments: list[dict] | None = None,
+        reply_to: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> Message:
+        """Reply to everyone on a stored message from this identity's mailbox.
+
+        Args:
+            message_id: UUID of the message being replied to.
+            subject: Optional subject override.
+            body_text: Plain-text reply body.
+            body_html: HTML reply body.
+            attachments: List of file attachment dicts with ``filename``,
+                ``content_type``, and ``content_base64`` keys. Add ``content_id``
+                to render an entry inline in the HTML body (``cid:<content_id>``);
+                requires ``body_html`` and an ``image/*`` ``content_type``.
+            reply_to: Optional Reply-To address.
+            idempotency_key: Makes this reply safe to retry — see
+                :meth:`inkbox.mail.resources.messages.MessagesResource.send`.
+
+        Raises:
+            StorageLimitExceededError: 402 — the mailbox is at its plan's
+                storage cap (see :meth:`send_email`).
+        """
+        self._require_mailbox()
+        return self._inkbox._messages.reply_all(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            message_id,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            attachments=attachments,
+            reply_to=reply_to,
+            idempotency_key=idempotency_key,
+        )
+
+    def forward_email(
+        self,
+        message_id: str,
+        *,
+        to: list[str] | None = None,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        mode: ForwardMode | str = ForwardMode.INLINE,
+        subject: str | None = None,
+        body_text: str | None = None,
+        body_html: str | None = None,
+        additional_attachments: list[dict] | None = None,
+        include_original_attachments: bool = True,
+        reply_to: str | None = None,
+        track_opens: bool = False,
+        idempotency_key: str | None = None,
+    ) -> Message:
+        """Forward a stored message out from this identity's mailbox.
+
+        Args:
+            message_id: UUID of the message being forwarded.
+            to: Primary recipient addresses.
+            cc: Carbon-copy recipients.
+            bcc: Blind carbon-copy recipients.
+                At least one address is required across ``to``, ``cc``, and
+                ``bcc``.
+            mode: ``inline`` (default) or ``wrapped``. See :class:`ForwardMode`.
+            subject: Optional override; defaults to ``"Fwd: " + original.subject``.
+            body_text: Optional caller note prepended above the original body
+                (inline mode) or as a top-level note (wrapped mode).
+            body_html: Optional HTML caller note.
+            additional_attachments: Optional caller-authored attachments
+                alongside the forwarded content. Same shape as
+                ``send_email(attachments=...)``.
+            include_original_attachments: ``inline`` mode only. When ``True``
+                (default), original attachments are re-attached as direct
+                outbound parts. Ignored in ``wrapped`` mode.
+            reply_to: Optional Reply-To address for the forward's outer
+                envelope.
+            track_opens: Embed an open-tracking pixel (requires an HTML part
+                on the forward); opens surface as
+                ``first_opened_at``/``open_count``.
+            idempotency_key: Makes this forward safe to retry — see
+                :meth:`inkbox.mail.resources.messages.MessagesResource.send`.
+
+        Raises:
+            StorageLimitExceededError: 402 — the mailbox is at its plan's
+                storage cap (see :meth:`send_email`).
+        """
+        self._require_mailbox()
+        return self._inkbox._messages.forward(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            message_id,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            mode=mode,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            additional_attachments=additional_attachments,
+            include_original_attachments=include_original_attachments,
+            reply_to=reply_to,
+            track_opens=track_opens,
+            idempotency_key=idempotency_key,
+        )
+
+    def iter_emails(
+        self,
+        *,
+        page_size: int = 50,
+        direction: MessageDirection | None = None,
+        start_datetime: str | None = None,
+        end_datetime: str | None = None,
+        tz: str | None = None,
+    ) -> Iterator[Message]:
+        """Iterate over emails in this identity's inbox, newest first.
+
+        Pagination is handled automatically.
+
+        Args:
+            page_size: Messages fetched per API call (1-100).
+            direction: Filter by direction.
+            start_datetime: Inclusive ``created_at`` lower bound (str). Bare dates
+                cover the whole day; ``None`` leaves the side open. UTC unless
+                ``tz`` is set.
+            end_datetime: ``created_at`` upper bound (str), whole-day inclusive for
+                bare dates; ``None`` leaves the side open.
+            tz: IANA timezone name (str) for zone-less values; ``None`` is UTC.
+        """
+        self._require_mailbox()
+        return self._inkbox._messages.list(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            page_size=page_size,
+            direction=direction,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            tz=tz,
+        )
+
+    def iter_unread_emails(
+        self,
+        *,
+        page_size: int = 50,
+        direction: MessageDirection | None = None,
+        start_datetime: str | None = None,
+        end_datetime: str | None = None,
+        tz: str | None = None,
+    ) -> Iterator[Message]:
+        """Iterate over unread emails in this identity's inbox, newest first.
+
+        Fetches all messages and filters client-side. Pagination is handled
+        automatically.
+
+        Args:
+            page_size: Messages fetched per API call (1-100).
+            direction: Filter by direction.
+            start_datetime: Inclusive ``created_at`` lower bound (str); ``None``
+                leaves the side open. UTC unless ``tz`` is set.
+            end_datetime: ``created_at`` upper bound (str), whole-day inclusive for
+                bare dates; ``None`` leaves the side open.
+            tz: IANA timezone name (str) for zone-less values; ``None`` is UTC.
+        """
+        return (
+            msg
+            for msg in self.iter_emails(
+                page_size=page_size,
+                direction=direction,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                tz=tz,
+            )
+            if not msg.is_read
+        )
+
+    def mark_emails_read(self, message_ids: list[str]) -> None:
+        """Mark a list of messages as read.
+
+        Args:
+            message_ids: IDs of the messages to mark as read.
+        """
+        self._require_mailbox()
+        for mid in message_ids:
+            self._inkbox._messages.mark_read(
+                self._mailbox.email_address,  # type: ignore[union-attr]
+                mid,
+            )
+
+    def mark_emails_unread(self, message_ids: list[str]) -> None:
+        """Mark a list of messages as unread.
+
+        Args:
+            message_ids: IDs of the messages to mark as unread.
+        """
+        self._require_mailbox()
+        for mid in message_ids:
+            self._inkbox._messages.mark_unread(
+                self._mailbox.email_address,  # type: ignore[union-attr]
+                mid,
+            )
+
+    def get_message(self, message_id: str) -> MessageDetail:
+        """Get a single message with full body content.
+
+        Args:
+            message_id: UUID of the message to fetch. Obtain via ``msg.id``
+                on any :class:`~inkbox.mail.types.Message`.
+        """
+        self._require_mailbox()
+        return self._inkbox._messages.get(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            message_id,
+        )
+
+    def get_thread(self, thread_id: str) -> ThreadDetail:
+        """Get a thread with all its messages inlined (oldest-first).
+
+        Args:
+            thread_id: UUID of the thread to fetch. Obtain via ``msg.thread_id``
+                on any :class:`~inkbox.mail.types.Message`.
+        """
+        self._require_mailbox()
+        return self._inkbox._threads.get(
+            self._mailbox.email_address,  # type: ignore[union-attr]
+            thread_id,
+        )
+
+    ## Phone helpers
+
+    def place_call(
+        self,
+        *,
+        to_number: str,
+        origination: CallOrigin | str = CallOrigin.DEDICATED_NUMBER,
+        client_websocket_url: str | None = None,
+        mode: CallMode | str = CallMode.CLIENT_WEBSOCKET,
+        hosted_agent_authority_mode: HostedAgentAuthorityMode | str | None = None,
+        voicemail_detection: VoicemailDetection | str | None = None,
+        on_voicemail: OnVoicemail | str | None = None,
+        voicemail_message: str | None = None,
+        reason: str | None = None,
+    ) -> PhoneCallWithRateLimit:
+        """Place an outbound call as this identity.
+
+        For ``dedicated_number`` origination the call rides this identity's
+        provisioned phone number (requires one). For
+        either iMessage origination it is scoped by this identity's id
+        instead.
+
+        Args:
+            to_number: E.164 destination number.
+            origination: How to place the call. Defaults to
+                ``dedicated_number``. See :class:`CallOrigin`.
+            client_websocket_url: WebSocket URL (wss://) for audio bridging.
+            mode: Who drives the call. Defaults to ``client_websocket``.
+                See :class:`CallMode`.
+            hosted_agent_authority_mode: Voice AI authority override.
+                Omit to inherit this identity's saved Voice AI authority.
+                Explicit ``contact_scoped`` downscopes the call. Explicit
+                ``yolo`` requires an admin credential unless the saved
+                authority is already ``yolo``.
+            voicemail_detection: Deprecated alias for ``on_voicemail``
+                (``enabled`` = ``hang_up``, ``disabled`` = ``ignore``).
+            on_voicemail: What to do when voicemail answers. See
+                :class:`OnVoicemail`. Omit for the server default
+                (``leave_message`` for hosted-agent calls, ``hang_up``
+                otherwise).
+            voicemail_message: What Voice AI says on the voicemail (max
+                1000 characters); requires ``on_voicemail=leave_message``.
+            reason: Voice AI's task brief for the call. Required
+                with ``mode=hosted_agent``, invalid otherwise (server 422).
+        """
+        is_dedicated = (
+            origination == CallOrigin.DEDICATED_NUMBER
+            or origination == CallOrigin.DEDICATED_NUMBER.value
+        )
+        if is_dedicated:
+            # Dedicated origination needs this identity's own number.
+            self._require_phone()
+            call_options: dict[str, Any] = {
+                "to_number": to_number,
+                "origination": origination,
+                "from_number": self._phone_number.number,  # type: ignore[union-attr]
+                "client_websocket_url": client_websocket_url,
+                "mode": mode,
+                "reason": reason,
+            }
+            if hosted_agent_authority_mode is not None:
+                call_options["hosted_agent_authority_mode"] = (
+                    hosted_agent_authority_mode
+                )
+            if voicemail_detection is not None:
+                call_options["voicemail_detection"] = voicemail_detection
+            if on_voicemail is not None:
+                call_options["on_voicemail"] = on_voicemail
+            if voicemail_message is not None:
+                call_options["voicemail_message"] = voicemail_message
+            return self._inkbox._calls.place(**call_options)
+        # iMessage origination scopes by identity id, no from_number.
+        call_options = {
+            "to_number": to_number,
+            "origination": origination,
+            "agent_identity_id": self.id,
+            "client_websocket_url": client_websocket_url,
+            "mode": mode,
+            "reason": reason,
+        }
+        if hosted_agent_authority_mode is not None:
+            call_options["hosted_agent_authority_mode"] = hosted_agent_authority_mode
+        if voicemail_detection is not None:
+            call_options["voicemail_detection"] = voicemail_detection
+        if on_voicemail is not None:
+            call_options["on_voicemail"] = on_voicemail
+        if voicemail_message is not None:
+            call_options["voicemail_message"] = voicemail_message
+        return self._inkbox._calls.place(**call_options)
+
+    def list_calls(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        is_blocked: bool | None = None,
+        start_datetime: str | None = None,
+        end_datetime: str | None = None,
+        tz: str | None = None,
+    ) -> list[PhoneCall]:
+        """List calls made to/from this identity.
+
+        Identity-scoped credentials never see contact-rule-blocked rows
+        regardless of ``is_blocked`` (server-side access policy).
+
+        Args:
+            limit: Maximum number of results (default 50).
+            offset: Pagination offset (default 0).
+            is_blocked: Tri-state filter — ``True`` for only blocked,
+                ``False`` for only non-blocked, ``None`` for all.
+            start_datetime: Inclusive ``created_at`` lower bound (str); ``None``
+                leaves the side open. UTC unless ``tz`` is set.
+            end_datetime: ``created_at`` upper bound (str), whole-day inclusive for
+                bare dates; ``None`` leaves the side open.
+            tz: IANA timezone name (str) for zone-less values; ``None`` is UTC.
+        """
+        return self._inkbox._calls.list(
+            agent_identity_id=self.id,
+            limit=limit,
+            offset=offset,
+            is_blocked=is_blocked,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            tz=tz,
+        )
+
+    def list_transcripts(self, call_id: str) -> list[PhoneTranscript]:
+        """List transcript segments for a specific call.
+
+        Args:
+            call_id: ID of the call to fetch transcripts for.
+        """
+        return self._inkbox._calls.transcripts(call_id)
+
+    def list_tool_invocations(
+        self,
+        call_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> HostedAgentToolInvocationPage:
+        """List a page of Voice AI tool activity for a specific call."""
+        return self._inkbox._calls.tool_invocations(
+            call_id,
+            limit=limit,
+            offset=offset,
+        )
+
+    def hangup_call(self, call_id: str) -> PhoneCall:
+        """Hang up one of this identity's live calls, from outside the call.
+
+        Args:
+            call_id: ID of the call to hang up.
+        """
+        return self._inkbox._calls.hangup(call_id)
+
+    def get_hosted_agent_config(self) -> HostedAgentConfig:
+        """Get this identity's Inkbox Voice AI config."""
+        return self._inkbox._hosted_agent.get_config(agent_identity_id=self.id)
+
+    def set_hosted_agent_config(
+        self,
+        *,
+        voice: str | None = None,
+        model: str | None = None,
+        instructions: str | None = None,
+    ) -> HostedAgentConfig:
+        """Set this identity's Inkbox Voice AI config (full replace).
+
+        Voice and instructions left at ``None`` reset to their defaults. The
+        deprecated ``model`` argument remains accepted but is ignored.
+
+        Args:
+            voice: Voice override, or ``None`` for the server default.
+            model: Deprecated compatibility argument; accepted but ignored.
+            instructions: Per-identity steering prompt, or ``None`` for none.
+        """
+        return self._inkbox._hosted_agent.set_config(
+            voice=voice,
+            model=model,
+            instructions=instructions,
+            agent_identity_id=self.id,
+        )
+
+    def set_hosted_agent_authority_mode(
+        self,
+        authority_mode: HostedAgentAuthorityMode | str,
+    ) -> HostedAgentConfig:
+        """Set the saved Voice AI authority with an admin API key.
+
+        Incoming calls use this value. Outbound calls inherit it when
+        ``hosted_agent_authority_mode`` is omitted.
+        """
+        return self._inkbox._hosted_agent.set_authority_mode(
+            agent_identity_id=self.id,
+            authority_mode=authority_mode,
+        )
+
+    def get_incoming_call_action(self) -> IncomingCallActionConfig:
+        """Get this identity's inbound-call handling config."""
+        return self._inkbox._incoming_call_action.get(agent_identity_id=self.id)
+
+    def set_incoming_call_action(
+        self,
+        *,
+        incoming_call_action: IncomingCallAction | str,
+        client_websocket_url: str | None = None,
+        incoming_call_webhook_url: str | None = None,
+        forwarding_target_type: Any = _UNSET,
+        forwarding_phone_number: Any = _UNSET,
+        forwarding_sip_uri: Any = _UNSET,
+    ) -> IncomingCallActionConfig:
+        """Set this identity's inbound-call handling config.
+
+        Args:
+            incoming_call_action: Behaviour to apply. See
+                :class:`IncomingCallAction`.
+            client_websocket_url: WebSocket URL (wss://) for audio bridging.
+            incoming_call_webhook_url: HTTPS receiver for the
+                ``webhook`` action.
+        """
+        kwargs: dict[str, Any] = {
+            "incoming_call_action": incoming_call_action,
+            "agent_identity_id": self.id,
+            "client_websocket_url": client_websocket_url,
+            "incoming_call_webhook_url": incoming_call_webhook_url,
+        }
+        if forwarding_target_type is not _UNSET:
+            kwargs["forwarding_target_type"] = forwarding_target_type
+        if forwarding_phone_number is not _UNSET:
+            kwargs["forwarding_phone_number"] = forwarding_phone_number
+        if forwarding_sip_uri is not _UNSET:
+            kwargs["forwarding_sip_uri"] = forwarding_sip_uri
+        return self._inkbox._incoming_call_action.set(
+            **kwargs,
+        )
+
+    ## Text message helpers
+
+    def send_text(
+        self,
+        *,
+        to: str | list[str] | None = None,
+        conversation_id: UUID | str | None = None,
+        text: str | None = None,
+        media_urls: list[str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> TextMessage:
+        """Send an outbound SMS/MMS from this identity's phone number.
+
+        Args:
+            to: E.164 destination number, or a list of numbers for a group send.
+                Mutually exclusive with ``conversation_id``.
+            conversation_id: Existing conversation UUID to reply into. The
+                server resolves it to that conversation's participants.
+            text: Message body.
+            media_urls: MMS media URLs. Pass with ``text`` or by themselves.
+
+        Returns:
+            The queued ``TextMessage``. The full outbound lifecycle
+            (``text.sent`` -> ``text.delivered`` / ``text.delivery_failed``
+            / ``text.delivery_unconfirmed``) arrives via webhook
+            subscriptions on the sender's identity, not the return
+            value
+            (``inkbox.webhooks.subscriptions.create(agent_identity_id=...,
+            url=..., event_types=[...])``). See ``TextWebhookEventType``
+            and ``TextWebhookPayload`` for the typed receiver-side
+            shapes.
+
+        Raises:
+            InkboxError: when this identity has no phone number.
+            RecipientBlockedError: when the destination is blocked by an
+                outbound contact rule.
+            InkboxAPIError: for other send failures.
+        """
+        self._require_phone()
+        send_kwargs: dict[str, Any] = {}
+        if idempotency_key is not None:
+            send_kwargs["idempotency_key"] = idempotency_key
+        if to is not None:
+            send_kwargs["to"] = to
+        if conversation_id is not None:
+            send_kwargs["conversation_id"] = conversation_id
+        if text is not None:
+            send_kwargs["text"] = text
+        if media_urls is not None:
+            send_kwargs["media_urls"] = media_urls
+        return self._inkbox._texts.send(
+            self._phone_number.id,  # type: ignore[union-attr]
+            **send_kwargs,
+        )
+
+    def list_texts(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        is_read: bool | None = None,
+        is_blocked: bool | None = None,
+        start_datetime: str | None = None,
+        end_datetime: str | None = None,
+        tz: str | None = None,
+    ) -> list[TextMessage]:
+        """List text messages for this identity's phone number.
+
+        Identity-scoped credentials never see contact-rule-blocked rows
+        regardless of ``is_blocked`` (server-side access policy).
+
+        Args:
+            limit: Maximum number of results (default 50).
+            offset: Pagination offset (default 0).
+            is_read: Filter by read state (``True``, ``False``, or ``None`` for all).
+            is_blocked: Tri-state filter — ``True`` for only blocked,
+                ``False`` for only non-blocked, ``None`` for all.
+            start_datetime: Inclusive ``created_at`` lower bound (str); ``None``
+                leaves the side open. UTC unless ``tz`` is set.
+            end_datetime: ``created_at`` upper bound (str), whole-day inclusive for
+                bare dates; ``None`` leaves the side open.
+            tz: IANA timezone name (str) for zone-less values; ``None`` is UTC.
+        """
+        self._require_phone()
+        return self._inkbox._texts.list(
+            self._phone_number.id,  # type: ignore[union-attr]
+            limit=limit,
+            offset=offset,
+            is_read=is_read,
+            is_blocked=is_blocked,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            tz=tz,
+        )
+
+    def get_text(self, text_id: str) -> TextMessage:
+        """Get a single text message by ID.
+
+        Args:
+            text_id: UUID of the text message to fetch.
+        """
+        self._require_phone()
+        return self._inkbox._texts.get(
+            self._phone_number.id,  # type: ignore[union-attr]
+            text_id,
+        )
+
+    def list_text_conversations(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        is_blocked: bool | None = None,
+        include_groups: bool = False,
+        start_datetime: str | None = None,
+        end_datetime: str | None = None,
+        tz: str | None = None,
+    ) -> list[TextConversationSummary]:
+        """List text conversations.
+
+        Identity-scoped credentials never see blocked rows in
+        conversation summaries; admin/JWT can use ``is_blocked=False``
+        to hide spam-only counterparties or ``is_blocked=True`` to
+        narrow to conversations made up of blocked rows.
+
+        Args:
+            limit: Maximum number of results (default 50).
+            offset: Pagination offset (default 0).
+            is_blocked: Tri-state filter — ``True`` for only blocked,
+                ``False`` for only non-blocked, ``None`` for all.
+            include_groups: Include group conversations. Defaults to
+                ``False`` so old clients continue to see one-to-one rows only.
+            start_datetime: Inclusive ``created_at`` lower bound (str); ``None``
+                leaves the side open. UTC unless ``tz`` is set.
+            end_datetime: ``created_at`` upper bound (str), whole-day inclusive for
+                bare dates; ``None`` leaves the side open.
+            tz: IANA timezone name (str) for zone-less values; ``None`` is UTC.
+        """
+        self._require_phone()
+        return self._inkbox._texts.list_conversations(
+            self._phone_number.id,  # type: ignore[union-attr]
+            limit=limit,
+            offset=offset,
+            is_blocked=is_blocked,
+            include_groups=include_groups,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            tz=tz,
+        )
+
+    def get_text_conversation(
+        self, remote_number: UUID | str, *, limit: int = 50, offset: int = 0
+    ) -> list[TextMessage]:
+        """Get all messages in a conversation.
+
+        Args:
+            remote_number: E.164 one-to-one remote number, or conversation UUID.
+            limit: Maximum number of results (default 50).
+            offset: Pagination offset (default 0).
+        """
+        self._require_phone()
+        return self._inkbox._texts.get_conversation(
+            self._phone_number.id,  # type: ignore[union-attr]
+            remote_number,
+            limit=limit,
+            offset=offset,
+        )
+
+    def mark_text_read(self, text_id: str) -> TextMessage:
+        """Mark a single text message as read.
+
+        Args:
+            text_id: UUID of the text message.
+        """
+        self._require_phone()
+        return self._inkbox._texts.update(
+            self._phone_number.id,  # type: ignore[union-attr]
+            text_id,
+            is_read=True,
+        )
+
+    def mark_text_conversation_read(
+        self, remote_number: UUID | str
+    ) -> TextConversationUpdateResult:
+        """Mark all messages in a conversation as read.
+
+        Args:
+            remote_number: E.164 one-to-one remote number, or conversation UUID.
+
+        Returns:
+            ``TextConversationUpdateResult`` with ``conversation_id``,
+            ``remote_phone_number``, ``is_read``, and ``updated_count``.
+        """
+        self._require_phone()
+        return self._inkbox._texts.update_conversation(
+            self._phone_number.id,  # type: ignore[union-attr]
+            remote_number,
+            is_read=True,
+        )
+
+    ## iMessage helpers
+
+    def get_imessage(self, message_id: UUID | str) -> IMessage:
+        """Read one message belonging to this identity."""
+        self._require_imessage()
+        return self._inkbox._imessages.get(message_id, agent_identity_id=self.id)
+
+    def get_imessage_thread(
+        self, message_id: UUID | str, *, limit: int = 50, cursor: str | None = None,
+    ) -> IMessageThread:
+        """Read a chronological thread page using any message in it."""
+        self._require_imessage()
+        return self._inkbox._imessages.get_thread(
+            message_id, limit=limit, cursor=cursor, agent_identity_id=self.id,
+        )
+
+    def get_imessage_conversation_thread(
+        self, conversation_id: UUID | str, thread_id: UUID | str, *,
+        limit: int = 50, cursor: str | None = None,
+    ) -> IMessageThread:
+        """Read a thread by its opaque ID within this identity's conversation."""
+        self._require_imessage()
+        return self._inkbox._imessages.get_conversation_thread(
+            conversation_id, thread_id, limit=limit, cursor=cursor, agent_identity_id=self.id,
+        )
+
+    def send_imessage(
+        self,
+        *,
+        to: str | list[str] | None = None,
+        conversation_id: UUID | str | None = None,
+        text: str | None = None,
+        media_urls: list[str] | None = None,
+        send_style: IMessageSendStyle | str | None = None,
+        idempotency_key: str | None = None,
+        reply_to_message_id: UUID | str | None = None,
+        plain_reply_fallback: bool = True,
+    ) -> IMessage:
+        """Send an outbound iMessage as this identity.
+
+        Shared service requires the recipient to connect first. A dedicated
+        iMessage line may start a conversation, subject to server-side policy
+        checks.
+
+        Args:
+            to: One E.164 recipient or 1–8 distinct recipients. Two or more
+                recipients select or create a dedicated-line group.
+                Mutually exclusive with ``conversation_id``.
+            conversation_id: Existing conversation UUID to reply into.
+            reply_to_message_id: Message to reply to in that conversation.
+                Requires ``conversation_id`` and cannot be used with ``to``.
+            plain_reply_fallback: Allow an ordinary message in the same conversation
+                when native threading is unsupported (default True). False requires
+                a native reply. Ignored without ``reply_to_message_id``.
+            text: Message body.
+            media_urls: Media URLs (at most one). Use
+                :meth:`upload_imessage_media` to create one from bytes.
+            send_style: Optional expressive send style (see
+                ``IMessageSendStyle``). The same styles work for one-to-one
+                sends, new groups, and replies by group ``conversation_id``;
+                they may be combined with the single supported media URL.
+
+        Raises:
+            InkboxError: when this identity is not iMessage-enabled.
+            InkboxAPIError: 403 when the recipient is blocked by a
+                contact rule; other send failures.
+        """
+        self._require_imessage()
+        return self._inkbox._imessages.send(
+            to=to,
+            conversation_id=conversation_id,
+            text=text,
+            media_urls=media_urls,
+            send_style=send_style,
+            agent_identity_id=self.id,
+            **({
+                "reply_to_message_id": reply_to_message_id,
+                "plain_reply_fallback": plain_reply_fallback,
+            } if reply_to_message_id is not None else {}),
+            **({"idempotency_key": idempotency_key} if idempotency_key is not None else {}),
+        )
+
+    def list_imessages(
+        self,
+        *,
+        conversation_id: UUID | str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        is_read: bool | None = None,
+        is_blocked: bool | None = None,
+        include_groups: bool = False,
+        start_datetime: str | None = None,
+        end_datetime: str | None = None,
+        tz: str | None = None,
+        thread_id: UUID | str | None = None,
+    ) -> list[IMessage]:
+        """List this identity's iMessages, newest first.
+
+        Identity-scoped credentials never see contact-rule-blocked rows
+        regardless of ``is_blocked`` (server-side access policy).
+
+        Args:
+            conversation_id: Narrow to one conversation.
+            thread_id: Narrow to a thread; requires ``conversation_id``.
+            limit: Maximum number of results (default 50).
+            offset: Pagination offset (default 0).
+            is_read: Filter by read state (``True``, ``False``, or ``None`` for all).
+            is_blocked: Tri-state filter — ``True`` for only blocked,
+                ``False`` for only non-blocked, ``None`` for all.
+            include_groups: Include group messages. Defaults to ``False``.
+            start_datetime: Inclusive ``created_at`` lower bound (str); ``None``
+                leaves the side open. UTC unless ``tz`` is set.
+            end_datetime: ``created_at`` upper bound (str), whole-day inclusive for
+                bare dates; ``None`` leaves the side open.
+            tz: IANA timezone name (str) for zone-less values; ``None`` is UTC.
+        """
+        self._require_imessage()
+        return self._inkbox._imessages.list(
+            agent_identity_id=self.id,
+            conversation_id=conversation_id,
+            limit=limit,
+            offset=offset,
+            is_read=is_read,
+            is_blocked=is_blocked,
+            include_groups=include_groups,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            tz=tz,
+            **({"thread_id": thread_id} if thread_id is not None else {}),
+        )
+
+    def list_imessage_assignments(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[IMessageAssignment]:
+        """List recipients actively connected to this identity, newest first.
+
+        Args:
+            limit: Maximum number of results (default 50).
+            offset: Pagination offset (default 0).
+        """
+        self._require_imessage()
+        return self._inkbox._imessages.list_assignments(
+            agent_identity_id=self.id,
+            limit=limit,
+            offset=offset,
+        )
+
+    def release_imessage_assignment(self, assignment_id: UUID | str) -> None:
+        """Disconnect a recipient from this identity.
+
+        Requires an admin API key; identity-scoped keys are rejected. Inbound
+        from them stops routing here and the shared line can be reassigned.
+        They are not notified and can reconnect by texting the triage number
+        again.
+
+        Args:
+            assignment_id: UUID of the connection, from ``list_imessage_assignments``.
+        """
+        self._require_imessage()
+        self._inkbox._imessages.release_assignment(assignment_id)
+
+    def list_imessage_conversations(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        is_blocked: bool | None = None,
+        include_groups: bool = False,
+        start_datetime: str | None = None,
+        end_datetime: str | None = None,
+        tz: str | None = None,
+    ) -> list[IMessageConversationSummary]:
+        """List this identity's iMessage conversations.
+
+        Args:
+            limit: Maximum number of results (default 50).
+            offset: Pagination offset (default 0).
+            is_blocked: Tri-state filter applied to the underlying
+                messages — ``True`` for only blocked, ``False`` for only
+                non-blocked, ``None`` for all.
+            include_groups: Include group conversations. Defaults to ``False``.
+            start_datetime: Inclusive ``created_at`` lower bound (str); ``None``
+                leaves the side open. UTC unless ``tz`` is set.
+            end_datetime: ``created_at`` upper bound (str), whole-day inclusive for
+                bare dates; ``None`` leaves the side open.
+            tz: IANA timezone name (str) for zone-less values; ``None`` is UTC.
+        """
+        self._require_imessage()
+        return self._inkbox._imessages.list_conversations(
+            agent_identity_id=self.id,
+            limit=limit,
+            offset=offset,
+            is_blocked=is_blocked,
+            include_groups=include_groups,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            tz=tz,
+        )
+
+    def get_imessage_conversation(
+        self, conversation_id: UUID | str
+    ) -> IMessageConversation:
+        """Get one of this identity's iMessage conversations by ID.
+
+        Args:
+            conversation_id: UUID of the conversation.
+        """
+        self._require_imessage()
+        return self._inkbox._imessages.get_conversation(
+            conversation_id,
+            agent_identity_id=self.id,
+        )
+
+    def send_imessage_reaction(
+        self,
+        *,
+        message_id: UUID | str,
+        reaction: IMessageReactionType | str,
+        part_index: int = 0,
+    ) -> IMessageReaction:
+        """React to an inbound one-to-one or group message owned by this identity.
+
+        Args:
+            message_id: UUID of the message being reacted to.
+            reaction: Tapback kind (see ``IMessageReactionType``).
+            part_index: Part of a multi-part message to react to.
+        """
+        self._require_imessage()
+        return self._inkbox._imessages.send_reaction(
+            message_id=message_id,
+            reaction=reaction,
+            part_index=part_index,
+        )
+
+    def remove_imessage_reaction(self, reaction_id: UUID | str) -> None:
+        """Take back a tapback this identity sent.
+
+        Only the sender can remove a tapback, so one the other party sent is
+        rejected. A tapback Inkbox already shows as gone succeeds without contacting the
+        messaging network, and a failed removal leaves it in place rather than
+        clearing it locally, so the call can be retried.
+
+        Args:
+            reaction_id: UUID of the reaction to take back.
+        """
+        self._require_imessage()
+        self._inkbox._imessages.remove_reaction(reaction_id)
+
+    def mark_imessage_conversation_read(
+        self, conversation_id: UUID | str
+    ) -> IMessageMarkReadResult:
+        """Send a one-to-one read receipt and mark inbound messages read.
+
+        Group conversations are unsupported and return 409.
+
+        Args:
+            conversation_id: UUID of the conversation.
+        """
+        self._require_imessage()
+        return self._inkbox._imessages.mark_conversation_read(conversation_id)
+
+    def send_imessage_typing(self, conversation_id: UUID | str) -> None:
+        """Show a typing indicator to a one-to-one recipient.
+
+        Group conversations are unsupported and return 409.
+
+        Args:
+            conversation_id: UUID of the conversation.
+        """
+        self._require_imessage()
+        self._inkbox._imessages.send_typing(conversation_id)
+
+    def upload_imessage_media(
+        self,
+        *,
+        content: bytes,
+        filename: str,
+        content_type: str | None = None,
+    ) -> IMessageMediaUpload:
+        """Upload media and get back a URL usable in ``media_urls``.
+
+        Args:
+            content: Raw file bytes (max 10 MiB).
+            filename: Original filename, used for type inference.
+            content_type: Optional MIME type.
+        """
+        self._require_imessage()
+        return self._inkbox._imessages.upload_media(
+            content=content,
+            filename=filename,
+            content_type=content_type,
+        )
+
+    ## Mail contact rules
+
+    def list_mail_contact_rules(
+        self,
+        *,
+        action: MailRuleAction | str | None = None,
+        match_type: MailRuleMatchType | str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        direction: ContactRuleDirection | str = _RULE_UNSET,  # type: ignore[assignment]
+    ) -> list[MailIdentityContactRule]:
+        """List this identity's mail allow/block rules, newest first."""
+        return self._inkbox._mail_identity_contact_rules.list(
+            self.agent_handle,
+            action=action,
+            match_type=match_type,
+            limit=limit,
+            offset=offset,
+            **_direction_fields(direction),
+        )
+
+    def get_mail_contact_rule(self, rule_id: UUID | str) -> MailIdentityContactRule:
+        """Get one of this identity's mail contact rules by id."""
+        return self._inkbox._mail_identity_contact_rules.get(self.agent_handle, rule_id)
+
+    def create_mail_contact_rule(
+        self,
+        *,
+        action: MailRuleAction | str,
+        match_type: MailRuleMatchType | str,
+        match_target: str,
+        direction: ContactRuleDirection | str = _RULE_UNSET,  # type: ignore[assignment]
+    ) -> MailIdentityContactRule:
+        """Create a mail allow/block rule for this identity."""
+        return self._inkbox._mail_identity_contact_rules.create(
+            self.agent_handle,
+            action=action,
+            match_type=match_type,
+            match_target=match_target,
+            **_direction_fields(direction),
+        )
+
+    def update_mail_contact_rule(
+        self,
+        rule_id: UUID | str,
+        *,
+        action: MailRuleAction | str | None = None,
+        direction: ContactRuleDirection | str = _RULE_UNSET,  # type: ignore[assignment]
+        apply_to: ContactRuleDirection | str = _RULE_UNSET,  # type: ignore[assignment]
+    ) -> MailIdentityContactRule:
+        """Update action or coverage; apply_to changes one covered side atomically."""
+        return self._inkbox._mail_identity_contact_rules.update(
+            self.agent_handle,
+            rule_id,
+            **_rule_update(action, direction, apply_to),
+        )
+
+    def delete_mail_contact_rule(self, rule_id: UUID | str) -> None:
+        """Delete one of this identity's mail contact rules (admin-only)."""
+        self._inkbox._mail_identity_contact_rules.delete(self.agent_handle, rule_id)
+
+    ## Phone contact rules
+
+    def list_phone_contact_rules(
+        self,
+        *,
+        action: PhoneRuleAction | str | None = None,
+        match_type: PhoneRuleMatchType | str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        direction: ContactRuleDirection | str = _RULE_UNSET,  # type: ignore[assignment]
+    ) -> list[PhoneIdentityContactRule]:
+        """List this identity's phone allow/block rules, newest first.
+
+        Rules also apply to iMessage and do not require a dedicated phone number.
+        """
+        return self._inkbox._phone_identity_contact_rules.list(
+            self.agent_handle,
+            action=action,
+            match_type=match_type,
+            limit=limit,
+            offset=offset,
+            **_direction_fields(direction),
+        )
+
+    def get_phone_contact_rule(self, rule_id: UUID | str) -> PhoneIdentityContactRule:
+        """Get one of this identity's phone contact rules by id."""
+        return self._inkbox._phone_identity_contact_rules.get(
+            self.agent_handle, rule_id
+        )
+
+    def create_phone_contact_rule(
+        self,
+        *,
+        action: PhoneRuleAction | str,
+        match_target: str,
+        match_type: PhoneRuleMatchType | str = PhoneRuleMatchType.EXACT_NUMBER,
+        direction: ContactRuleDirection | str = _RULE_UNSET,  # type: ignore[assignment]
+    ) -> PhoneIdentityContactRule:
+        """Create a phone allow/block rule for this identity.
+
+        Requires admin credentials; channel provisioning is not required.
+        """
+        return self._inkbox._phone_identity_contact_rules.create(
+            self.agent_handle,
+            action=action,
+            match_target=match_target,
+            match_type=match_type,
+            **_direction_fields(direction),
+        )
+
+    def update_phone_contact_rule(
+        self,
+        rule_id: UUID | str,
+        *,
+        action: PhoneRuleAction | str | None = None,
+        direction: ContactRuleDirection | str = _RULE_UNSET,  # type: ignore[assignment]
+        apply_to: ContactRuleDirection | str = _RULE_UNSET,  # type: ignore[assignment]
+    ) -> PhoneIdentityContactRule:
+        """Update action or coverage; apply_to changes one covered side atomically."""
+        return self._inkbox._phone_identity_contact_rules.update(
+            self.agent_handle,
+            rule_id,
+            **_rule_update(action, direction, apply_to),
+        )
+
+    def delete_phone_contact_rule(self, rule_id: UUID | str) -> None:
+        """Delete one of this identity's phone contact rules (admin-only)."""
+        self._inkbox._phone_identity_contact_rules.delete(self.agent_handle, rule_id)
+
+    def list_contact_communication_policies(self, *, limit: int = 50, offset: int = 0) -> ContactCommunicationPolicyPage:
+        """List this identity's permission-filtered contact views."""
+        return self._inkbox.contacts.communication_policy.list_for_identity(self.agent_handle, limit=limit, offset=offset)
+
+    ## A2A
+
+    def a2a_enable(self) -> A2ASettings:
+        """Enable this identity's A2A receiver."""
+        return self._inkbox._a2a.update_settings(self.agent_handle, enabled=True)
+
+    def a2a_disable(self) -> A2ASettings:
+        """Disable this identity's A2A receiver."""
+        return self._inkbox._a2a.update_settings(self.agent_handle, enabled=False)
+
+    def a2a_settings(self) -> A2ASettings:
+        """Return this identity's A2A channel settings."""
+        return self._inkbox._a2a.settings(self.agent_handle)
+
+    def a2a_set_publicly_discoverable(self, enabled: bool) -> A2ASettings:
+        """Set public directory visibility (admin-only)."""
+        return self._inkbox._a2a.update_settings(
+            self.agent_handle,
+            publicly_discoverable=enabled,
+        )
+
+    def a2a_set_allow_public_egress(self, enabled: bool) -> A2ASettings:
+        """Allow or deny A2A calls to publicly discoverable agents."""
+        return self._inkbox._a2a.update_settings(
+            self.agent_handle,
+            allow_public_egress=enabled,
+        )
+
+    def a2a_set_skills(self, skills: list[A2ASkill]) -> A2ASettings:
+        """Replace the skills advertised on this identity's Agent Card."""
+        return self._inkbox._a2a.update_settings(
+            self.agent_handle,
+            skills=skills_wire(skills),
+        )
+
+    def a2a_reset_skills(self) -> A2ASettings:
+        """Restore the receiver's default advertised skills."""
+        return self._inkbox._a2a.update_settings(
+            self.agent_handle,
+            skills=None,
+        )
+
+    def a2a_set_filter_mode(
+        self,
+        filter_mode: FilterMode | str,
+    ) -> A2ASettings:
+        """Set A2A admission to whitelist or blacklist mode (admin-only)."""
+        return self._inkbox._a2a.update_settings(
+            self.agent_handle,
+            filter_mode=(
+                filter_mode.value
+                if isinstance(filter_mode, FilterMode)
+                else filter_mode
+            ),
+        )
+
+    def a2a_card(self) -> dict[str, Any]:
+        """Return this identity's Agent Card preview."""
+        return self._inkbox._a2a.card(self.agent_handle)
+
+    def a2a_tasks(
+        self,
+        *,
+        direction: A2AHistoryDirection | str | None = None,
+        requester_handle: str | None = None,
+        worker_handle: str | None = None,
+        state: A2ATaskState | str | None = None,
+        context_id: UUID | str | None = None,
+        q: str | None = None,
+        since: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> A2ATaskPage:
+        """List the receiver-side A2A task inbox."""
+        return self._inkbox._a2a.tasks(
+            self.agent_handle,
+            direction=direction,
+            requester_handle=requester_handle,
+            worker_handle=worker_handle,
+            state=state,
+            context_id=str(context_id) if context_id is not None else None,
+            q=q,
+            since=since,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    def iter_a2a_tasks(
+        self,
+        *,
+        direction: A2AHistoryDirection | str | None = None,
+        requester_handle: str | None = None,
+        worker_handle: str | None = None,
+        state: A2ATaskState | str | None = None,
+        context_id: UUID | str | None = None,
+        q: str | None = None,
+        since: str | None = None,
+        limit: int = 50,
+    ) -> Iterator[A2ATask]:
+        """Drain every page in the receiver-side A2A inbox."""
+        return self._inkbox._a2a.iter_tasks(
+            self.agent_handle,
+            direction=direction,
+            requester_handle=requester_handle,
+            worker_handle=worker_handle,
+            state=state,
+            context_id=str(context_id) if context_id is not None else None,
+            q=q,
+            since=since,
+            limit=limit,
+        )
+
+    def a2a_task(self, task_id: UUID | str) -> A2ATask:
+        """Get an A2A task with its message history."""
+        return self._inkbox._a2a.task(self.agent_handle, str(task_id))
+
+    def a2a_sent_tasks(
+        self,
+        *,
+        requester_handle: str | None = None,
+        worker_handle: str | None = None,
+        state: A2ATaskState | str | None = None,
+        context_id: UUID | str | None = None,
+        q: str | None = None,
+        since: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> A2ATaskPage:
+        """List A2A tasks sent by this identity."""
+        return self._inkbox._a2a.sent_tasks(
+            self.agent_handle,
+            requester_handle=requester_handle,
+            worker_handle=worker_handle,
+            state=state,
+            context_id=str(context_id) if context_id is not None else None,
+            q=q,
+            since=since,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    def iter_a2a_sent_tasks(
+        self,
+        *,
+        requester_handle: str | None = None,
+        worker_handle: str | None = None,
+        state: A2ATaskState | str | None = None,
+        context_id: UUID | str | None = None,
+        q: str | None = None,
+        since: str | None = None,
+        limit: int = 50,
+    ) -> Iterator[A2ATask]:
+        """Drain every page of A2A tasks sent by this identity."""
+        return self._inkbox._a2a.iter_sent_tasks(
+            self.agent_handle,
+            requester_handle=requester_handle,
+            worker_handle=worker_handle,
+            state=state,
+            context_id=str(context_id) if context_id is not None else None,
+            q=q,
+            since=since,
+            limit=limit,
+        )
+
+    def a2a_sent_task(self, task_id: UUID | str) -> A2ATask:
+        """Get a full A2A task sent by this identity."""
+        return self._inkbox._a2a.sent_task(
+            self.agent_handle,
+            str(task_id),
+        )
+
+    def a2a_messages(
+        self,
+        *,
+        direction: A2AHistoryDirection | str | None = None,
+        requester_handle: str | None = None,
+        worker_handle: str | None = None,
+        task_id: UUID | str | None = None,
+        context_id: UUID | str | None = None,
+        role: A2AMessageRole | str | None = None,
+        q: str | None = None,
+        since: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> A2AHistoryMessagePage:
+        """List this identity's inbound and outbound A2A messages."""
+        return self._inkbox._a2a.messages(
+            self.agent_handle,
+            direction=direction,
+            requester_handle=requester_handle,
+            worker_handle=worker_handle,
+            task_id=str(task_id) if task_id is not None else None,
+            context_id=str(context_id) if context_id is not None else None,
+            role=role,
+            q=q,
+            since=since,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    def iter_a2a_messages(
+        self,
+        *,
+        direction: A2AHistoryDirection | str | None = None,
+        requester_handle: str | None = None,
+        worker_handle: str | None = None,
+        task_id: UUID | str | None = None,
+        context_id: UUID | str | None = None,
+        role: A2AMessageRole | str | None = None,
+        q: str | None = None,
+        since: str | None = None,
+        limit: int = 50,
+    ) -> Iterator[A2AHistoryMessage]:
+        """Drain every page of this identity's A2A message history."""
+        return self._inkbox._a2a.iter_messages(
+            self.agent_handle,
+            direction=direction,
+            requester_handle=requester_handle,
+            worker_handle=worker_handle,
+            task_id=str(task_id) if task_id is not None else None,
+            context_id=str(context_id) if context_id is not None else None,
+            role=role,
+            q=q,
+            since=since,
+            limit=limit,
+        )
+
+    def a2a_reply(
+        self,
+        task_id: UUID | str,
+        *,
+        intent: A2AReplyIntent | str,
+        text: str | None = None,
+        parts: list[dict[str, Any]] | None = None,
+    ) -> A2ATask:
+        """Reply to an inbound A2A task and choose its next state."""
+        return self._inkbox._a2a.reply(
+            self.agent_handle,
+            str(task_id),
+            intent=intent,
+            text=text,
+            parts=parts,
+        )
+
+    def a2a_contexts(
+        self,
+        *,
+        direction: A2AHistoryDirection | str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> A2AContextPage:
+        """List A2A contexts by direction; defaults to inbound."""
+        return self._inkbox._a2a.contexts(
+            self.agent_handle,
+            direction=direction,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    def a2a_context(self, context_id: UUID | str) -> A2AContext:
+        """Get a context this identity originally received and its tasks."""
+        return self._inkbox._a2a.context(self.agent_handle, str(context_id))
+
+    def a2a_update_context(
+        self,
+        context_id: UUID | str,
+        *,
+        name: str,
+    ) -> A2AContext:
+        """Rename a context shared with this identity."""
+        return self._inkbox._a2a.update_context(
+            self.agent_handle,
+            str(context_id),
+            name=name,
+        )
+
+    def a2a_sent_contexts(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> A2AContextPage:
+        """List A2A contexts started by this identity."""
+        return self._inkbox._a2a.sent_contexts(
+            self.agent_handle,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    def a2a_sent_context(self, context_id: UUID | str) -> A2AContext:
+        """Get a context originally opened by this identity."""
+        return self._inkbox._a2a.sent_context(
+            self.agent_handle,
+            str(context_id),
+        )
+
+    def a2a_contact_rules(self) -> list[A2AContactRule]:
+        """List this identity's directional A2A contact rules."""
+        return self._inkbox._a2a.contact_rules(self.agent_handle)
+
+    def a2a_add_contact_rule(
+        self,
+        *,
+        handle: str,
+        action: A2ARuleAction | str,
+        direction: A2ARuleDirection | str = A2ARuleDirection.INBOUND,
+    ) -> A2AContactRule:
+        """Add a directional A2A contact rule (admin-only)."""
+        return self._inkbox._a2a.add_contact_rule(
+            self.agent_handle,
+            peer_handle=handle,
+            action=action,
+            direction=direction,
+        )
+
+    def a2a_update_contact_rule(
+        self,
+        rule_id: UUID | str,
+        *,
+        action: A2ARuleAction | str | None = None,
+        direction: A2ARuleDirection | str | None = None,
+    ) -> A2AContactRule:
+        """Update a directional A2A contact rule (admin-only)."""
+        return self._inkbox._a2a.update_contact_rule(
+            self.agent_handle,
+            str(rule_id),
+            action=action,
+            direction=direction,
+        )
+
+    def a2a_delete_contact_rule(self, rule_id: UUID | str) -> None:
+        """Delete a directional A2A contact rule (admin-only)."""
+        self._inkbox._a2a.delete_contact_rule(
+            self.agent_handle,
+            str(rule_id),
+        )
+
+    def a2a_client(self) -> A2AClient:
+        """Create an A2A client bound to this claimed identity's API key."""
+        principal = self._inkbox.whoami()
+        expected_scope = f"agent_identity:{self.id}"
+        if (
+            principal.auth_type != "api_key"
+            or principal.auth_subtype != "api_key.agent_scoped.claimed"
+            or getattr(principal, "scope", None) != expected_scope
+        ):
+            raise InkboxError(
+                "A2A calls require this claimed identity's agent-scoped API key"
+            )
+        client = A2AClient(
+            api_key=self._inkbox._api_key,
+            platform_base_url=self._inkbox._base_url,
+            timeout=self._inkbox._timeout,
+        )
+        client._response_observer = self._inkbox._api_http._response_observer
+        client._notice_collector = self._inkbox._api_http._notice_collector
+        return client
+
+    ## Signing key
+
+    def get_signing_key_status(self) -> SigningKeyStatus:
+        """Report whether this identity has a webhook signing key."""
+        return self._inkbox._signing_keys.get_status(self.agent_handle)
+
+    def create_signing_key(self) -> SigningKey:
+        """Create or rotate this identity's webhook signing key.
+
+        The plaintext ``signing_key`` is returned **once** — store it
+        securely, it cannot be retrieved again.
+        """
+        return self._inkbox._signing_keys.create_or_rotate(self.agent_handle)
+
+    ## Identity management
+
+    def update(
+        self,
+        *,
+        display_name: Any = _UNSET,
+        description: Any = _UNSET,
+        imessage_enabled: bool | None = None,
+        contact_sharing_enabled: bool | None = None,
+        imessage_number_id: UUID | str | None = _UNSET,  # type: ignore[assignment]
+        claim_imessage_number: Literal[True] | None = None,
+        idempotency_key: str | None = None,
+        imessage_filter_mode: FilterMode | str | None = None,
+        mail_filter_mode: FilterMode | str | None = None,
+        phone_filter_mode: FilterMode | str | None = None,
+        mail_inbound_filter_mode: FilterMode | str = _UNSET,  # type: ignore[assignment]
+        mail_outbound_filter_mode: FilterMode | str = _UNSET,  # type: ignore[assignment]
+        slack_filter_mode: FilterMode | str | None = None,
+        slack_inbound_filter_mode: FilterMode | str = _UNSET,  # type: ignore[assignment]
+        slack_outbound_filter_mode: FilterMode | str = _UNSET,  # type: ignore[assignment]
+        phone_inbound_filter_mode: FilterMode | str = _UNSET,  # type: ignore[assignment]
+        phone_outbound_filter_mode: FilterMode | str = _UNSET,  # type: ignore[assignment]
+    ) -> None:
+        """Update this identity's display name, description,
+        iMessage reachability, and contact-rule filter modes.
+
+        Only provided fields are applied; omitted fields are left
+        unchanged. For ``display_name`` and ``description``, explicit
+        ``None`` clears the column; omitting the keyword argument leaves
+        it untouched.
+
+        Args:
+            display_name: New display name, or ``None`` to clear.
+            description: New description, or ``None`` to clear.
+            imessage_enabled: Toggle iMessage reachability.
+            contact_sharing_enabled: Toggle automatic name and optional photo
+                sharing for an attached dedicated iMessage line.
+            imessage_number_id: Attach an already-owned dedicated line by
+                UUID, pass ``None`` to move back to the shared service, or
+                omit to keep the current attachment.
+            claim_imessage_number: Claim and attach a new dedicated iMessage
+                line. Cannot be combined with
+                ``imessage_number_id`` and requires ``idempotency_key``.
+            idempotency_key: Stable caller-generated key for a dedicated-line
+                claim. Reuse it when retrying the same logical update.
+            imessage_filter_mode: ``"whitelist"`` or ``"blacklist"`` for
+                iMessage contact rules (admin-only).
+            mail_filter_mode: ``"whitelist"`` or ``"blacklist"`` for this
+                identity's mail contact rules (admin-only). Note: unlike the
+                deprecated ``mailboxes.update(filter_mode=...)``, this does
+                not return a ``FilterModeChangeNotice``.
+            phone_filter_mode: ``"whitelist"`` or ``"blacklist"`` for this
+                identity's phone contact rules (admin-only).
+            mail_inbound_filter_mode: Effective receive mode for email.
+            mail_outbound_filter_mode: Effective send mode for email.
+            slack_filter_mode: Set both Slack directions (admin-only).
+            slack_inbound_filter_mode: Effective receive mode for Slack.
+            slack_outbound_filter_mode: Effective send mode for Slack.
+            phone_inbound_filter_mode: Effective receive mode for phone/iMessage.
+            phone_outbound_filter_mode: Effective send mode for phone/iMessage.
+        """
+        update_kwargs: dict[str, Any] = {}
+        if display_name is not _UNSET:
+            update_kwargs["display_name"] = display_name
+        if description is not _UNSET:
+            update_kwargs["description"] = description
+        if imessage_enabled is not None:
+            update_kwargs["imessage_enabled"] = imessage_enabled
+        if contact_sharing_enabled is not None:
+            update_kwargs["contact_sharing_enabled"] = contact_sharing_enabled
+        if imessage_number_id is not _UNSET:
+            update_kwargs["imessage_number_id"] = imessage_number_id
+        if claim_imessage_number is not None:
+            update_kwargs["claim_imessage_number"] = claim_imessage_number
+        if idempotency_key is not None:
+            update_kwargs["idempotency_key"] = idempotency_key
+        if imessage_filter_mode is not None:
+            update_kwargs["imessage_filter_mode"] = (
+                imessage_filter_mode.value
+                if isinstance(imessage_filter_mode, FilterMode)
+                else imessage_filter_mode
+            )
+        if mail_filter_mode is not None:
+            update_kwargs["mail_filter_mode"] = (
+                mail_filter_mode.value
+                if isinstance(mail_filter_mode, FilterMode)
+                else mail_filter_mode
+            )
+        if phone_filter_mode is not None:
+            update_kwargs["phone_filter_mode"] = (
+                phone_filter_mode.value
+                if isinstance(phone_filter_mode, FilterMode)
+                else phone_filter_mode
+            )
+        if slack_filter_mode is not None:
+            update_kwargs["slack_filter_mode"] = FilterMode(slack_filter_mode).value
+        for name, value in (
+            ("slack_inbound_filter_mode", slack_inbound_filter_mode),
+            ("slack_outbound_filter_mode", slack_outbound_filter_mode),
+            ("mail_inbound_filter_mode", mail_inbound_filter_mode),
+            ("mail_outbound_filter_mode", mail_outbound_filter_mode),
+            ("phone_inbound_filter_mode", phone_inbound_filter_mode),
+            ("phone_outbound_filter_mode", phone_outbound_filter_mode),
+        ):
+            if value is not _UNSET:
+                update_kwargs[name] = value
+        result = self._inkbox._ids_resource.update(
+            self.agent_handle,
+            **update_kwargs,
+        )
+        # PATCH returns the full detail shape, including the current dedicated
+        # number and renamed tunnel. Update every cached channel directly;
+        # there is no follow-up GET that could race the mutation response.
+        self._data = result
+        self._mailbox = result.mailbox
+        self._phone_number = result.phone_number
+        self._imessage_number = result.imessage_number
+        self._tunnel = result.tunnel
+
+    def refresh(self) -> AgentIdentity:
+        """Re-fetch this identity from the API and update cached channels.
+
+        Also clears the credentials filter cache so the next access to
+        :attr:`credentials` re-evaluates access rules.  (The cache is
+        also automatically invalidated when the vault is re-unlocked.)
+
+        Returns:
+            ``self`` for chaining.
+        """
+        data = self._inkbox._ids_resource.get(self.agent_handle)
+        self._data = data
+        self._mailbox = data.mailbox
+        self._phone_number = data.phone_number
+        self._imessage_number = data.imessage_number
+        self._tunnel = data.tunnel
+        self._credentials = None
+        return self
+
+    def delete(self) -> None:
+        """Delete this identity.
+
+        Cascades: flips the linked mailbox to ``deleted``, force-finalizes
+        the linked tunnel to ``deleted``, revokes any identity-scoped
+        API keys, and releases any linked phone number (vendor + local).
+        """
+        self._inkbox._ids_resource.delete(self.agent_handle)
+
+    ## Internal guards
+
+    def _require_mailbox(self) -> None:
+        if not self._mailbox:
+            raise InkboxError(
+                f"Identity '{self.agent_handle}' has no mailbox — "
+                "this should only be reachable on a deleted identity."
+            )
+
+    def _require_phone(self) -> None:
+        if not self._phone_number:
+            raise InkboxError(
+                f"Identity '{self.agent_handle}' has no phone number assigned. "
+                "Call identity.provision_phone_number() first, or pass phone_number to create_identity()."
+            )
+
+    def _require_imessage(self) -> None:
+        if not self._data.imessage_enabled:
+            raise InkboxError(
+                f"Identity '{self.agent_handle}' is not iMessage-enabled. "
+                "Call identity.update(imessage_enabled=True) first, or pass "
+                "imessage_enabled=True to create_identity()."
+            )
+
+    def _require_vault_unlocked(self) -> None:
+        if self._inkbox._vault_resource._unlocked is None:
+            raise InkboxError(
+                "Vault must be unlocked before accessing credentials. "
+                "Call inkbox.vault.unlock(vault_key) first."
+            )
+
+    def __repr__(self) -> str:
+        return (
+            f"AgentIdentity(agent_handle={self.agent_handle!r}, "
+            f"mailbox={self._mailbox.email_address if self._mailbox else None!r}, "
+            f"phone={self._phone_number.number if self._phone_number else None!r})"
+        )

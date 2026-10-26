@@ -1,0 +1,552 @@
+import { Command } from "commander";
+import { printStatus } from "../output.js";
+import {
+  CallMode,
+  CallOrigin,
+  HostedAgentAuthorityMode,
+  IncomingCallAction,
+  ForwardingTargetType,
+  OnVoicemail,
+  VoicemailDetection,
+} from "@inkbox/sdk";
+import { createClient, getGlobalOpts } from "../client.js";
+import { output } from "../output.js";
+import { withErrorHandler } from "../errors.js";
+
+interface PlaceCallCommandOptions {
+  identity: string;
+  to: string;
+  wsUrl?: string;
+  hosted?: boolean;
+  reason?: string;
+  origination?: string;
+  authorityMode?: string;
+  voicemailDetection?: boolean;
+  onVoicemail?: string;
+  voicemailMessage?: string;
+}
+
+interface PlaceCallOptions {
+  toNumber: string;
+  clientWebsocketUrl?: string;
+  mode?: CallMode;
+  reason?: string;
+  origination?: CallOrigin;
+  hostedAgentAuthorityMode?: HostedAgentAuthorityMode;
+  voicemailDetection?: VoicemailDetection;
+  onVoicemail?: OnVoicemail;
+  voicemailMessage?: string;
+}
+
+export function buildPlaceCallOptions(
+  cmdOpts: PlaceCallCommandOptions,
+): { callOptions: PlaceCallOptions } | { error: string } {
+  // Shape-only gating; everything else (reason length, capacity, quotas)
+  // is the server's call and surfaces as an API error.
+  if (cmdOpts.hosted && !cmdOpts.reason) {
+    return { error: "--hosted requires --reason (the agent's task brief)." };
+  }
+  if (cmdOpts.hosted && cmdOpts.wsUrl) {
+    return { error: "--hosted conflicts with --ws-url (Voice AI calls need no socket)." };
+  }
+  if (!cmdOpts.hosted && cmdOpts.reason) {
+    return { error: "--reason is only valid with --hosted." };
+  }
+  if (
+    cmdOpts.origination !== undefined
+    && !Object.values(CallOrigin).includes(cmdOpts.origination as CallOrigin)
+  ) {
+    return {
+      error:
+        "--origination must be dedicated_number, shared_imessage_number, "
+        + "or dedicated_imessage_number.",
+    };
+  }
+  if (
+    cmdOpts.authorityMode !== undefined
+    && !Object.values(HostedAgentAuthorityMode).includes(
+      cmdOpts.authorityMode as HostedAgentAuthorityMode,
+    )
+  ) {
+    return { error: "--authority-mode must be contact_scoped or yolo." };
+  }
+  if (!cmdOpts.hosted && cmdOpts.authorityMode !== undefined) {
+    return { error: "--authority-mode requires --hosted." };
+  }
+  if (
+    cmdOpts.onVoicemail !== undefined
+    && !Object.values(OnVoicemail).includes(cmdOpts.onVoicemail as OnVoicemail)
+  ) {
+    return { error: "--on-voicemail must be leave_message, hang_up, or ignore." };
+  }
+  // --voicemail-message only makes sense when the agent will leave one;
+  // the deprecated opt-out flag means "ignore", which contradicts that.
+  if (
+    cmdOpts.voicemailMessage !== undefined
+    && cmdOpts.onVoicemail !== OnVoicemail.LEAVE_MESSAGE
+  ) {
+    return { error: "--voicemail-message requires --on-voicemail leave_message." };
+  }
+  if (cmdOpts.voicemailMessage !== undefined && cmdOpts.voicemailDetection === false) {
+    return { error: "--voicemail-message conflicts with --no-voicemail-detection." };
+  }
+
+  const callOptions: PlaceCallOptions = { toNumber: cmdOpts.to };
+  if (cmdOpts.wsUrl) {
+    callOptions.clientWebsocketUrl = cmdOpts.wsUrl;
+  }
+  if (cmdOpts.hosted) {
+    callOptions.mode = CallMode.HOSTED_AGENT;
+    callOptions.reason = cmdOpts.reason;
+  }
+  if (cmdOpts.origination) {
+    callOptions.origination = cmdOpts.origination as CallOrigin;
+  }
+  if (cmdOpts.authorityMode !== undefined) {
+    callOptions.hostedAgentAuthorityMode =
+      cmdOpts.authorityMode as HostedAgentAuthorityMode;
+  }
+  if (cmdOpts.voicemailDetection === false) {
+    callOptions.voicemailDetection = VoicemailDetection.DISABLED;
+  }
+  if (cmdOpts.onVoicemail !== undefined) {
+    callOptions.onVoicemail = cmdOpts.onVoicemail as OnVoicemail;
+  }
+  if (cmdOpts.voicemailMessage !== undefined) {
+    callOptions.voicemailMessage = cmdOpts.voicemailMessage;
+  }
+  return { callOptions };
+}
+
+export function registerPhoneCommands(program: Command): void {
+  const phone = program
+    .command("phone")
+    .description("Phone operations (identity-scoped)");
+
+  phone
+    .command("call")
+    .description("Place an outbound call")
+    .requiredOption("-i, --identity <handle>", "Agent identity handle")
+    .requiredOption("--to <number>", "E.164 destination number")
+    .option("--ws-url <url>", "WebSocket URL (wss://) for audio bridging")
+    .option("--hosted", "Let Inkbox Voice AI drive the call (requires --reason)")
+    .option("--reason <text>", "Voice AI's task brief — what to accomplish")
+    .option(
+      "--authority-mode <mode>",
+      "Voice AI authority override: contact_scoped or yolo; omit to inherit the saved default",
+    )
+    .option(
+      "--origination <origin>",
+      "Call origin: dedicated_number, shared_imessage_number, or dedicated_imessage_number",
+    )
+    .option(
+      "--on-voicemail <action>",
+      "What to do when voicemail answers: leave_message, hang_up, or ignore; "
+        + "omit for the default (leave_message with --hosted, hang_up otherwise)",
+    )
+    .option(
+      "--voicemail-message <text>",
+      "What Voice AI says on the voicemail (requires --on-voicemail leave_message)",
+    )
+    .option(
+      "--no-voicemail-detection",
+      "Deprecated; use --on-voicemail ignore. Keep the call connected when voicemail is detected",
+    )
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        cmdOpts: PlaceCallCommandOptions,
+      ) {
+        const built = buildPlaceCallOptions(cmdOpts);
+        if ("error" in built) {
+          console.error(built.error);
+          process.exit(1);
+        }
+
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const identity = await inkbox.getIdentity(cmdOpts.identity);
+        const call = await identity.placeCall(built.callOptions);
+        output(
+          {
+            id: call.id,
+            from: call.localPhoneNumber,
+            to: call.remotePhoneNumber,
+            origin: call.origin,
+            status: call.status,
+            mode: call.mode,
+            reason: call.reason,
+            authorityMode: call.hostedAgentAuthorityMode,
+            voicemailDetection: call.voicemailDetection,
+            onVoicemail: call.onVoicemail,
+            callsRemaining: call.rateLimit.callsRemaining,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  phone
+    .command("calls")
+    .description("List calls")
+    .requiredOption("-i, --identity <handle>", "Agent identity handle")
+    .option("--limit <n>", "Max results", "50")
+    .option("--offset <n>", "Pagination offset", "0")
+    .option("--start-datetime <date>", "Only calls with created_at >= this date/instant")
+    .option("--end-datetime <date>", "Only calls with created_at <= this date (bare date is whole-day inclusive)")
+    .option("--tz <zone>", "IANA timezone for bare/zone-less dates (default UTC)")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        cmdOpts: {
+          identity: string;
+          limit: string;
+          offset: string;
+          startDatetime?: string;
+          endDatetime?: string;
+          tz?: string;
+        },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const identity = await inkbox.getIdentity(cmdOpts.identity);
+        const calls = await identity.listCalls({
+          limit: parseInt(cmdOpts.limit, 10),
+          offset: parseInt(cmdOpts.offset, 10),
+          startDatetime: cmdOpts.startDatetime,
+          endDatetime: cmdOpts.endDatetime,
+          tz: cmdOpts.tz,
+        });
+        output(calls, {
+          json: !!opts.json,
+          columns: [
+            "id",
+            "direction",
+            "remotePhoneNumber",
+            "status",
+            "createdAt",
+          ],
+        });
+      }),
+    );
+
+  phone
+    .command("transcripts <call-id>")
+    .description("Get call transcripts")
+    .requiredOption("-i, --identity <handle>", "Agent identity handle")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        callId: string,
+        cmdOpts: { identity: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const identity = await inkbox.getIdentity(cmdOpts.identity);
+        const transcripts = await identity.listTranscripts(callId);
+        output(transcripts, {
+          json: !!opts.json,
+          columns: ["seq", "party", "phoneNumber", "text", "createdAt"],
+        });
+      }),
+    );
+
+  phone
+    .command("tool-activity <call-id>")
+    .description("List Voice AI tool activity")
+    .requiredOption("-i, --identity <handle>", "Agent identity handle")
+    .option("--limit <n>", "Max results", "50")
+    .option("--offset <n>", "Pagination offset", "0")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        callId: string,
+        cmdOpts: { identity: string; limit: string; offset: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const identity = await inkbox.getIdentity(cmdOpts.identity);
+        const activity = await identity.listToolInvocations(callId, {
+          limit: parseInt(cmdOpts.limit, 10),
+          offset: parseInt(cmdOpts.offset, 10),
+        });
+        if (opts.json) {
+          output(activity, { json: true });
+          return;
+        }
+        output(activity.items, {
+          json: false,
+          columns: [
+            "id",
+            "toolName",
+            "status",
+            "startedAt",
+            "completedAt",
+          ],
+        });
+      }),
+    );
+
+  phone
+    .command("hangup <call-id>")
+    .description("Hang up a live call")
+    .requiredOption("-i, --identity <handle>", "Agent identity handle")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        callId: string,
+        cmdOpts: { identity: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const identity = await inkbox.getIdentity(cmdOpts.identity);
+        const call = await identity.hangupCall(callId);
+        output(
+          {
+            id: call.id,
+            // Hangup applies to inbound calls too, so label the peer as the
+            // remote party (with direction) rather than a destination "to".
+            direction: call.direction,
+            remotePhoneNumber: call.remotePhoneNumber,
+            status: call.status,
+            hangupReason: call.hangupReason,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  phone
+    .command("search-transcripts")
+    .description("Search call transcripts")
+    .requiredOption("-i, --identity <handle>", "Agent identity handle")
+    .requiredOption("-q, --query <query>", "Search query")
+    .option("--party <party>", "Filter by speaker: local or remote")
+    .option("--limit <n>", "Max results", "50")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        cmdOpts: {
+          identity: string;
+          query: string;
+          party?: string;
+          limit: string;
+        },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const identity = await inkbox.getIdentity(cmdOpts.identity);
+        if (!identity.phoneNumber) {
+          console.error(
+            `Identity '${cmdOpts.identity}' has no phone number assigned.`,
+          );
+          process.exit(1);
+        }
+        const transcripts = await inkbox.phoneNumbers.searchTranscripts(
+          identity.phoneNumber.id,
+          {
+            q: cmdOpts.query,
+            party: cmdOpts.party,
+            limit: parseInt(cmdOpts.limit, 10),
+          },
+        );
+        output(transcripts, {
+          json: !!opts.json,
+          columns: ["id", "callId", "seq", "party", "phoneNumber", "text", "createdAt"],
+        });
+      }),
+    );
+
+  phone
+    .command("incoming-action [action]")
+    .description(
+      "Get, or set this identity's incoming-call action: auto_accept | " +
+        "auto_reject | webhook | hosted_agent | forward",
+    )
+    .requiredOption("-i, --identity <handle>", "Agent identity handle")
+    .option("--ws-url <url>", "WebSocket URL (wss://) for audio bridging")
+    .option("--webhook-url <url>", "HTTPS receiver for the webhook action")
+    .option("--forward-to-phone <number>", "Forward to a complete E.164 number")
+    .option("--forward-to-sip <uri>", "Forward to a SIP URI with a public DNS hostname")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        action: string | undefined,
+        cmdOpts: {
+          identity: string;
+          wsUrl?: string;
+          webhookUrl?: string;
+          forwardToPhone?: string;
+          forwardToSip?: string;
+        },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const identity = await inkbox.getIdentity(cmdOpts.identity);
+        // Without an action, print the current config; with one, set it.
+        // The action string is forwarded verbatim — the server rejects
+        // unknown values.
+        if (cmdOpts.forwardToPhone && cmdOpts.forwardToSip) {
+          throw new Error("--forward-to-phone and --forward-to-sip are mutually exclusive");
+        }
+        if (action === IncomingCallAction.FORWARD && !cmdOpts.forwardToPhone && !cmdOpts.forwardToSip) {
+          throw new Error("forward requires --forward-to-phone or --forward-to-sip");
+        }
+        if (action !== IncomingCallAction.FORWARD && (cmdOpts.forwardToPhone || cmdOpts.forwardToSip)) {
+          throw new Error("forwarding destination flags require the 'forward' action");
+        }
+        const config = action
+          ? await identity.setIncomingCallAction({
+              incomingCallAction: action as IncomingCallAction,
+              clientWebsocketUrl: cmdOpts.wsUrl,
+              incomingCallWebhookUrl: cmdOpts.webhookUrl,
+              forwardingTargetType: cmdOpts.forwardToPhone
+                ? ForwardingTargetType.PHONE
+                : cmdOpts.forwardToSip
+                  ? ForwardingTargetType.SIP
+                  : undefined,
+              forwardingPhoneNumber: cmdOpts.forwardToPhone,
+              forwardingSipUri: cmdOpts.forwardToSip,
+            })
+          : await identity.getIncomingCallAction();
+        output(
+          {
+            agentIdentityId: config.agentIdentityId,
+            incomingCallAction: config.incomingCallAction,
+            clientWebsocketUrl: config.clientWebsocketUrl,
+            incomingCallWebhookUrl: config.incomingCallWebhookUrl,
+            forwardingTargetType: config.forwardingTargetType,
+            forwardingPhoneNumber: config.forwardingPhoneNumber,
+            forwardingSipUri: config.forwardingSipUri,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  const hostedAgent = phone
+    .command("hosted-agent")
+    .description("Inkbox Voice AI configuration and voice discovery");
+
+  hostedAgent
+    .command("voices")
+    .description("List voices, selection availability, and preview URLs")
+    .action(
+      withErrorHandler(async function (this: Command) {
+        const opts = getGlobalOpts(this);
+        const catalog = await createClient(opts).hostedAgent.listVoices();
+        if (opts.json) {
+          output(catalog, { json: true });
+          return;
+        }
+        printStatus(`Default voice: ${catalog.defaultVoice}`);
+        output(catalog.voices, {
+          json: false,
+          columns: ["id", "name", "description", "available", "previewUrl"],
+        });
+      }),
+    );
+
+  hostedAgent
+    .command("get")
+    .description("Show this identity's Inkbox Voice AI config")
+    .requiredOption("-i, --identity <handle>", "Agent identity handle")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        cmdOpts: { identity: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const identity = await inkbox.getIdentity(cmdOpts.identity);
+        const config = await identity.getHostedAgentConfig();
+        output(
+          {
+            agentIdentityId: config.agentIdentityId,
+            voice: config.voice,
+            model: config.model,
+            effectiveVoice: config.effectiveVoice,
+            effectiveModel: config.effectiveModel,
+            instructions: config.instructions,
+            authorityMode: config.authorityMode,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  hostedAgent
+    .command("set")
+    .description(
+      "Set this identity's Inkbox Voice AI config. Full replace: an " +
+        "omitted flag resets that field to the server default",
+    )
+    .requiredOption("-i, --identity <handle>", "Agent identity handle")
+    .option("--voice <voice>", "Voice override")
+    .option("--model <model>", "Deprecated; accepted but ignored")
+    .option("--instructions <text>", "Per-identity steering prompt")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        cmdOpts: {
+          identity: string;
+          voice?: string;
+          model?: string;
+          instructions?: string;
+        },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const identity = await inkbox.getIdentity(cmdOpts.identity);
+        const config = await identity.setHostedAgentConfig({
+          voice: cmdOpts.voice,
+          model: cmdOpts.model,
+          instructions: cmdOpts.instructions,
+        });
+        output(
+          {
+            agentIdentityId: config.agentIdentityId,
+            voice: config.voice,
+            model: config.model,
+            effectiveVoice: config.effectiveVoice,
+            effectiveModel: config.effectiveModel,
+            instructions: config.instructions,
+            authorityMode: config.authorityMode,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  hostedAgent
+    .command("authority-mode <mode>")
+    .description("Set the saved authority for future Voice AI calls (admin API key)")
+    .requiredOption("-i, --identity <handle>", "Agent identity handle")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        mode: string,
+        cmdOpts: { identity: string },
+      ) {
+        if (!Object.values(HostedAgentAuthorityMode).includes(
+          mode as HostedAgentAuthorityMode,
+        )) {
+          console.error("mode must be contact_scoped or yolo.");
+          process.exit(1);
+        }
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const identity = await inkbox.getIdentity(cmdOpts.identity);
+        const config = await identity.setHostedAgentAuthorityMode({
+          authorityMode: mode as HostedAgentAuthorityMode,
+        });
+        output(
+          {
+            agentIdentityId: config.agentIdentityId,
+            authorityMode: config.authorityMode,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+}

@@ -1,0 +1,365 @@
+//! Canonical error types for the Inkbox SDK.
+//!
+//! Mirrors `inkbox/exceptions.py`: a single [`InkboxError`] enum stands in for
+//! the Python exception hierarchy (`InkboxError` base, `InkboxAPIError`, and
+//! the structured 4xx/409/403 subclasses), plus the SDK-internal transport
+//! and decoding failures that Python surfaces as `httpx`/`json` errors.
+
+use serde_json::Value;
+use uuid::Uuid;
+
+/// Result alias used throughout the SDK.
+pub type Result<T> = std::result::Result<T, InkboxError>;
+
+pub(crate) fn parse_agent_support(envelope: Option<&Value>) -> Option<Box<str>> {
+    envelope
+        .and_then(Value::as_object)
+        .and_then(|map| map.get("agent_support"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(Into::into)
+}
+
+/// Base error for all Inkbox SDK failures.
+#[derive(Debug, thiserror::Error)]
+pub enum InkboxError {
+    /// The API returned a 4xx or 5xx response. Carries the HTTP status code
+    /// and the parsed `detail` (a plain string, or a structured object for
+    /// errors that ship machine-readable fields).
+    #[error("HTTP {status_code}: {detail}")]
+    Api {
+        /// HTTP status code.
+        status_code: u16,
+        /// Error detail from the response body.
+        detail: ApiErrorDetail,
+        /// Support Agent escalation instructions supplied by the API.
+        agent_support: Option<Box<str>>,
+    },
+
+    /// 409 when creating a mail/phone/iMessage contact rule that duplicates an
+    /// existing `(match_type, match_target)` pair on the same resource.
+    #[error("HTTP {status_code}: duplicate contact rule (existing_rule_id={existing_rule_id})")]
+    DuplicateContactRule {
+        status_code: u16,
+        /// UUID of the already-existing rule.
+        existing_rule_id: Uuid,
+        /// Full structured detail from the server. Boxed to keep `InkboxError`
+        /// small (this variant is rare; `serde_json::Value` is ~72 bytes).
+        detail: Box<Value>,
+        /// Support Agent escalation instructions supplied by the API.
+        agent_support: Option<Box<str>>,
+    },
+
+    /// 409 when posting a contact-access grant that is redundant under the
+    /// current access model (e.g. a per-identity grant atop an active wildcard).
+    #[error("HTTP {status_code}: redundant contact access grant ({error})")]
+    RedundantContactAccessGrant {
+        status_code: u16,
+        /// Discriminator string from the server (`"redundant_grant"`).
+        error: String,
+        /// Human-readable explanation from the server's `detail` field.
+        detail_message: String,
+        /// Full structured detail from the server. Boxed to keep `InkboxError`
+        /// small (this variant is rare; `serde_json::Value` is ~72 bytes).
+        detail: Box<Value>,
+        /// Support Agent escalation instructions supplied by the API.
+        agent_support: Option<Box<str>>,
+    },
+
+    /// 403 when an SMS, call, or iMessage destination is blocked by an outbound
+    /// contact rule on the sender (or the sender's `filter_mode` default).
+    #[error("HTTP {status_code}: recipient blocked ({address})")]
+    RecipientBlocked {
+        status_code: u16,
+        /// UUID of the rule that blocked the recipient, or `None` when the
+        /// block came from the phone number's `filter_mode` default.
+        matched_rule_id: Option<Uuid>,
+        /// The blocked counterparty (E.164 phone number).
+        address: String,
+        /// Human-readable explanation from the server.
+        reason: String,
+        /// Full structured detail from the server. Boxed to keep `InkboxError`
+        /// small (this variant is rare; `serde_json::Value` is ~72 bytes).
+        detail: Box<Value>,
+        /// Support Agent escalation instructions supplied by the API.
+        agent_support: Option<Box<str>>,
+    },
+
+    /// 402 when an outbound mail send would push the mailbox past its plan's
+    /// storage cap. Raised by `messages().send()`, `reply_all()`, and
+    /// `forward()`. Free space with `messages().delete()` /
+    /// `threads().delete()`, or upgrade the plan at `upgrade_url`.
+    #[error("HTTP {status_code}: storage limit exceeded ({message})")]
+    StorageLimitExceeded {
+        status_code: u16,
+        /// Human-readable explanation from the server.
+        message: String,
+        /// Billing page where the plan can be upgraded.
+        upgrade_url: String,
+        /// The mailbox's storage cap in binary bytes, when supplied by the server.
+        limit_bytes: Option<u64>,
+        /// Full structured detail from the server. Boxed to keep `InkboxError`
+        /// small (this variant is rare; `serde_json::Value` is ~72 bytes).
+        detail: Box<Value>,
+        /// Support Agent escalation instructions supplied by the API.
+        agent_support: Option<Box<str>>,
+    },
+
+    /// 402 when the organization has reached its dedicated iMessage number
+    /// allowance. The response retains a fixed compatibility field.
+    #[error("HTTP {status_code}: dedicated iMessage number quota exceeded ({message})")]
+    DedicatedIMessageNumberQuotaExceeded {
+        status_code: u16,
+        message: Box<str>,
+        /// Fixed response compatibility field.
+        number_type: Box<str>,
+        limit: i64,
+        current: i64,
+        upgrade_url: Box<str>,
+        contact_email: Box<str>,
+        detail: Box<Value>,
+        /// Support Agent escalation instructions supplied by the API.
+        agent_support: Option<Box<str>>,
+    },
+
+    /// 503 when no dedicated iMessage number is currently available to claim.
+    #[error("HTTP {status_code}: dedicated iMessage number inventory pending ({message})")]
+    DedicatedIMessageNumberInventoryPending {
+        status_code: u16,
+        message: Box<str>,
+        /// Fixed response compatibility field.
+        number_type: Box<str>,
+        retry_after_seconds: u64,
+        /// Parsed delta-seconds value from the HTTP `Retry-After` header.
+        retry_after_header: Option<u64>,
+        detail: Box<Value>,
+        /// Support Agent escalation instructions supplied by the API.
+        agent_support: Option<Box<str>>,
+    },
+
+    /// 409 when an idempotency key is reused with an incompatible request.
+    #[error("HTTP {status_code}: idempotency key reused ({message})")]
+    IdempotencyKeyReused {
+        status_code: u16,
+        message: Box<str>,
+        detail: Box<Value>,
+        /// Support Agent escalation instructions supplied by the API.
+        agent_support: Option<Box<str>>,
+    },
+
+    /// A vault key did not meet requirements, or a vault crypto operation failed.
+    /// Mirrors `InkboxVaultKeyError`.
+    #[error("vault key error: {0}")]
+    VaultKey(String),
+
+    /// A value supplied by the caller failed local validation (mirrors the
+    /// `ValueError`/`TypeError` raised by the Python SDK before any request).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// A tunnels-specific failure. See [`crate::tunnels::exceptions`].
+    #[error("tunnel error: {0}")]
+    Tunnel(String),
+
+    /// A stored tunnel id returned 404 while opening the data plane.
+    #[error("tunnel error: TunnelRemoved: {message}")]
+    TunnelRemoved {
+        message: String,
+        /// Support Agent escalation instructions supplied with the originating 404.
+        agent_support: Option<Box<str>>,
+    },
+
+    /// Transport-level failure (connection, timeout, TLS) — Python's `httpx`
+    /// errors.
+    #[error("transport error: {0}")]
+    Transport(#[from] reqwest::Error),
+
+    /// 429 when the organization's daily mailbox-import job quota is spent.
+    #[error("HTTP {status_code}: mail import quota exceeded ({message})")]
+    MailImportQuotaExceeded {
+        status_code: u16,
+        message: Box<str>,
+        /// Parsed delta-seconds value from the HTTP `Retry-After` header.
+        retry_after_header: Option<u64>,
+        detail: Box<Value>,
+        /// Support Agent escalation instructions supplied by the API.
+        agent_support: Option<Box<str>>,
+    },
+
+    /// A local wait exceeded its wall-clock budget. The remote job is
+    /// untouched; waiting again picks it back up.
+    #[error("timed out: {0}")]
+    Timeout(String),
+
+    /// A direct mailbox import upload returned an HTTP error.
+    #[error("import upload failed with HTTP {status_code}: {detail}")]
+    MailImportUpload { status_code: u16, detail: String },
+
+    /// A direct mailbox import upload failed before receiving an HTTP response.
+    #[error("import upload failed: {detail}")]
+    MailImportUploadTransport { detail: String },
+
+    /// Response body could not be decoded as the expected JSON shape.
+    #[error("decode error: {0}")]
+    Decode(#[from] serde_json::Error),
+}
+
+impl InkboxError {
+    pub(crate) fn with_agent_support(mut self, support: Option<Box<str>>) -> Self {
+        match &mut self {
+            InkboxError::Api { agent_support, .. }
+            | InkboxError::DuplicateContactRule { agent_support, .. }
+            | InkboxError::RedundantContactAccessGrant { agent_support, .. }
+            | InkboxError::RecipientBlocked { agent_support, .. }
+            | InkboxError::StorageLimitExceeded { agent_support, .. }
+            | InkboxError::DedicatedIMessageNumberQuotaExceeded { agent_support, .. }
+            | InkboxError::DedicatedIMessageNumberInventoryPending { agent_support, .. }
+            | InkboxError::IdempotencyKeyReused { agent_support, .. }
+            | InkboxError::MailImportQuotaExceeded { agent_support, .. }
+            | InkboxError::TunnelRemoved { agent_support, .. } => {
+                *agent_support = support;
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Support Agent escalation instructions supplied with an API error.
+    ///
+    /// Returns `None` for local validation, transport, decoding, and other
+    /// errors that were not created from an API error response.
+    pub fn agent_support(&self) -> Option<&str> {
+        match self {
+            InkboxError::Api { agent_support, .. }
+            | InkboxError::DuplicateContactRule { agent_support, .. }
+            | InkboxError::RedundantContactAccessGrant { agent_support, .. }
+            | InkboxError::RecipientBlocked { agent_support, .. }
+            | InkboxError::StorageLimitExceeded { agent_support, .. }
+            | InkboxError::DedicatedIMessageNumberQuotaExceeded { agent_support, .. }
+            | InkboxError::DedicatedIMessageNumberInventoryPending { agent_support, .. }
+            | InkboxError::IdempotencyKeyReused { agent_support, .. }
+            | InkboxError::MailImportQuotaExceeded { agent_support, .. }
+            | InkboxError::TunnelRemoved { agent_support, .. } => agent_support.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Server-supplied retry delay, when this error exposes one.
+    pub fn retry_after_seconds(&self) -> Option<u64> {
+        match self {
+            InkboxError::Api { detail, .. } => detail
+                .as_object()
+                .and_then(Value::as_object)
+                .and_then(|map| map.get("retry_after_seconds"))
+                .and_then(Value::as_u64),
+            InkboxError::DedicatedIMessageNumberInventoryPending {
+                retry_after_seconds,
+                ..
+            } => Some(*retry_after_seconds),
+            InkboxError::MailImportQuotaExceeded {
+                retry_after_header, ..
+            } => *retry_after_header,
+            _ => None,
+        }
+    }
+
+    /// True iff this is the terminal "another client took over this tunnel"
+    /// error surfaced by a tunnel client's `serve_forever`. Terminal by
+    /// design: the client has stopped and will not reconnect. Lets callers
+    /// tell a takeover apart from a transient, reconnectable tunnel error.
+    pub fn is_tunnel_superseded(&self) -> bool {
+        matches!(self, InkboxError::Tunnel(m) if m.starts_with("tunnel-superseded:"))
+    }
+}
+
+/// The `detail` payload on an [`InkboxError::Api`]: either a human-readable
+/// string or a structured object, matching the Python `str | dict` union.
+#[derive(Debug, Clone)]
+pub enum ApiErrorDetail {
+    /// A plain human-readable message.
+    Message(String),
+    /// A structured object carrying machine-readable fields.
+    Structured(Value),
+}
+
+impl std::fmt::Display for ApiErrorDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiErrorDetail::Message(s) => f.write_str(s),
+            ApiErrorDetail::Structured(v) => write!(f, "{v}"),
+        }
+    }
+}
+
+impl ApiErrorDetail {
+    /// Borrow the structured object, if this detail is one.
+    pub fn as_object(&self) -> Option<&Value> {
+        match self {
+            ApiErrorDetail::Structured(v) => Some(v),
+            ApiErrorDetail::Message(_) => None,
+        }
+    }
+}
+
+pub(crate) fn api_error_detail_with_retry(
+    raw_detail: Value,
+    retry_after_seconds: Option<u64>,
+) -> ApiErrorDetail {
+    match (raw_detail, retry_after_seconds) {
+        (Value::String(message), None) => ApiErrorDetail::Message(message),
+        (Value::String(message), Some(seconds)) => ApiErrorDetail::Structured(serde_json::json!({
+            "message": message,
+            "retry_after_seconds": seconds,
+        })),
+        (Value::Object(mut map), retry_after_seconds) => {
+            if let Some(seconds) = retry_after_seconds {
+                map.insert("retry_after_seconds".to_string(), Value::from(seconds));
+            }
+            ApiErrorDetail::Structured(Value::Object(map))
+        }
+        (structured, None) => ApiErrorDetail::Structured(structured),
+        (detail, Some(seconds)) => ApiErrorDetail::Structured(serde_json::json!({
+            "detail": detail,
+            "retry_after_seconds": seconds,
+        })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{api_error_detail_with_retry, ApiErrorDetail, InkboxError};
+    use serde_json::json;
+
+    #[test]
+    fn stale_tunnel_error_exposes_agent_support() {
+        let error = InkboxError::TunnelRemoved {
+            message: "stored tunnel was removed".into(),
+            agent_support: Some("Contact the Support Agent.".into()),
+        };
+
+        assert_eq!(error.agent_support(), Some("Contact the Support Agent."));
+        assert_eq!(
+            error.to_string(),
+            "tunnel error: TunnelRemoved: stored tunnel was removed"
+        );
+    }
+
+    #[test]
+    fn retry_header_enriches_string_detail_without_changing_the_api_variant() {
+        let detail = api_error_detail_with_retry(json!("try later"), Some(12));
+        let error = InkboxError::Api {
+            status_code: 429,
+            detail,
+            agent_support: None,
+        };
+
+        assert_eq!(error.retry_after_seconds(), Some(12));
+        assert!(matches!(
+            error,
+            InkboxError::Api {
+                detail: ApiErrorDetail::Structured(_),
+                ..
+            }
+        ));
+    }
+}

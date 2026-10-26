@@ -1,0 +1,941 @@
+"""
+inkbox/webhooks.py
+
+Receiver-side webhook payload types.
+
+Wire-shape only: every field is snake_case so
+``cast(MailWebhookPayload, json.loads(body))`` round-trips without a
+transformer. Enum-valued fields are ``Literal[...]`` string unions
+(e.g. ``Literal["inbound", "outbound"]``) rather than ``StrEnum``s,
+since ``json.loads`` produces bare strings.
+"""
+
+from __future__ import annotations
+
+from typing import Literal, NotRequired, TypedDict
+from inkbox.companion import CompanionMetadata
+from inkbox.sender_access import SenderAccess
+
+from inkbox.slack import SlackMessageKind
+
+
+# ---- Wire union types ____________________________________________________
+
+MessageDirectionWire = Literal["inbound", "outbound"]
+
+MessageStatus = Literal[
+    "queued",
+    "sent",
+    "delivered",
+    "bounced",
+    "failed",
+    "received",
+    "deleted",
+]
+
+TextDirectionWire = Literal["inbound", "outbound"]
+
+TextTypeWire = Literal["sms", "mms"]
+
+SmsDeliveryStatusWire = Literal[
+    "queued",
+    "sent",
+    "delivered",
+    "delivery_failed",
+    "delivery_unconfirmed",
+    "sending_failed",
+]
+
+TextMessageOriginWire = Literal["user_initiated", "auto_reply"]
+
+CallOriginWire = Literal[
+    "dedicated_number",
+    "shared_imessage_number",
+    "dedicated_imessage_number",
+]
+
+CallDirectionWire = Literal["outbound", "inbound"]
+
+CallStatusWire = Literal[
+    "initiated",
+    "ringing",
+    "answered",
+    "completed",
+    "failed",
+    "canceled",
+]
+
+HangupReasonWire = Literal[
+    "local",
+    "remote",
+    "max_duration",
+    "voicemail",
+    "rejected",
+]
+
+CallModeWire = Literal["client_websocket", "hosted_agent"]
+HostedAgentAuthorityModeWire = Literal["contact_scoped", "yolo"]
+VoicemailDetectionWire = Literal["enabled", "disabled"]
+OnVoicemailWire = Literal["leave_message", "hang_up", "ignore"]
+
+CallOutcomeWire = Literal["completed", "no_answer", "declined", "failed"]
+
+
+# ---- Nested wire shapes __________________________________________________
+
+
+class TextMediaItemWire(TypedDict):
+    """MMS media attachment (snake_case wire shape)."""
+
+    content_type: str
+    size: int
+    url: str
+
+
+class TextMessageRecipientWire(TypedDict):
+    """Per-recipient outbound SMS/MMS delivery state."""
+
+    recipient_phone_number: str
+    delivery_status: SmsDeliveryStatusWire | None
+    carrier: str | None
+    line_type: str | None
+    error_code: str | None
+    error_detail: str | None
+    sent_at: str | None
+    delivered_at: str | None
+    failed_at: str | None
+
+
+class RateLimitInfoWire(TypedDict):
+    """Org rate-limit snapshot on inbound-call payloads."""
+
+    calls_used: int
+    calls_remaining: int
+    calls_limit: int
+    minutes_used: float
+    minutes_remaining: float
+    minutes_limit: int
+
+
+# ---- Shared ______________________________________________________________
+
+
+class WebhookContact(TypedDict):
+    """
+    Address-book match for a remote party on a phone or text webhook
+    event. Surfaced as a list -- pass ``id`` to
+    ``inkbox.contacts.get()`` to hydrate.
+    """
+
+    id: str
+    # None when the contact has no name on file. Never falls back to the
+    # phone number or email address.
+    name: str | None
+    # Active memories, newest first; optional only for older replays.
+    memories: NotRequired[list[str]]
+
+
+class WebhookAgentIdentity(TypedDict):
+    """
+    Identity match for a remote party on a phone or text webhook
+    event. Set when the remote party is an active agent identity in
+    the same org that is visible to the receiver.
+    """
+
+    id: str
+    agent_handle: str
+    display_name: str | None
+
+
+# ---- Conversation context ________________________________________________
+
+WebhookContextScopeWire = Literal["thread", "conversation", "contact"]
+WebhookContextModeWire = Literal["count", "window"]
+WebhookContextSkipReasonWire = Literal["no_contact", "no_resource", "unavailable"]
+WebhookContextTextChannelWire = Literal["sms", "imessage"]
+
+
+class WebhookContextTextMediaWire(TypedDict):
+    """Media metadata for a context text item: a count only, never URLs."""
+
+    count: int
+
+
+class WebhookContextMailItemWire(TypedDict):
+    """Slim mail context item: metadata + snippet only; bodies are omitted.
+
+    Item-level nullable fields are **present with a ``null`` value** on the
+    wire, not omitted — so ``subject``/``snippet`` are required keys typed
+    ``str | None``, not ``NotRequired``.
+    """
+
+    id: str
+    direction: str
+    from_address: str
+    to_addresses: list[str]
+    created_at: str
+    subject: str | None
+    snippet: str | None
+    # Owning mailbox address; with ``id`` fetches the full body via
+    # messages.get(). NotRequired: payloads predating the feature omit it.
+    email_address: NotRequired[str | None]
+
+
+class WebhookContextTextItemWire(TypedDict):
+    """One merged texts-class item (SMS or iMessage).
+
+    ``media`` is metadata only (``{"count": N}``), never URLs. Item-level
+    nullable fields are present-with-``null`` on the wire, not omitted.
+    """
+
+    id: str
+    channel: WebhookContextTextChannelWire
+    direction: str
+    text: str
+    text_truncated: bool
+    created_at: str
+    sender: str | None
+    status: str | None
+    media: WebhookContextTextMediaWire | None
+
+
+class WebhookTranscriptEntryWire(TypedDict, total=False):
+    """One transcript entry: a turn or the abridgment marker.
+
+    Optional keys are omitted when unset. A turn has ``party``/``text``/
+    ``ts_ms`` (plus ``truncated`` when char-cut), the marker has
+    ``marker``/``omitted_turns``/``omitted_ms``. Discriminate on
+    ``"marker" in entry``.
+    """
+
+    party: str
+    text: str
+    ts_ms: int
+    phone_number: str | None
+    truncated: bool
+    marker: Literal["abridged"]
+    omitted_turns: int
+    omitted_ms: int
+
+
+class WebhookContextCallItemWire(TypedDict):
+    """One calls-class item: metadata plus its (possibly abridged) transcript.
+
+    ``remote_number`` is the far-end number (from the call's
+    ``remote_phone_number``); ``duration`` is the call length in whole
+    seconds. Item-level nullable fields are present-with-``null`` on the
+    wire, not omitted.
+    """
+
+    call_id: str
+    abridged: bool
+    transcript: list[WebhookTranscriptEntryWire]
+    direction: str | None
+    remote_number: str | None
+    duration: int | None
+    started_at: str | None
+
+
+class WebhookContextBlockWire(TypedDict):
+    """One delivered context class under ``data.context``.
+
+    Block-level optional keys (``mode``/``requested``/``hours``/``skipped``)
+    are absent when unset, not null — hence ``NotRequired``. This does NOT
+    apply to item-level fields, which are present-with-``null`` (see the
+    item types). ``items`` is chronological oldest-first and excludes the
+    trigger; a skipped class ships ``items: []`` plus ``skipped``.
+    """
+
+    scope: WebhookContextScopeWire
+    items: list[
+        WebhookContextMailItemWire
+        | WebhookContextTextItemWire
+        | WebhookContextCallItemWire
+    ]
+    truncated: bool
+    mode: NotRequired[WebhookContextModeWire]
+    requested: NotRequired[int]
+    hours: NotRequired[int]
+    skipped: NotRequired[WebhookContextSkipReasonWire]
+
+
+class WebhookContextWire(TypedDict, total=False):
+    """``data.context`` value — only configured classes appear.
+
+    Present only on received events whose subscription opted in via
+    ``context_config``. Capped at 256 KB; over-cap classes drop oldest
+    items and set ``truncated: true``.
+    """
+
+    email: WebhookContextBlockWire
+    texts: WebhookContextBlockWire
+    calls: WebhookContextBlockWire
+
+
+# ---- Mail ________________________________________________________________
+
+MailWebhookEventType = Literal[
+    "message.received",
+    "message.sent",
+    "message.forwarded",
+    "message.delivered",
+    "message.bounced",
+    "message.failed",
+]
+
+MailContactBucket = Literal["from", "to", "cc", "bcc"]
+"""Which recipient list a mail webhook contact/identity was matched from."""
+
+
+class WebhookMailContact(TypedDict):
+    """
+    Per-recipient address-book match on a mail webhook event.
+
+    Mail events resolve every relevant recipient (inbound: sender + CC;
+    outbound: every To + CC + BCC) and surface each match as its own
+    entry. Pair to the source field by ``(bucket, address)``, not by
+    ``address`` alone -- the same address may appear in multiple
+    buckets on a single send, producing one entry per bucket.
+    ``address`` echoes the original wire-form casing on
+    ``data["message"]["{from,to,cc,bcc}_addresses"]``, so naive ``==``
+    against that bucket array works for messages your platform sent.
+    The list is sparse: only matched recipients appear.
+    """
+
+    bucket: MailContactBucket
+    address: str
+    id: str
+    # None when the contact has no name on file. Never falls back to the
+    # email address.
+    name: str | None
+    # Active memories, newest first; optional only for older replays.
+    memories: NotRequired[list[str]]
+
+
+class WebhookMailAgentIdentity(TypedDict):
+    """
+    Per-recipient identity match on a mail webhook event. Same shape
+    as ``WebhookMailContact`` but with ``agent_handle`` /
+    ``display_name`` instead of ``name``.
+    """
+
+    bucket: MailContactBucket
+    address: str
+    id: str
+    agent_handle: str
+    display_name: str | None
+
+
+class MailWebhookMessage(TypedDict):
+    """
+    Stored mail message. ``message_id`` is the RFC 5322 ``Message-ID``
+    header value (not Inkbox's row id -- that's ``id``).
+    ``bcc_addresses`` is only populated on outbound events; inbound
+    payloads carry ``None`` (BCC is not visible to recipients).
+    """
+
+    id: str
+    sender_access: NotRequired[SenderAccess]
+    mailbox_id: str
+    thread_id: str | None
+    message_id: str | None
+    from_address: str
+    to_addresses: list[str]
+    cc_addresses: list[str] | None
+    bcc_addresses: list[str] | None
+    subject: str | None
+    snippet: str | None
+    # Body fields: NotRequired because payloads predating the feature omit
+    # them. Present-with-``null`` on live payloads; populated (body_state
+    # ``complete``/``truncated``) only on inbound ``message.received``.
+    # ``email_address`` + ``id`` fetch the full body via messages.get().
+    email_address: NotRequired[str | None]
+    body: NotRequired[str | None]
+    body_state: NotRequired[Literal["complete", "truncated", "unavailable"] | None]
+    body_truncated: NotRequired[bool | None]
+    body_total_chars: NotRequired[int | None]
+    body_included_chars: NotRequired[int | None]
+    direction: MessageDirectionWire
+    status: MessageStatus
+    has_attachments: bool
+    created_at: str | None
+
+
+class MailWebhookData(TypedDict):
+    """
+    Wrapper under ``MailWebhookPayload.data``.
+
+    ``contacts`` and ``agent_identities`` are both always present,
+    possibly empty. Wire order is ``from`` -> ``to`` -> ``cc`` ->
+    ``bcc``, then within each bucket by source-field order; receivers
+    should pair by ``(bucket, address)`` rather than relying on the
+    order. A peer can match both a contact and an agent identity --
+    two rows are emitted; receivers decide precedence.
+    """
+
+    message: MailWebhookMessage
+    contacts: list[WebhookMailContact]
+    agent_identities: list[WebhookMailAgentIdentity]
+    # Present only on the channel's ``*.received`` event, and only when the
+    # subscription opted into it via ``context_config``. Absent on sent /
+    # delivery-status / reaction events even though this shared data type
+    # permits the key.
+    context: NotRequired[WebhookContextWire]
+
+
+class MailWebhookPayload(TypedDict):
+    companion: NotRequired[CompanionMetadata]
+    id: str  # stable per-event id (evt_...); idempotency key, stable across replays
+    event_type: MailWebhookEventType
+    timestamp: str
+    data: MailWebhookData
+
+
+# ---- Text ________________________________________________________________
+
+TextWebhookEventType = Literal[
+    "text.received",
+    "text.sent",
+    "text.delivered",
+    "text.delivery_failed",
+    "text.delivery_unconfirmed",
+]
+
+
+class TextWebhookMessage(TypedDict):
+    """
+    Stored text message. ``is_blocked`` is not part of the wire body
+    -- default-filtered texts may arrive under Companion sponsorship.
+
+    Field population by traffic shape:
+      * ``remote_phone_number``: populated on inbound and on outbound
+        1:1; ``None`` on group outbound (per-recipient state lives in
+        ``recipients``).
+      * ``delivery_status``: populated on outbound. On group outbound this
+        is the message-level rollup across ``recipients``; on inbound it
+        is ``None``.
+      * Legacy top-level lifecycle details (``error_code``,
+        ``error_detail``, ``sent_at``, ``delivered_at``, ``failed_at``):
+        populated only on outbound 1:1. On group outbound the
+        per-recipient values live in ``recipients``; on inbound there
+        is no carrier lifecycle to track, so all five are ``None``.
+    """
+
+    id: str
+    sender_access: NotRequired[SenderAccess]
+    direction: TextDirectionWire
+    local_phone_number: str
+    remote_phone_number: str | None
+    text: str | None
+    type: TextTypeWire
+    media: list[TextMediaItemWire] | None
+    is_read: bool
+    delivery_status: SmsDeliveryStatusWire | None
+    origin: TextMessageOriginWire
+    error_code: str | None
+    error_detail: str | None
+    sent_at: str | None
+    delivered_at: str | None
+    failed_at: str | None
+    conversation_id: str | None
+    sender_phone_number: str | None
+    recipients: list[TextMessageRecipientWire] | None
+    created_at: str
+    updated_at: str
+
+
+class TextWebhookData(TypedDict):
+    text_message: TextWebhookMessage
+    contacts: list[WebhookContact]
+    agent_identities: list[WebhookAgentIdentity]
+    recipient_phone_number: str | None
+    # Present only on the channel's ``*.received`` event, and only when the
+    # subscription opted into it via ``context_config``. Absent on sent /
+    # delivery-status / reaction events even though this shared data type
+    # permits the key.
+    context: NotRequired[WebhookContextWire]
+
+
+class TextWebhookPayload(TypedDict):
+    companion: NotRequired[CompanionMetadata]
+    id: str  # stable per-event id (evt_...); idempotency key, stable across replays
+    event_type: TextWebhookEventType
+    timestamp: str
+    data: TextWebhookData
+
+
+# ---- iMessage ____________________________________________________________
+
+IMessageWebhookEventType = Literal[
+    "imessage.received",
+    "imessage.reaction_received",
+    "imessage.sent",
+    "imessage.delivered",
+    "imessage.delivery_failed",
+]
+
+IMessageDirectionWire = Literal["inbound", "outbound"]
+
+IMessageServiceWire = Literal["imessage", "sms", "rcs"]
+
+IMessageTypeWire = Literal["message", "carousel"]
+
+IMessageDeliveryStatusWire = Literal[
+    "registered",
+    "pending",
+    "queued",
+    "accepted",
+    "sent",
+    "delivered",
+    "declined",
+    "error",
+    "received",
+]
+
+IMessageReactionTypeWire = Literal[
+    "love",
+    "like",
+    "dislike",
+    "laugh",
+    "emphasize",
+    "question",
+    "eyes",
+    "custom",
+]
+
+IMessageSendStyleWire = Literal[
+    "celebration",
+    "shooting_star",
+    "fireworks",
+    "lasers",
+    "love",
+    "confetti",
+    "balloons",
+    "spotlight",
+    "echo",
+    "invisible",
+    "gentle",
+    "loud",
+    "slam",
+]
+
+
+class IMessageMediaItemWire(TypedDict):
+    """iMessage media attachment (snake_case wire shape)."""
+
+    content_type: str | None
+    size: int | None
+    url: str
+
+
+class IMessageRecipientWire(TypedDict):
+    """Per-recipient outbound iMessage delivery state."""
+
+    remote_number: str
+    delivery_status: IMessageDeliveryStatusWire | None
+    service: IMessageServiceWire | None
+    error_code: str | None
+    error_message: str | None
+    error_reason: str | None
+    error_detail: str | None
+    sent_at: str | None
+    delivered_at: str | None
+    failed_at: str | None
+
+
+class IMessageMessageReactionWire(TypedDict):
+    """A live tapback attached to a message (snake_case wire shape)."""
+
+    id: str
+    direction: IMessageDirectionWire
+    reaction: IMessageReactionTypeWire
+    custom_emoji: str | None
+    remote_number: str
+    part_index: int
+    created_at: str
+
+
+class IMessageWebhookMessage(TypedDict):
+    """
+    Stored iMessage. ``is_blocked`` is not part of the wire body -- blocked
+    messages require Companion sponsorship unless directly admitted. Group messages have no assignment and
+    include sender/participant fields. On dedicated lines, ``remote_number``
+    may be a non-phone sender address; receiving a message does not imply that
+    a reply, reaction, typing indicator, or read receipt can be sent.
+    """
+
+    id: str
+    sender_access: NotRequired[SenderAccess]
+    conversation_id: str
+    assignment_id: str | None
+    direction: IMessageDirectionWire
+    remote_number: str | None
+    sender_number: NotRequired[str | None]
+    participants: NotRequired[list[str] | None]
+    is_group: NotRequired[bool]
+    reply_to_message_id: NotRequired[str | None]
+    thread_id: NotRequired[str | None]
+    thread_root_message_id: NotRequired[str | None]
+    content: str | None
+    message_type: IMessageTypeWire
+    service: IMessageServiceWire
+    send_style: IMessageSendStyleWire | None
+    media: list[IMessageMediaItemWire] | None
+    was_downgraded: bool | None
+    status: IMessageDeliveryStatusWire | None
+    error_code: str | None
+    error_message: str | None
+    error_reason: str | None
+    error_detail: str | None
+    is_read: bool
+    recipients: list[IMessageRecipientWire] | None
+    reactions: list[IMessageMessageReactionWire] | None
+    created_at: str
+    updated_at: str
+
+
+class IMessageWebhookReaction(TypedDict):
+    """A tapback reaction on an iMessage (snake_case wire shape).
+
+    ``custom_emoji`` carries the literal emoji when ``reaction`` is
+    ``"custom"``; ``None`` for named reactions.
+    """
+
+    id: str
+    conversation_id: str
+    assignment_id: str | None
+    target_message_id: str
+    direction: IMessageDirectionWire
+    reaction: IMessageReactionTypeWire
+    custom_emoji: str | None
+    remote_number: str
+    part_index: int
+    created_at: str
+    updated_at: str
+
+
+class IMessageWebhookData(TypedDict):
+    """
+    Wrapper under ``IMessageWebhookPayload.data``.
+
+    Exactly one of ``message`` (``imessage.received`` and the delivery
+    lifecycle events ``imessage.sent`` / ``imessage.delivered`` /
+    ``imessage.delivery_failed``) or ``reaction``
+    (``imessage.reaction_received``) is populated. ``contacts`` and
+    ``agent_identities`` resolve the remote number against the conversation
+    identity's visible contact book and identity graph; both are always
+    present, possibly empty.
+    """
+
+    message: IMessageWebhookMessage | None
+    reaction: IMessageWebhookReaction | None
+    contacts: list[WebhookContact]
+    agent_identities: list[WebhookAgentIdentity]
+    # Present only on the channel's ``*.received`` event, and only when the
+    # subscription opted into it via ``context_config``. Absent on sent /
+    # delivery-status / reaction events even though this shared data type
+    # permits the key.
+    context: NotRequired[WebhookContextWire]
+
+
+class IMessageWebhookPayload(TypedDict):
+    companion: NotRequired[CompanionMetadata]
+    id: str  # stable per-event id (evt_...); idempotency key, stable across replays
+    event_type: IMessageWebhookEventType
+    timestamp: str
+    data: IMessageWebhookData
+
+
+# ---- Inbound call (FLAT - no envelope) ___________________________________
+
+
+class PhoneIncomingCallWebhookPayload(TypedDict):
+    """
+    Inbound call payload. **Flat** -- no ``{event_type, timestamp,
+    data}`` envelope; ``contacts`` / ``agent_identities`` sit at the
+    top level. ``is_blocked`` is not part of the wire body -- blocked
+    calls never reach the webhook.
+    """
+
+    id: str
+    local_phone_number: str
+    remote_phone_number: str
+    direction: Literal["inbound"]
+    status: CallStatusWire
+    client_websocket_url: str | None
+    use_inkbox_tts: bool | None
+    use_inkbox_stt: bool | None
+    hangup_reason: HangupReasonWire | None
+    started_at: str | None
+    ended_at: str | None
+    created_at: str
+    updated_at: str
+    rate_limit: RateLimitInfoWire | None
+    contacts: list[WebhookContact]
+    agent_identities: list[WebhookAgentIdentity]
+
+
+# ---- Call lifecycle (post-call fan-out) __________________________________
+
+CallLifecycleWebhookEventType = Literal["call.ended"]
+"""Post-call lifecycle event types, delivered to an agent-identity-owned
+``call.ended`` subscription. Fire-and-forget and replayable (unlike the
+synchronous ``phone.incoming_call`` control-plane callback)."""
+
+
+class WebhookPhoneCall(TypedDict):
+    """
+    Stored phone call embedded in a call-lifecycle webhook payload.
+
+    Mirrors ``PhoneCallResponse`` minus ``is_blocked`` (blocked calls never
+    reach the webhook). ``local_phone_number`` is ``None`` and ``origin`` is
+    ``"shared_imessage_number"`` on shared-line calls (the pool line is never
+    surfaced). ``duration_seconds`` is the connected length in whole seconds,
+    or ``None`` when the call never connected. ``mode`` says who drove the
+    call and ``reason`` carries the outbound Voice AI task brief (``None``
+    inbound and on ``client_websocket`` calls); both are ``NotRequired`` only
+    so payloads predating Voice AI still parse.
+    """
+
+    id: str
+    origin: CallOriginWire
+    local_phone_number: str | None
+    remote_phone_number: str
+    direction: CallDirectionWire
+    status: CallStatusWire
+    hangup_reason: HangupReasonWire | None
+    started_at: str | None
+    ended_at: str | None
+    created_at: str
+    updated_at: str
+    duration_seconds: int | None
+    mode: NotRequired[CallModeWire]
+    reason: NotRequired[str | None]
+    # Optional/nullable for replay compatibility; treat either as contact_scoped.
+    hosted_agent_authority_mode: NotRequired[HostedAgentAuthorityModeWire | None]
+    # Optional for webhook replays that predate voicemail detection controls.
+    voicemail_detection: NotRequired[VoicemailDetectionWire | None]
+    # What the call did when voicemail answered. Omitted by replays that
+    # predate the setting; treat a missing value as ``hang_up``.
+    on_voicemail: NotRequired[OnVoicemailWire | None]
+    # Chronological forwarding attempts; omitted by older webhook replays.
+    forwardings: NotRequired[list[WebhookPhoneCallForwarding]]
+    # Canonical history; omitted by older webhook replays.
+    connections: NotRequired[list[WebhookPhoneCallConnection]]
+
+
+class WebhookPhoneCallForwarding(TypedDict):
+    """One forwarding attempt embedded in a call lifecycle webhook."""
+
+    id: str
+    trigger: Literal["incoming_action"]
+    status: Literal["requested", "dialing", "forwarded", "failed"]
+    target_type: Literal["phone", "sip"]
+    target: str
+    requested_at: str
+    dialing_at: str | None
+    forwarded_at: str | None
+    ended_at: str | None
+    failure_code: str | None
+
+
+class WebhookPhoneCallConnection(TypedDict):
+    """One handoff or conference attempt in a call lifecycle webhook."""
+
+    id: str
+    kind: Literal["handoff", "conference"] | str
+    trigger: Literal["incoming_action", "agent_tool"] | str
+    status: Literal["requested", "dialing", "connected", "failed"] | str
+    target_type: Literal["phone", "sip"]
+    target: str
+    requested_at: str
+    dialing_at: NotRequired[str | None]
+    connected_at: NotRequired[str | None]
+    ended_at: NotRequired[str | None]
+    failure_code: NotRequired[str | None]
+
+
+class WebhookCallTranscript(TypedDict):
+    """
+    Inline transcript block on a ``call.ended`` payload.
+
+    Present when the platform captured a transcript for the call. ``entries``
+    reuses the shared middle-cut ``WebhookTranscriptEntryWire`` shape --
+    discriminate a turn from the abridgment marker on ``"marker" in entry``.
+    ``abridged`` is ``True`` when the middle was cut. ``url`` points at the
+    authoritative verbatim transcript (the same value as ``transcript_url``
+    on the data wrapper).
+    """
+
+    entries: list[WebhookTranscriptEntryWire]
+    abridged: bool
+    url: str
+
+
+class WebhookPostCallActionItemWire(TypedDict):
+    """
+    One open action item Inkbox Voice AI recorded during the call.
+
+    Rides ``call.ended`` in ``seq`` order, mirroring the inline
+    ``PhoneCall.post_call_action_items``. Canceled items are withdrawn, so
+    ``status`` here is always ``"open"``.
+    """
+
+    id: str
+    seq: int
+    action: str
+    details: str | None
+    status: str
+
+
+class CallEndedWebhookData(TypedDict):
+    """
+    Wrapper under ``CallEndedWebhookPayload.data``.
+
+    ``contacts`` / ``agent_identities`` resolve the caller and are always
+    present, possibly empty. ``transcript`` is a present-with-``null`` field:
+    the inline (possibly abridged) block is populated only when the platform
+    captured a transcript for the call, otherwise ``None``.
+    ``transcript_url`` is **always** present and is the authoritative
+    verbatim record (fetch with an API key that can access the call —
+    the subscription owner's own key suffices). ``outcome`` is the hosted
+    call's terminal result (``None`` iff ``data.call.mode`` is
+    ``client_websocket``) and ``post_call_action_items`` its recorded todo list
+    (always present, possibly empty); both are ``NotRequired`` only so
+    payloads predating Voice AI still parse.
+    """
+
+    call: WebhookPhoneCall
+    contacts: list[WebhookContact]
+    agent_identities: list[WebhookAgentIdentity]
+    transcript: WebhookCallTranscript | None
+    transcript_url: str
+    outcome: NotRequired[CallOutcomeWire | None]
+    post_call_action_items: NotRequired[list[WebhookPostCallActionItemWire]]
+
+
+class CallEndedWebhookPayload(TypedDict):
+    id: str  # stable per-event id (evt_...); idempotency key, stable across replays
+    event_type: CallLifecycleWebhookEventType
+    timestamp: str
+    data: CallEndedWebhookData
+
+
+# ---- A2A task lifecycle ---------------------------------------------------
+
+A2AWebhookEventType = Literal[
+    "a2a.task.created",
+    "a2a.task.message",
+    "a2a.task.canceled",
+    "a2a.sent_task.updated",
+]
+
+
+class DomainAffiliationPayload(TypedDict):
+    domain: str
+    verifier: str
+    last_success_at: str
+    valid_until: str
+
+
+class A2AWebhookCaller(TypedDict):
+    affiliation: NotRequired[DomainAffiliationPayload | None]
+    identity_id: str
+    organization_id: str
+    handle: str | None
+
+
+class A2AWebhookData(TypedDict):
+    sender: NotRequired[A2AWebhookCaller | None]
+    task_id: str
+    context_id: str
+    state: str
+    caller: A2AWebhookCaller
+    message_id: NotRequired[str]
+    parts: NotRequired[list[dict]]
+
+
+class A2AWebhookPayload(TypedDict):
+    id: str
+    event_type: A2AWebhookEventType
+    timestamp: str
+    data: A2AWebhookData
+
+
+SlackWebhookEventType = Literal[
+    "slack.dm_received",
+    "slack.group_dm_received",
+    "slack.channel_message_received",
+    "slack.mention_received",
+    "slack.thread_reply_received",
+    "slack.message_updated",
+    "slack.message_deleted",
+    "slack.reaction_added",
+    "slack.reaction_removed",
+    "slack.member_joined",
+    "slack.member_left",
+    "slack.channel_updated",
+    "slack.file_shared",
+    "slack.file_changed",
+    "slack.file_deleted",
+    "slack.pin_added",
+    "slack.pin_removed",
+    "slack.connection_changed",
+    "slack.message_sent",
+    "slack.message_send_failed",
+    "slack.message_send_unknown",
+    "slack.interaction",
+    "slack.session_stopped",
+]
+
+
+class SlackUserProfile(TypedDict, total=False):
+    display_name: str | None
+    real_name: str | None
+    first_name: str | None
+    last_name: str | None
+    email: str | None
+    phone: str | None
+    title: str | None
+    status_text: str | None
+    status_emoji: str | None
+    image_48: str | None
+    image_72: str | None
+    image_192: str | None
+
+
+class SlackActorProfile(TypedDict):
+    id: str
+    name: NotRequired[str | None]
+    real_name: NotRequired[str | None]
+    tz: NotRequired[str | None]
+    tz_label: NotRequired[str | None]
+    team_id: NotRequired[str | None]
+    is_bot: NotRequired[bool | None]
+    is_app_user: NotRequired[bool | None]
+    deleted: NotRequired[bool | None]
+    tz_offset: NotRequired[int | None]
+    profile: NotRequired[SlackUserProfile | None]
+
+
+class SlackWebhookData(TypedDict):
+    sender_access: NotRequired[SenderAccess | None]
+    identity_id: str
+    connection_id: str
+    workspace_id: str
+    conversation_id: NotRequired[str | None]
+    message_ts: NotRequired[str | None]
+    thread_ts: NotRequired[str | None]
+    actor_id: NotRequired[str | None]
+    actor_profile: NotRequired[SlackActorProfile | None]
+    contact_id: NotRequired[str | None]
+    message_kinds: list[SlackMessageKind]
+    event: dict[str, object]
+
+
+class SlackWebhookPayload(TypedDict):
+    companion: NotRequired[CompanionMetadata]
+    id: str
+    event_type: SlackWebhookEventType
+    timestamp: str
+    data: SlackWebhookData

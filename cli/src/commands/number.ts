@@ -1,0 +1,362 @@
+import { Command } from "commander";
+import { addDirectionalRuleOptions, directionalRuleOptions } from "../contact-rules.js";
+import {
+  FilterMode,
+  ForwardingTargetType,
+  PhoneRuleAction,
+  PhoneRuleMatchType,
+} from "@inkbox/sdk";
+import { createClient, getGlobalOpts } from "../client.js";
+import { output, printStatus } from "../output.js";
+import { withErrorHandler } from "../errors.js";
+
+function renderFilterModeChangeNotice(
+  pn: { filterModeChangeNotice?: unknown },
+): void {
+  const notice = pn.filterModeChangeNotice as {
+    redundantRuleCount: number;
+    redundantRuleAction: string;
+    newFilterMode: string;
+  } | null | undefined;
+  if (!notice) return;
+  console.error(
+    `Note: ${notice.redundantRuleCount} active '${notice.redundantRuleAction}' ` +
+      `rule(s) are now redundant under '${notice.newFilterMode}'. ` +
+      `Review with 'inkbox number rules list --number <id>'.`,
+  );
+}
+
+function assertFilterMode(raw: string): FilterMode {
+  if (raw !== FilterMode.WHITELIST && raw !== FilterMode.BLACKLIST) {
+    throw new Error(`--filter-mode must be 'whitelist' or 'blacklist' (got '${raw}')`);
+  }
+  return raw;
+}
+
+function registerNumberRulesCommands(parent: Command): void {
+  const rules = parent
+    .command("rules")
+    .description(
+      "[deprecated] Contact rules scoped to a phone number. Use " +
+        "'inkbox identity phone-rules ...' instead (keyed by agent handle).",
+    );
+
+  rules
+    .command("list")
+    .description("List rules for a number, or org-wide with --all-numbers")
+    .option("--number <id>", "Phone number id")
+    .option("--all-numbers", "List all rules across all numbers (admin-only)")
+    .option("--phone-number-id <id>", "Narrow the org-wide list to a single number id")
+    .option("--action <action>", "Filter by action: allow or block")
+    .option("--match-type <type>", "Filter by match_type: exact_number")
+    .option("--limit <n>", "Max rows", (v) => parseInt(v, 10))
+    .option("--offset <n>", "Offset", (v) => parseInt(v, 10))
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        cmdOpts: {
+          number?: string;
+          allNumbers?: boolean;
+          phoneNumberId?: string;
+          action?: string;
+          matchType?: string;
+          limit?: number;
+          offset?: number;
+        },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        let rows;
+        if (cmdOpts.allNumbers) {
+          rows = await inkbox.phoneContactRules.listAll({
+            ...directionalRuleOptions(this),
+            phoneNumberId: cmdOpts.phoneNumberId,
+            action: cmdOpts.action as PhoneRuleAction | undefined,
+            matchType: cmdOpts.matchType as PhoneRuleMatchType | undefined,
+            limit: cmdOpts.limit,
+            offset: cmdOpts.offset,
+          });
+        } else {
+          if (!cmdOpts.number) {
+            throw new Error("--number <id> or --all-numbers is required");
+          }
+          rows = await inkbox.phoneContactRules.list(cmdOpts.number, {
+            ...directionalRuleOptions(this),
+            action: cmdOpts.action as PhoneRuleAction | undefined,
+            matchType: cmdOpts.matchType as PhoneRuleMatchType | undefined,
+            limit: cmdOpts.limit,
+            offset: cmdOpts.offset,
+          });
+        }
+        output(rows, {
+          json: !!opts.json,
+          columns: ["id", "phoneNumberId", "action", "direction", "matchType", "matchTarget", "status"],
+        });
+      }),
+    );
+
+  rules
+    .command("get <rule-id>")
+    .description("Get a single rule")
+    .requiredOption("--number <id>", "Phone number id")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        ruleId: string,
+        cmdOpts: { number: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rule = await inkbox.phoneContactRules.get(cmdOpts.number, ruleId);
+        output(rule as unknown as Record<string, unknown>, { json: !!opts.json });
+      }),
+    );
+
+  rules
+    .command("create")
+    .description("Create an allow or block rule")
+    .requiredOption("--number <id>", "Phone number id")
+    .requiredOption("--action <action>", "allow or block")
+    .requiredOption("--match-target <value>", "Phone number to match (E.164)")
+    .option("--match-type <type>", "exact_number (default)", PhoneRuleMatchType.EXACT_NUMBER)
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        cmdOpts: {
+          number: string;
+          action: string;
+          matchType: string;
+          matchTarget: string;
+        },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rule = await inkbox.phoneContactRules.create(cmdOpts.number, {
+          ...directionalRuleOptions(this),
+          action: cmdOpts.action as PhoneRuleAction,
+          matchType: cmdOpts.matchType as PhoneRuleMatchType,
+          matchTarget: cmdOpts.matchTarget,
+        });
+        output(rule as unknown as Record<string, unknown>, { json: !!opts.json });
+      }),
+    );
+
+  rules
+    .command("update <rule-id>")
+    .description("Update the action on a rule (admin-only)")
+    .requiredOption("--number <id>", "Phone number id")
+    .requiredOption("--action <action>", "allow or block")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        ruleId: string,
+        cmdOpts: { number: string; action: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const rule = await inkbox.phoneContactRules.update(cmdOpts.number, ruleId, {
+          ...directionalRuleOptions(this),
+          action: cmdOpts.action as PhoneRuleAction,
+        });
+        output(rule as unknown as Record<string, unknown>, { json: !!opts.json });
+      }),
+    );
+
+  rules
+    .command("delete <rule-id>")
+    .description("Delete a rule (admin-only)")
+    .requiredOption("--number <id>", "Phone number id")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        ruleId: string,
+        cmdOpts: { number: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        await inkbox.phoneContactRules.delete(cmdOpts.number, ruleId);
+        printStatus(`Deleted phone contact rule '${ruleId}' on ${cmdOpts.number}.`);
+      }),
+    );
+  addDirectionalRuleOptions(rules);
+}
+
+export function registerNumberCommands(program: Command): void {
+  const number = program
+    .command("number")
+    .description("Org-level phone number operations");
+
+  number
+    .command("list")
+    .description("List all phone numbers")
+    .action(
+      withErrorHandler(async function (this: Command) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const numbers = await inkbox.phoneNumbers.list();
+        output(numbers, {
+          json: !!opts.json,
+          columns: ["number", "id", "type", "status", "filterMode", "inboundFilterMode", "outboundFilterMode", "agentIdentityId", "createdAt"],
+        });
+      }),
+    );
+
+  number
+    .command("provision")
+    .description("Provision a new phone number")
+    .requiredOption("--handle <handle>", "Agent handle to provision for")
+    .option("--type <type>", "Number type (only local is supported)", "local")
+    .option("--state <state>", "US state abbreviation (for local numbers)")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        cmdOpts: { handle: string; type: string; state?: string },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const num = await inkbox.phoneNumbers.provision({
+          agentHandle: cmdOpts.handle,
+          type: cmdOpts.type,
+          state: cmdOpts.state,
+        });
+        output(
+          {
+            number: num.number,
+            id: num.id,
+            type: num.type,
+            status: num.status,
+            filterMode: num.filterMode,
+            inboundFilterMode: num.inboundFilterMode ?? num.filterMode,
+            outboundFilterMode: num.outboundFilterMode ?? num.filterMode,
+            agentIdentityId: num.agentIdentityId,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  number
+    .command("get <id>")
+    .description("Get phone number details")
+    .action(
+      withErrorHandler(async function (this: Command, id: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        const num = await inkbox.phoneNumbers.get(id);
+        output(
+          {
+            number: num.number,
+            id: num.id,
+            type: num.type,
+            status: num.status,
+            smsStatus: num.smsStatus,
+            smsErrorCode: num.smsErrorCode ?? null,
+            smsErrorDetail: num.smsErrorDetail ?? null,
+            smsReadyAt: num.smsReadyAt,
+            incomingCallAction: num.incomingCallAction ?? null,
+            clientWebsocketUrl: num.clientWebsocketUrl ?? null,
+            incomingCallWebhookUrl: num.incomingCallWebhookUrl ?? null,
+            forwardingTargetType: num.forwardingTargetType ?? null,
+            forwardingPhoneNumber: num.forwardingPhoneNumber ?? null,
+            forwardingSipUri: num.forwardingSipUri ?? null,
+            filterMode: num.filterMode,
+            inboundFilterMode: num.inboundFilterMode ?? num.filterMode,
+            outboundFilterMode: num.outboundFilterMode ?? num.filterMode,
+            state: num.state,
+            agentIdentityId: num.agentIdentityId,
+            createdAt: num.createdAt,
+          },
+          { json: !!opts.json },
+        );
+      }),
+    );
+
+  number
+    .command("update <id>")
+    .description("Update phone number configuration")
+    .option(
+      "--incoming-call-action <action>",
+      "Incoming call action: auto_accept, auto_reject, webhook, hosted_agent, or forward",
+    )
+    .option("--client-websocket-url <url>", "Client WebSocket URL for audio bridging")
+    .option("--incoming-call-webhook-url <url>", "Webhook URL for incoming calls")
+    .option("--forward-to-phone <number>", "Forward to a complete E.164 number")
+    .option("--forward-to-sip <uri>", "Forward to a SIP URI with a public DNS hostname")
+    .option("--filter-mode <mode>", "Contact-rule filter mode: whitelist or blacklist (admin-only)")
+    .action(
+      withErrorHandler(async function (
+        this: Command,
+        id: string,
+        cmdOpts: {
+          incomingCallAction?: string;
+          clientWebsocketUrl?: string;
+          incomingCallWebhookUrl?: string;
+          filterMode?: string;
+          forwardToPhone?: string;
+          forwardToSip?: string;
+        },
+      ) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        if (cmdOpts.forwardToPhone && cmdOpts.forwardToSip) {
+          throw new Error("--forward-to-phone and --forward-to-sip are mutually exclusive");
+        }
+        if (cmdOpts.incomingCallAction === "forward" && !cmdOpts.forwardToPhone && !cmdOpts.forwardToSip) {
+          throw new Error("forward requires --forward-to-phone or --forward-to-sip");
+        }
+        if (cmdOpts.incomingCallAction !== "forward" && (cmdOpts.forwardToPhone || cmdOpts.forwardToSip)) {
+          throw new Error("forwarding destination flags require --incoming-call-action forward");
+        }
+        const num = await inkbox.phoneNumbers.update(id, {
+          incomingCallAction: cmdOpts.incomingCallAction,
+          clientWebsocketUrl: cmdOpts.clientWebsocketUrl,
+          incomingCallWebhookUrl: cmdOpts.incomingCallWebhookUrl,
+          forwardingTargetType: cmdOpts.forwardToPhone
+            ? ForwardingTargetType.PHONE
+            : cmdOpts.forwardToSip
+              ? ForwardingTargetType.SIP
+              : undefined,
+          forwardingPhoneNumber: cmdOpts.forwardToPhone,
+          forwardingSipUri: cmdOpts.forwardToSip,
+          filterMode:
+            cmdOpts.filterMode !== undefined
+              ? assertFilterMode(cmdOpts.filterMode)
+              : undefined,
+        });
+        output(
+          {
+            number: num.number,
+            id: num.id,
+            type: num.type,
+            status: num.status,
+            incomingCallAction: num.incomingCallAction ?? null,
+            clientWebsocketUrl: num.clientWebsocketUrl ?? null,
+            incomingCallWebhookUrl: num.incomingCallWebhookUrl ?? null,
+            forwardingTargetType: num.forwardingTargetType ?? null,
+            forwardingPhoneNumber: num.forwardingPhoneNumber ?? null,
+            forwardingSipUri: num.forwardingSipUri ?? null,
+            filterMode: num.filterMode,
+            inboundFilterMode: num.inboundFilterMode ?? num.filterMode,
+            outboundFilterMode: num.outboundFilterMode ?? num.filterMode,
+            agentIdentityId: num.agentIdentityId,
+          },
+          { json: !!opts.json },
+        );
+        renderFilterModeChangeNotice(num);
+      }),
+    );
+
+  number
+    .command("release <id>")
+    .description("Release a phone number")
+    .action(
+      withErrorHandler(async function (this: Command, id: string) {
+        const opts = getGlobalOpts(this);
+        const inkbox = createClient(opts);
+        await inkbox.phoneNumbers.release(id);
+        printStatus(`Released phone number '${id}'.`);
+      }),
+    );
+
+  registerNumberRulesCommands(number);
+}

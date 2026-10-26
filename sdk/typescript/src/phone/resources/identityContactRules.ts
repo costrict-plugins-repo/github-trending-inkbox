@@ -1,0 +1,158 @@
+/**
+ * inkbox-phone/resources/identityContactRules.ts
+ *
+ * Identity-keyed phone contact rules (per-agent-identity allow/block rules
+ * + org-wide list).
+ *
+ * Phone (voice + SMS) rules live on the **agent identity**, addressed by
+ * `agentHandle`, mirroring the iMessage rule shape. The legacy per-number
+ * resource (`inkbox.phoneContactRules`) is kept as a deprecated wrapper.
+ *
+ * Permissions can be configured before assigning a number and also govern
+ * iMessage. Mutations require admin credentials.
+ *
+ * Transport note: rides the api-root transport (`{base}/api/v1`) so it
+ * addresses both `/identities/{handle}/phone-contact-rules` and the
+ * org-wide `/phone/contact-rules` with full paths. It must NOT ride the
+ * `/phone`-prefixed transport.
+ */
+
+import { HttpTransport } from "../../_http.js";
+import { type RuleDirection, ruleUpdateToWire } from "../../contact_rules.js";
+import {
+  PhoneIdentityContactRule,
+  PhoneRuleAction,
+  PhoneRuleMatchType,
+  RawPhoneIdentityContactRule,
+  parsePhoneIdentityContactRule,
+} from "../types.js";
+
+const ORG_BASE = "/phone/contact-rules";
+
+function rulePath(agentHandle: string, ruleId?: string): string {
+  const base = `/identities/${agentHandle}/phone-contact-rules`;
+  return ruleId ? `${base}/${ruleId}` : base;
+}
+
+export interface ListPhoneIdentityContactRulesOptions {
+  direction?: RuleDirection;
+  action?: PhoneRuleAction;
+  matchType?: PhoneRuleMatchType;
+  limit?: number;
+  offset?: number;
+}
+
+export interface CreatePhoneIdentityContactRuleOptions {
+  direction?: RuleDirection;
+  action: PhoneRuleAction;
+  matchTarget: string;
+  matchType?: PhoneRuleMatchType;
+}
+
+export interface UpdatePhoneIdentityContactRuleOptions {
+  action?: PhoneRuleAction;
+  direction?: RuleDirection;
+  applyTo?: "inbound" | "outbound";
+}
+
+export interface ListAllPhoneIdentityContactRulesOptions {
+  direction?: RuleDirection;
+  agentIdentityId?: string;
+  action?: PhoneRuleAction;
+  matchType?: PhoneRuleMatchType;
+  limit?: number;
+  offset?: number;
+}
+
+/** Allow/block phone rules scoped to agent identities (voice + SMS). */
+export class PhoneIdentityContactRulesResource {
+  constructor(private readonly http: HttpTransport) {}
+
+  /**
+   * List permitted rules, including for unprovisioned identities.
+   */
+  async list(
+    agentHandle: string,
+    options: ListPhoneIdentityContactRulesOptions = {},
+  ): Promise<PhoneIdentityContactRule[]> {
+    const params: Record<string, string | number | undefined> = {};
+    if (options.direction !== undefined) params.direction = options.direction;
+    if (options.action !== undefined) params.action = options.action;
+    if (options.matchType !== undefined) params.match_type = options.matchType;
+    if (options.limit !== undefined) params.limit = options.limit;
+    if (options.offset !== undefined) params.offset = options.offset;
+    const data = await this.http.get<
+      { items: RawPhoneIdentityContactRule[] } | RawPhoneIdentityContactRule[]
+    >(rulePath(agentHandle), params);
+    const items = Array.isArray(data) ? data : data.items;
+    return items.map(parsePhoneIdentityContactRule);
+  }
+
+  async get(agentHandle: string, ruleId: string): Promise<PhoneIdentityContactRule> {
+    const data = await this.http.get<RawPhoneIdentityContactRule>(
+      rulePath(agentHandle, ruleId),
+    );
+    return parsePhoneIdentityContactRule(data);
+  }
+
+  /**
+   * Create a rule for an agent identity.
+   * Requires admin credentials; channel provisioning is not required.
+   *
+   * Compatible coverage may widen an existing rule and retain its ID.
+   * @throws {DuplicateContactRuleError} 409 when the coverage already exists.
+   */
+  async create(
+    agentHandle: string,
+    options: CreatePhoneIdentityContactRuleOptions,
+  ): Promise<PhoneIdentityContactRule> {
+    const body: Record<string, unknown> = {
+      action: options.action,
+      match_type: options.matchType ?? PhoneRuleMatchType.EXACT_NUMBER,
+      match_target: options.matchTarget,
+    };
+    if (options.direction !== undefined) body.direction = options.direction;
+    const data = await this.http.post<RawPhoneIdentityContactRule>(
+      rulePath(agentHandle),
+      body,
+    );
+    return parsePhoneIdentityContactRule(data);
+  }
+
+  /** Update action or coverage, or atomically edit one covered side (admin-only). */
+  async update(
+    agentHandle: string,
+    ruleId: string,
+    options: UpdatePhoneIdentityContactRuleOptions,
+  ): Promise<PhoneIdentityContactRule> {
+    const body = ruleUpdateToWire(options);
+    const data = await this.http.patch<RawPhoneIdentityContactRule>(
+      rulePath(agentHandle, ruleId),
+      body,
+    );
+    return parsePhoneIdentityContactRule(data);
+  }
+
+  /** Delete a rule (admin-only). */
+  async delete(agentHandle: string, ruleId: string): Promise<void> {
+    await this.http.delete(rulePath(agentHandle, ruleId));
+  }
+
+  /** Org-wide list of phone contact rules (admin-only). */
+  async listAll(
+    options: ListAllPhoneIdentityContactRulesOptions = {},
+  ): Promise<PhoneIdentityContactRule[]> {
+    const params: Record<string, string | number | undefined> = {};
+    if (options.direction !== undefined) params.direction = options.direction;
+    if (options.agentIdentityId !== undefined) params.agent_identity_id = options.agentIdentityId;
+    if (options.action !== undefined) params.action = options.action;
+    if (options.matchType !== undefined) params.match_type = options.matchType;
+    if (options.limit !== undefined) params.limit = options.limit;
+    if (options.offset !== undefined) params.offset = options.offset;
+    const data = await this.http.get<
+      { items: RawPhoneIdentityContactRule[] } | RawPhoneIdentityContactRule[]
+    >(ORG_BASE, params);
+    const items = Array.isArray(data) ? data : data.items;
+    return items.map(parsePhoneIdentityContactRule);
+  }
+}

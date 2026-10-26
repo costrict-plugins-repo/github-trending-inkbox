@@ -1,0 +1,384 @@
+"""
+inkbox/_http.py
+
+Sync HTTP transport (internal). Shared by all resource packages.
+"""
+
+from __future__ import annotations
+
+import importlib.metadata
+from copy import copy
+from typing import Any
+
+import httpx
+
+from inkbox._cookies import CookieJar
+from inkbox.response_metadata import ResponseObserver, _observe_response
+from inkbox.exceptions import (
+    DedicatedIMessageNumberInventoryPendingError,
+    DedicatedIMessageNumberQuotaExceededError,
+    DuplicateContactRuleError,
+    InkboxAPIError,
+    IdempotencyKeyReusedError,
+    MailImportQuotaExceededError,
+    RecipientBlockedError,
+    RedundantContactAccessGrantError,
+    StorageLimitExceededError,
+)
+from inkbox.error_guidance import parse_agent_support
+
+_DEFAULT_TIMEOUT = 30.0
+# Retries connection setup only; the request has not been sent yet, so any method is safe.
+CONNECT_RETRIES = 2
+
+
+def _sdk_version() -> str:
+    try:
+        return importlib.metadata.version("inkbox")
+    except importlib.metadata.PackageNotFoundError:
+        return "0.0.0"
+
+
+def sdk_user_agent(prefix: str | None = None) -> str:
+    """``User-Agent`` announcing the SDK (e.g. ``inkbox-python/0.4.17``); an
+    optional caller token goes first (``inkbox-cli/1.2.3 inkbox-python/...``)."""
+    base = f"inkbox-python/{_sdk_version()}"
+    return f"{prefix} {base}" if prefix else base
+
+
+class HttpTransport:
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        timeout: float = _DEFAULT_TIMEOUT,
+        cookie_jar: CookieJar | None = None,
+        user_agent: str | None = None,
+        response_observer: ResponseObserver | None = None,
+    ) -> None:
+        headers = {
+            "X-API-Key": api_key,
+            "Accept": "application/json",
+        }
+        if user_agent:
+            headers["User-Agent"] = user_agent
+        self._client = httpx.Client(
+            base_url=base_url,
+            headers=headers,
+            timeout=timeout,
+            transport=httpx.HTTPTransport(retries=CONNECT_RETRIES),
+        )
+        self._cookie_jar = cookie_jar or CookieJar()
+        self._response_observer = response_observer
+        self._notice_collector: ResponseObserver | None = None
+        self._owns_connections = True
+
+    def _scoped(self, collector: ResponseObserver) -> HttpTransport:
+        scoped = copy(self)
+        scoped._notice_collector = collector
+        scoped._owns_connections = False
+        return scoped
+
+    def get(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        cleaned = {k: v for k, v in (params or {}).items() if v is not None}
+        resp = self._send("GET", path, params=cleaned, timeout=timeout,
+                          **({"headers": headers} if headers is not None else {}))
+        _raise_for_status(resp)
+        return resp.json()
+
+    def post(
+        self,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        cleaned = {k: v for k, v in (params or {}).items() if v is not None}
+        resp = self._send(
+            "POST",
+            path,
+            json=json,
+            params=cleaned,
+            headers=headers,
+            timeout=timeout,
+        )
+        _raise_for_status(resp)
+        if resp.status_code == 204:
+            return None
+        return resp.json()
+
+    def put(
+        self,
+        path: str,
+        *,
+        json: dict[str, Any],
+        timeout: float | None = None,
+    ) -> Any:
+        resp = self._send("PUT", path, json=json, timeout=timeout)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def patch(
+        self,
+        path: str,
+        *,
+        json: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        resp = self._send("PATCH", path, json=json, headers=headers, timeout=timeout)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def delete(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        cleaned = {k: v for k, v in (params or {}).items() if v is not None}
+        kwargs: dict[str, Any] = {"headers": headers, "timeout": timeout}
+        if cleaned:
+            kwargs["params"] = cleaned
+        resp = self._send("DELETE", path, **kwargs)
+        _raise_for_status(resp)
+
+    def delete_with_response(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """``DELETE`` that returns a parsed JSON body.
+
+        Used by endpoints (e.g. tunnels) that respond with a representation
+        of the deleted resource rather than 204 No Content.
+        """
+        cleaned = {k: v for k, v in (params or {}).items() if v is not None}
+        kwargs: dict[str, Any] = {"headers": headers, "timeout": timeout}
+        if cleaned:
+            kwargs["params"] = cleaned
+        resp = self._send("DELETE", path, **kwargs)
+        _raise_for_status(resp)
+        if resp.status_code == 204 or not resp.content:
+            return None
+        return resp.json()
+
+    def post_multipart(
+        self,
+        path: str,
+        *,
+        field_name: str,
+        filename: str,
+        content: bytes,
+        content_type: str,
+    ) -> Any:
+        """POST one file as multipart/form-data.
+
+        Used for media uploads. The response is decoded as JSON.
+        """
+        files = {field_name: (filename, content, content_type)}
+        resp = self._send("POST", path, files=files)
+        _raise_for_status(resp)
+        if resp.status_code == 204:
+            return None
+        return resp.json()
+
+    def post_bytes(
+        self,
+        path: str,
+        *,
+        content: bytes,
+        content_type: str,
+        accept: str = "application/json",
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        """POST arbitrary bytes with a caller-supplied Content-Type.
+
+        Used for non-JSON payloads like vCard imports. The response is
+        still decoded as JSON.
+        """
+        request_headers = {"Content-Type": content_type, "Accept": accept}
+        request_headers.update(headers or {})
+        resp = self._send("POST", path, content=content, headers=request_headers)
+        _raise_for_status(resp)
+        if resp.status_code == 204:
+            return None
+        return resp.json()
+
+    def get_bytes(
+        self,
+        path: str,
+        *,
+        accept: str,
+        params: dict[str, Any] | None = None,
+    ) -> bytes:
+        """GET a non-JSON response and return the raw body.
+
+        Used for vCard export and any other binary/text endpoints.
+        """
+        return self.get_raw(path, accept=accept, params=params).content
+
+    def get_raw(
+        self,
+        path: str,
+        *,
+        accept: str,
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        """GET a non-JSON response while preserving its headers."""
+        cleaned = {k: v for k, v in (params or {}).items() if v is not None}
+        resp = self._send(
+            "GET", path, params=cleaned, headers={"Accept": accept}
+        )
+        _raise_for_status(resp)
+        return resp
+
+    def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        # Drop a None timeout so httpx falls back to the client-level default
+        # rather than disabling timeouts entirely.
+        if kwargs.get("timeout") is None:
+            kwargs.pop("timeout", None)
+        request = self._client.build_request(method, path, **kwargs)
+        cookie = self._cookie_jar.header_for_url(str(request.url))
+        if cookie:
+            request.headers["Cookie"] = cookie
+        resp = self._client.send(request)
+        self._cookie_jar.store_from_headers(str(request.url), resp.headers)
+        _observe_response(resp, self._notice_collector, self._response_observer)
+        return resp
+
+    def close(self) -> None:
+        if self._owns_connections:
+            self._client.close()
+
+    def __enter__(self) -> HttpTransport:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+def _raise_for_status(resp: httpx.Response) -> None:
+    if resp.status_code < 400:
+        return
+    raw_detail: Any
+    agent_support: str | None = None
+    try:
+        envelope = resp.json()
+        raw_detail = envelope.get("detail", resp.text)
+        agent_support = parse_agent_support(envelope.get("agent_support"))
+    except Exception:
+        raw_detail = resp.text
+
+    if resp.status_code == 409 and isinstance(raw_detail, dict):
+        if "existing_rule_id" in raw_detail:
+            error = DuplicateContactRuleError(
+                status_code=resp.status_code,
+                detail=raw_detail,
+            )
+            error.agent_support = agent_support
+            raise error
+        if raw_detail.get("error") == "redundant_grant":
+            error = RedundantContactAccessGrantError(
+                status_code=resp.status_code,
+                detail=raw_detail,
+            )
+            error.agent_support = agent_support
+            raise error
+
+    if (
+        resp.status_code == 403
+        and isinstance(raw_detail, dict)
+        and raw_detail.get("error") == "recipient_blocked"
+    ):
+        error = RecipientBlockedError(
+            status_code=resp.status_code,
+            detail=raw_detail,
+        )
+        error.agent_support = agent_support
+        raise error
+
+    # Older servers send a plain-string 402 detail; those fall through to the
+    # generic error rather than being mistyped.
+    if (
+        resp.status_code == 402
+        and isinstance(raw_detail, dict)
+        and raw_detail.get("error") == "storage_limit_exceeded"
+    ):
+        error = StorageLimitExceededError(
+            status_code=resp.status_code,
+            detail=raw_detail,
+        )
+        error.agent_support = agent_support
+        raise error
+
+    if (
+        resp.status_code == 402
+        and isinstance(raw_detail, dict)
+        and raw_detail.get("error") == "dedicated_imessage_number_quota_exceeded"
+    ):
+        error = DedicatedIMessageNumberQuotaExceededError(
+            status_code=resp.status_code,
+            detail=raw_detail,
+        )
+        error.agent_support = agent_support
+        raise error
+
+    if (
+        resp.status_code == 503
+        and isinstance(raw_detail, dict)
+        and raw_detail.get("error") == "dedicated_imessage_number_inventory_pending"
+    ):
+        error = DedicatedIMessageNumberInventoryPendingError(
+            status_code=resp.status_code,
+            detail=raw_detail,
+            retry_after=resp.headers.get("Retry-After"),
+        )
+        error.agent_support = agent_support
+        raise error
+
+    if (
+        resp.status_code == 409
+        and isinstance(raw_detail, dict)
+        and raw_detail.get("error") == "idempotency_key_reused"
+    ):
+        error = IdempotencyKeyReusedError(
+            status_code=resp.status_code,
+            detail=raw_detail,
+        )
+        error.agent_support = agent_support
+        raise error
+
+    if (
+        resp.status_code == 429
+        and isinstance(raw_detail, dict)
+        and raw_detail.get("error") == "mail_import_quota_exceeded"
+    ):
+        error = MailImportQuotaExceededError(
+            status_code=resp.status_code,
+            detail=raw_detail,
+            retry_after=resp.headers.get("Retry-After"),
+        )
+        error.agent_support = agent_support
+        raise error
+
+    raise InkboxAPIError(
+        status_code=resp.status_code,
+        detail=raw_detail,
+        retry_after=resp.headers.get("Retry-After"),
+        agent_support=agent_support,
+    )

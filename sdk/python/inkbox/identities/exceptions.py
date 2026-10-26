@@ -1,0 +1,78 @@
+"""
+inkbox/identities/exceptions.py
+
+Typed exceptions for the identities surface, plus re-exports from the
+canonical ``inkbox.exceptions`` module for backward compatibility.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from inkbox.exceptions import InkboxAPIError, InkboxError
+
+BlockingNamespace = Literal["identities", "tunnels", "mail", None]
+
+
+class HandleUnavailableError(InkboxAPIError):
+    """Raised on 409 from identity creation when the
+    requested agent_handle collides with the unified global namespace.
+
+    ``blocking_namespace`` reports which side rejected: ``"identities"``,
+    ``"tunnels"``, or ``"mail"``. May be ``None`` if the server did not
+    set the field.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        detail: Any,
+        blocking_namespace: BlockingNamespace,
+    ) -> None:
+        super().__init__(status_code, detail)
+        self.blocking_namespace = blocking_namespace
+
+
+def _read_blocking_namespace(detail: Any) -> BlockingNamespace:
+    if isinstance(detail, dict):
+        v = detail.get("blocking_namespace")
+        if v in ("identities", "tunnels", "mail"):
+            return v  # type: ignore[return-value]
+    return None
+
+
+def map_identity_conflict_error(err: InkboxAPIError) -> Exception:
+    """If ``err`` is a 409 handle collision from identity creation,
+    return a :class:`HandleUnavailableError`; else return ``err``."""
+    detail = err.detail
+    is_handle_conflict = False
+    if isinstance(detail, dict):
+        is_handle_conflict = (
+            detail.get("code") == "agent_handle_unavailable"
+            or detail.get("error") == "agent_handle_unavailable"
+            or _read_blocking_namespace(detail) is not None
+        )
+    elif isinstance(detail, str):
+        normalized = detail.lower()
+        is_handle_conflict = "handle" in normalized and (
+            "unavailable" in normalized or "already" in normalized
+        )
+
+    if err.status_code == 409 and is_handle_conflict:
+        mapped = HandleUnavailableError(
+            err.status_code,
+            detail,
+            _read_blocking_namespace(detail),
+        )
+        mapped.agent_support = err.agent_support
+        return mapped
+    return err
+
+
+__all__ = [
+    "BlockingNamespace",
+    "HandleUnavailableError",
+    "InkboxAPIError",
+    "InkboxError",
+    "map_identity_conflict_error",
+]

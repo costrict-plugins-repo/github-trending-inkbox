@@ -1,0 +1,461 @@
+"""
+inkbox/identities/types.py
+
+Dataclasses mirroring the Inkbox Identities API response models.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Literal
+from uuid import UUID
+
+from inkbox.imessage.types import _compatibility_number_type
+from inkbox.mail.types import FilterMode, FilterModeChangeNotice
+from inkbox.phone.types import SmsStatus
+from inkbox.phone.types import ForwardingTargetType
+from inkbox.tunnels.types import TLSMode, TunnelSummary
+
+# Sentinel for "field omitted" that's distinct from explicit ``None``.
+# Exported (intentionally underscore-named but referenced internally
+# from `client.py`, `agent_identity.py`, and
+# `identities/resources/identities.py`) so all three layers compare
+# against the SAME object — `is not _UNSET` is identity-based, and
+# threading the sentinel through three separately-defined module-local
+# `_UNSET = object()` instances would leak it onto the wire as
+# `{"description": <object>}` and crash JSON serialization.
+_UNSET = object()
+
+
+@dataclass
+class IdentityMailboxCreateOptions:
+    """
+    Optional mailbox payload nested under identity creation.
+
+    Attributes:
+        email_local_part: Optional requested local part to use before the
+            sending domain. On the platform domain the server forces it
+            to the agent handle, so this only matters on a custom
+            sending domain.
+        sending_domain: Optional sending-domain selector by **bare domain
+            name** (not an id). Leave at ``_UNSET`` to inherit the org
+            default; pass ``None`` to force the platform default; pass a
+            verified custom-domain name (e.g. ``"mail.acme.com"``) to bind.
+    """
+
+    email_local_part: str | None = None
+    sending_domain: str | None = _UNSET  # type: ignore[assignment]
+
+    def to_wire(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict matching the API schema."""
+        body: dict[str, Any] = {}
+        if self.email_local_part is not None:
+            body["email_local_part"] = self.email_local_part
+        if self.sending_domain is not _UNSET:
+            body["sending_domain"] = self.sending_domain
+        return body
+
+
+@dataclass
+class IdentityTunnelCreateOptions:
+    """Optional nested tunnel spec for identity creation.
+
+    Attributes:
+        tls_mode: ``"edge"`` (default) or ``"passthrough"``.
+    """
+
+    tls_mode: TLSMode | str | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if self.tls_mode is not None:
+            body["tls_mode"] = (
+                self.tls_mode.value
+                if isinstance(self.tls_mode, TLSMode)
+                else self.tls_mode
+            )
+        return body
+
+
+@dataclass
+class IdentityPhoneNumberCreateOptions:
+    """
+    Optional phone-number provisioning payload nested under identity creation.
+
+    Attributes:
+        type: Type of phone number to provision. Only ``"local"`` is supported; defaults to ``"local"``.
+        state: Optional US state abbreviation filter for local numbers.
+        incoming_call_action: How to handle inbound calls on the provisioned number.
+        client_websocket_url: WebSocket URL for ``"auto_accept"`` call handling.
+        incoming_call_webhook_url: Webhook URL for ``"webhook"`` call handling.
+    """
+
+    type: str = "local"
+    state: str | None = None
+    incoming_call_action: str = "auto_reject"
+    client_websocket_url: str | None = None
+    incoming_call_webhook_url: str | None = None
+    forwarding_target_type: ForwardingTargetType | str | None = None
+    forwarding_phone_number: str | None = None
+    forwarding_sip_uri: str | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict matching the API schema."""
+        if (
+            self.incoming_call_action == "auto_accept"
+            and self.client_websocket_url is None
+        ):
+            raise ValueError("client_websocket_url is required for auto_accept")
+        if (
+            self.incoming_call_action == "webhook"
+            and self.incoming_call_webhook_url is None
+        ):
+            raise ValueError("incoming_call_webhook_url is required for webhook")
+        if (
+            self.incoming_call_action == "forward"
+            and self.forwarding_target_type is None
+        ):
+            raise ValueError("forwarding_target_type is required for forward")
+        target_type = (
+            self.forwarding_target_type.value
+            if isinstance(self.forwarding_target_type, ForwardingTargetType)
+            else self.forwarding_target_type
+        )
+        if target_type is None:
+            if self.forwarding_phone_number is not None or self.forwarding_sip_uri is not None:
+                raise ValueError("forwarding_target_type is required when a forwarding target is set")
+        elif target_type == "phone":
+            if not self.forwarding_phone_number or self.forwarding_sip_uri is not None:
+                raise ValueError("phone forwarding requires only forwarding_phone_number")
+        elif target_type == "sip":
+            if not self.forwarding_sip_uri or self.forwarding_phone_number is not None:
+                raise ValueError("SIP forwarding requires only forwarding_sip_uri")
+        else:
+            raise ValueError("forwarding_target_type must be 'phone' or 'sip'")
+
+        body: dict[str, Any] = {
+            "type": self.type,
+            "incoming_call_action": self.incoming_call_action,
+        }
+        if self.state is not None:
+            body["state"] = self.state
+        if self.client_websocket_url is not None:
+            body["client_websocket_url"] = self.client_websocket_url
+        if self.incoming_call_webhook_url is not None:
+            body["incoming_call_webhook_url"] = self.incoming_call_webhook_url
+        if self.forwarding_target_type is not None:
+            body["forwarding_target_type"] = (
+                self.forwarding_target_type.value
+                if isinstance(self.forwarding_target_type, ForwardingTargetType)
+                else self.forwarding_target_type
+            )
+        if self.forwarding_phone_number is not None:
+            body["forwarding_phone_number"] = self.forwarding_phone_number
+        if self.forwarding_sip_uri is not None:
+            body["forwarding_sip_uri"] = self.forwarding_sip_uri
+        return body
+
+
+def vault_secret_ids_to_wire(
+    value: UUID | str | list[UUID | str] | Literal["*", "all"] | None,
+) -> str | list[str] | Literal["*", "all"] | None:
+    """Return a JSON-serializable vault secret selection value."""
+    if value in (None, "*", "all"):
+        return value
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    return [str(item) for item in value]
+
+
+@dataclass
+class IdentityMailbox:
+    """Mailbox channel linked to an agent identity.
+
+    ``agent_identity_id`` mirrors the same field on :class:`Mailbox`;
+    on the embedded variant it is non-null for live customer mailboxes
+    (1:1 invariant) and null only on deleted rows and system mailboxes.
+
+    ``sending_domain`` is the bare domain the mailbox sends from, derived
+    from ``email_address``.
+
+    """
+
+    id: UUID
+    email_address: str
+    filter_mode: FilterMode
+    created_at: datetime
+    updated_at: datetime
+    sending_domain: str = ""
+    agent_identity_id: UUID | None = None
+    filter_mode_change_notice: FilterModeChangeNotice | None = None
+
+    signature_html: str | None = None
+    signature_text: str | None = None
+    signature_enabled: bool = False
+    inbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+    outbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        self.inbound_filter_mode = FilterMode(self.inbound_filter_mode or self.filter_mode)
+        self.outbound_filter_mode = FilterMode(self.outbound_filter_mode or self.filter_mode)
+        if self.inbound_filter_mode == self.outbound_filter_mode:
+            self.filter_mode = self.inbound_filter_mode
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> IdentityMailbox:
+        notice = d.get("filter_mode_change_notice")
+        agent_identity_id = d.get("agent_identity_id")
+        sending_domain = d.get("sending_domain")
+        if not sending_domain:
+            email_address = d["email_address"]
+            _, _, sending_domain = email_address.partition("@")
+        return cls(
+            inbound_filter_mode=d.get("inbound_filter_mode"),
+            outbound_filter_mode=d.get("outbound_filter_mode"),
+            signature_html=d.get("signature_html"),
+            signature_text=d.get("signature_text"),
+            signature_enabled=d.get("signature_enabled", False),
+            id=UUID(d["id"]),
+            email_address=d["email_address"],
+            sending_domain=sending_domain,
+            filter_mode=FilterMode(d.get("filter_mode", "blacklist")),
+            created_at=datetime.fromisoformat(d["created_at"]),
+            updated_at=datetime.fromisoformat(d["updated_at"]),
+            agent_identity_id=UUID(agent_identity_id) if agent_identity_id else None,
+            filter_mode_change_notice=(
+                FilterModeChangeNotice._from_dict(notice) if notice else None
+            ),
+        )
+
+
+@dataclass
+class IdentityPhoneNumber:
+    """Phone number channel linked to an agent identity.
+
+    ``agent_identity_id`` mirrors the same field on :class:`PhoneNumber`;
+    on the embedded variant it always equals the owning identity's ID.
+
+    SMS-readiness fields (``sms_status``, ``sms_error_code``,
+    ``sms_error_detail``, ``sms_ready_at``) mirror the same fields on
+    :class:`PhoneNumber` and reflect 10DLC / TFV provisioning progress.
+    """
+
+    id: UUID
+    number: str
+    type: str
+    status: str
+    sms_status: SmsStatus
+    incoming_call_action: str
+    client_websocket_url: str | None
+    incoming_call_webhook_url: str | None
+    filter_mode: FilterMode
+    created_at: datetime
+    updated_at: datetime
+    sms_error_code: str | None = None
+    sms_error_detail: str | None = None
+    sms_ready_at: datetime | None = None
+    # US state abbreviation when known; null when not applicable.
+    state: str | None = None
+    agent_identity_id: UUID | None = None
+    filter_mode_change_notice: FilterModeChangeNotice | None = None
+    forwarding_target_type: ForwardingTargetType | None = None
+    forwarding_phone_number: str | None = None
+    forwarding_sip_uri: str | None = None
+    inbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+    outbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        self.inbound_filter_mode = FilterMode(self.inbound_filter_mode or self.filter_mode)
+        self.outbound_filter_mode = FilterMode(self.outbound_filter_mode or self.filter_mode)
+        if self.inbound_filter_mode == self.outbound_filter_mode:
+            self.filter_mode = self.inbound_filter_mode
+    # ISO 3166-1 alpha-2 country code; older responses default to US.
+    country: str = "US"
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> IdentityPhoneNumber:
+        notice = d.get("filter_mode_change_notice")
+        agent_identity_id = d.get("agent_identity_id")
+        raw_sms_status = d.get("sms_status")
+        raw_sms_ready_at = d.get("sms_ready_at")
+        return cls(
+            inbound_filter_mode=d.get("inbound_filter_mode"),
+            outbound_filter_mode=d.get("outbound_filter_mode"),
+            id=UUID(d["id"]),
+            number=d["number"],
+            type=d["type"],
+            status=d["status"],
+            sms_status=SmsStatus(raw_sms_status) if raw_sms_status else SmsStatus.READY,
+            incoming_call_action=d["incoming_call_action"],
+            client_websocket_url=d.get("client_websocket_url"),
+            incoming_call_webhook_url=d.get("incoming_call_webhook_url"),
+            forwarding_target_type=(
+                ForwardingTargetType(d["forwarding_target_type"])
+                if d.get("forwarding_target_type")
+                else None
+            ),
+            forwarding_phone_number=d.get("forwarding_phone_number"),
+            forwarding_sip_uri=d.get("forwarding_sip_uri"),
+            filter_mode=FilterMode(d.get("filter_mode", "blacklist")),
+            created_at=datetime.fromisoformat(d["created_at"]),
+            updated_at=datetime.fromisoformat(d["updated_at"]),
+            sms_error_code=d.get("sms_error_code"),
+            sms_error_detail=d.get("sms_error_detail"),
+            sms_ready_at=(
+                datetime.fromisoformat(raw_sms_ready_at) if raw_sms_ready_at else None
+            ),
+            state=d.get("state"),
+            country=d.get("country", "US"),
+            agent_identity_id=UUID(agent_identity_id) if agent_identity_id else None,
+            filter_mode_change_notice=(
+                FilterModeChangeNotice._from_dict(notice) if notice else None
+            ),
+        )
+
+
+@dataclass
+class IdentityIMessageNumber:
+    """Personal iMessage line attached to an agent identity.
+
+    The identity-detail wire shape is intentionally smaller than the
+    organization-level personal-line response: it contains no lifecycle
+    status or attachment fields because attachment is implied by nesting.
+    """
+
+    id: UUID
+    number: str
+    type: Literal["dedicated_outbound"]
+
+    @property
+    def line_role(self) -> Literal["personal"]:
+        """Always ``"personal"``; this model represents only personal lines."""
+        return "personal"
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> IdentityIMessageNumber:
+        return cls(
+            id=UUID(d["id"]),
+            number=d["number"],
+            type=_compatibility_number_type(d["type"]),
+        )
+
+
+@dataclass
+class AgentIdentitySummary:
+    """Agent identity returned by list endpoints.
+
+    ``imessage_enabled`` / ``imessage_filter_mode`` describe iMessage
+    reachability and filtering. Newer responses also include linked channels;
+    these fields default to empty values for older responses.
+
+    ``mail_filter_mode`` / ``phone_filter_mode`` are the whitelist/blacklist
+    modes for this identity's mail and phone contact rules. They live on the
+    identity (set via ``identity.update(...)``); the same field on the mailbox
+    / phone-number objects is the deprecated legacy mirror.
+    """
+
+    id: UUID
+    organization_id: str
+    agent_handle: str
+    display_name: str | None
+    description: str | None
+    email_address: str | None
+    created_at: datetime
+    updated_at: datetime
+    imessage_enabled: bool = False
+    contact_sharing_enabled: bool = True
+    imessage_filter_mode: FilterMode = FilterMode.BLACKLIST
+    mail_filter_mode: FilterMode = FilterMode.BLACKLIST
+    phone_filter_mode: FilterMode = FilterMode.BLACKLIST
+    # Webhook signing-key status (never the secret itself).
+    signing_key_configured: bool = False
+    signing_key_created_at: datetime | None = None
+    mailbox: IdentityMailbox | None = field(default=None)
+    phone_number: IdentityPhoneNumber | None = field(default=None)
+    imessage_number: IdentityIMessageNumber | None = field(default=None)
+    tunnel: TunnelSummary | None = field(default=None)
+    mail_inbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+    mail_outbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+    phone_inbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+    phone_outbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+    slack_filter_mode: FilterMode = FilterMode.BLACKLIST
+    slack_inbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+    slack_outbound_filter_mode: FilterMode = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        for channel in ("mail", "phone", "slack"):
+            shared = getattr(self, f"{channel}_filter_mode")
+            for side in ("inbound", "outbound"):
+                name = f"{channel}_{side}_filter_mode"
+                setattr(self, name, FilterMode(getattr(self, name) or shared))
+            inbound = getattr(self, f"{channel}_inbound_filter_mode")
+            if inbound == getattr(self, f"{channel}_outbound_filter_mode"):
+                setattr(self, f"{channel}_filter_mode", inbound)
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> AgentIdentitySummary:
+        raw_signing_created_at = d.get("signing_key_created_at")
+        imessage_mode = d.get("imessage_filter_mode") or "blacklist"
+        if d.get("phone_inbound_filter_mode") is not None and d.get("phone_inbound_filter_mode") == d.get("phone_outbound_filter_mode"):
+            imessage_mode = d["phone_inbound_filter_mode"]
+        mailbox_data = d.get("mailbox")
+        phone_data = d.get("phone_number")
+        imessage_data = d.get("imessage_number")
+        tunnel_data = d.get("tunnel")
+        return cls(
+            mail_inbound_filter_mode=d.get("mail_inbound_filter_mode"),
+            mail_outbound_filter_mode=d.get("mail_outbound_filter_mode"),
+            slack_filter_mode=FilterMode(d.get("slack_filter_mode") or "blacklist"),
+            slack_inbound_filter_mode=d.get("slack_inbound_filter_mode"),
+            slack_outbound_filter_mode=d.get("slack_outbound_filter_mode"),
+            phone_inbound_filter_mode=d.get("phone_inbound_filter_mode"),
+            phone_outbound_filter_mode=d.get("phone_outbound_filter_mode"),
+            id=UUID(d["id"]),
+            organization_id=d["organization_id"],
+            agent_handle=d["agent_handle"],
+            display_name=d.get("display_name"),
+            description=d.get("description"),
+            email_address=d.get("email_address"),
+            created_at=datetime.fromisoformat(d["created_at"]),
+            updated_at=datetime.fromisoformat(d["updated_at"]),
+            imessage_enabled=d.get("imessage_enabled", False),
+            contact_sharing_enabled=d.get("contact_sharing_enabled", True),
+            imessage_filter_mode=FilterMode(imessage_mode),
+            mail_filter_mode=FilterMode(d.get("mail_filter_mode") or "blacklist"),
+            phone_filter_mode=FilterMode(d.get("phone_filter_mode") or d.get("imessage_filter_mode") or "blacklist"),
+            signing_key_configured=d.get("signing_key_configured", False),
+            signing_key_created_at=(
+                datetime.fromisoformat(raw_signing_created_at)
+                if raw_signing_created_at
+                else None
+            ),
+            mailbox=IdentityMailbox._from_dict(mailbox_data) if mailbox_data else None,
+            phone_number=(
+                IdentityPhoneNumber._from_dict(phone_data) if phone_data else None
+            ),
+            imessage_number=(
+                IdentityIMessageNumber._from_dict(imessage_data)
+                if imessage_data
+                else None
+            ),
+            tunnel=TunnelSummary._from_dict(tunnel_data) if tunnel_data else None,
+        )
+
+
+@dataclass
+class _AgentIdentityData(AgentIdentitySummary):
+    """
+    Agent identity with linked communication channels and tunnel.
+
+    Returned by identity-create and identity-get endpoints. Internal —
+    users interact with :class:`AgentIdentity` (the domain class)
+    instead.
+    """
+
+    @classmethod
+    def _from_dict(cls, d: dict[str, Any]) -> _AgentIdentityData:  # type: ignore[override]
+        base = AgentIdentitySummary._from_dict(d)
+        return cls(**base.__dict__)

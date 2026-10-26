@@ -1,0 +1,377 @@
+"""
+tests/integration/python/test_sdk_lifecycle.py
+
+End-to-end lifecycle test for the Python SDK against a live environment.
+"""
+
+from __future__ import annotations
+
+from uuid import uuid4
+from tempfile import NamedTemporaryFile
+
+import pytest
+from inkbox import DraftRecipients, Inkbox, MailImportFormat, MailImportJobStatus
+from conftest import SdkIntegrationContext, log_step, poll_until
+
+
+@pytest.mark.sdk_integration
+def test_python_sdk_lifecycle(sdk_context: SdkIntegrationContext) -> None:
+    ctx = sdk_context
+    cfg = ctx.config
+    api_key = ctx.bootstrap.api_key
+
+    # Globally unique handles (`agent_handle` is now unique across all
+    # orgs and shares its namespace with `tunnel_name`), so parallel CI
+    # runs and any prior runs that left stragglers must not collide.
+    run_suffix = uuid4().hex[:8]
+    alpha_handle = f"py-alpha-{run_suffix}"
+    bravo_handle = f"py-bravo-{run_suffix}"
+
+    with Inkbox(api_key=api_key, base_url=cfg.base_url, timeout=cfg.http_timeout) as inkbox:
+
+        # ── whoami ──────────────────────────────────────────────────
+        log_step(ctx, "whoami")
+        whoami = inkbox.whoami()
+        assert whoami.organization_id == ctx.bootstrap.org_id
+
+        claim_domain = f"certification-{uuid4().hex}.example.com"
+        claim = inkbox.organization_domains.create(claim_domain)
+        try:
+            assert claim.state == "pending"
+            repeated = inkbox.organization_domains.create(claim_domain.upper() + ".")
+            assert repeated.id == claim.id
+            assert inkbox.organization_domains.get(claim.id).dns_record.name == f"_inkbox.{claim_domain}"
+            assert inkbox.organization_domains.verify(claim.id).valid_until is None
+            assert inkbox.a2a.public_directory(verified_domain=claim_domain).items == []
+        finally:
+            inkbox.organization_domains.delete(claim.id)
+
+        # ── empty state ────────────────────────────────────────────
+        log_step(ctx, "verify empty identity list")
+        identities = inkbox.list_identities()
+        assert len(identities) == 0
+
+        # ── create identities ─────────────────────────────────────
+        log_step(ctx, f"create identity {alpha_handle} (mailbox + tunnel atomic)")
+        alpha = inkbox.create_identity(
+            alpha_handle, description="alpha integration-test identity"
+        )
+        assert alpha.agent_handle == alpha_handle
+        assert alpha.mailbox is not None
+        assert alpha.email_address is not None
+        assert alpha.tunnel is not None
+        assert alpha.tunnel.public_host.startswith(f"{alpha_handle}.")
+        assert alpha.tunnel.public_host.endswith(".inkboxwire.com")
+        assert alpha.description == "alpha integration-test identity"
+        assert inkbox.identities.get_domain_affiliation(alpha_handle).affiliation is None
+
+        log_step(ctx, f"create identity {bravo_handle}")
+        bravo = inkbox.create_identity(bravo_handle)
+        assert bravo.agent_handle == bravo_handle
+        assert bravo.mailbox is not None
+        assert bravo.tunnel is not None
+
+        log_step(ctx, "import one EML through the Python SDK")
+        imported_subject = f"python-import-{run_suffix}"
+        with NamedTemporaryFile(suffix=".eml") as upload:
+            upload.write(
+                (
+                    f"From: sender@example.com\r\nTo: {alpha.email_address}\r\n"
+                    f"Subject: {imported_subject}\r\nMessage-ID: <{run_suffix}@example.com>\r\n"
+                    "Date: Wed, 1 Jul 2026 12:00:00 +0000\r\n\r\nImported body.\r\n"
+                ).encode()
+            )
+            upload.flush()
+            created = inkbox.mailboxes.imports.create(
+                alpha.email_address, source_format=MailImportFormat.EML
+            )
+            inkbox.mailboxes.imports.upload(created.upload, upload.name)
+        inkbox.mailboxes.imports.start(alpha.email_address, str(created.job.id))
+        imported = inkbox.mailboxes.imports.wait(
+            alpha.email_address,
+            str(created.job.id),
+            timeout=cfg.poll_timeout,
+            poll_interval=cfg.poll_interval,
+        )
+        assert imported.status is MailImportJobStatus.COMPLETED
+        assert imported.messages_imported == 1
+
+        log_step(ctx, "list identities shows 2")
+        identities = inkbox.list_identities()
+        assert len(identities) == 2
+
+        # ── tunnel get (smoke) ────────────────────────────────────
+        log_step(ctx, "fetch alpha's tunnel from the tunnel surface")
+        alpha_tunnel = inkbox.tunnels.get(alpha.tunnel.id)
+        assert alpha_tunnel.tunnel_name == alpha_handle
+        assert alpha_tunnel.tls_mode.value == "edge"
+
+        # ── get identity ──────────────────────────────────────────
+        log_step(ctx, f"get identity {alpha_handle}")
+        alpha_fetched = inkbox.get_identity(alpha_handle)
+        assert alpha_fetched.id == alpha.id
+        assert alpha_fetched.email_address == alpha.email_address
+        assert alpha_fetched.tunnel is not None
+        assert alpha_fetched.tunnel.id == alpha.tunnel.id
+        assert alpha_fetched.description == "alpha integration-test identity"
+
+        # ── update description: omit vs explicit-null semantics ───
+        log_step(ctx, "update alpha description (set)")
+        alpha_fetched.update(description="alpha updated")
+        assert inkbox.get_identity(alpha_handle).description == "alpha updated"
+        log_step(ctx, "update alpha description (clear via explicit None)")
+        alpha_fetched.update(description=None)
+        assert inkbox.get_identity(alpha_handle).description is None
+
+        # ── email draft lifecycle ──────────────────────────────────
+        log_step(ctx, "create, list, get, update, and delete an email draft")
+        draft = alpha.create_email_draft(subject=f"draft-{run_suffix}")
+        assert draft.generation == 1
+        assert any(item.id == draft.id for item in alpha.iter_email_drafts())
+        fetched_draft = alpha.get_email_draft(draft.id)
+        assert fetched_draft.id == draft.id
+        updated_draft = alpha.update_email_draft(
+            draft.id,
+            generation=draft.generation,
+            recipients=DraftRecipients(to=[bravo.email_address]),
+            body_text="Updated draft body",
+        )
+        assert updated_draft.generation == draft.generation + 1
+        assert updated_draft.body_text == "Updated draft body"
+        alpha.delete_email_draft(
+            updated_draft.id, generation=updated_draft.generation
+        )
+        assert all(item.id != draft.id for item in alpha.iter_email_drafts())
+
+        log_step(ctx, "create and send a draft with an attachment")
+        send_draft = inkbox.drafts.create(
+            alpha.email_address,
+            to=[bravo.email_address],
+            subject=f"draft-send-{run_suffix}",
+            body_text="Sent from a draft.",
+            attachments=[
+                {
+                    "filename": "hello.txt",
+                    "content_type": "text/plain",
+                    "content_base64": "aGVsbG8=",
+                }
+            ],
+        )
+        assert send_draft.attachment_count == 1
+        sent_draft_message = alpha.send_email_draft(
+            send_draft.id, generation=send_draft.generation
+        )
+        assert sent_draft_message.subject == f"draft-send-{run_suffix}"
+
+        # ── send email alpha → bravo ──────────────────────────────
+        subject = f"sdk-integration-{cfg.environment}"
+        log_step(ctx, f"send email from alpha to bravo: {subject}")
+        sent = alpha.send_email(
+            to=[bravo.email_address],
+            subject=subject,
+            body_text="Hello from the Python SDK integration test!",
+        )
+        assert sent.subject == subject
+        assert sent.direction == "outbound"
+
+        # ── poll for delivery ─────────────────────────────────────
+        log_step(ctx, "poll for inbound delivery to bravo")
+
+        def fetch_bravo_inbound():
+            msgs = []
+            for msg in bravo.iter_emails(direction="inbound"):
+                msgs.append(msg)
+                if len(msgs) >= 50:
+                    break
+            return msgs
+
+        messages = poll_until(
+            "inbound message delivered to bravo",
+            fetch_bravo_inbound,
+            timeout_seconds=cfg.poll_timeout,
+            interval_seconds=cfg.poll_interval,
+            is_ready=lambda msgs: any(m.subject == subject for m in msgs),
+            verbose=cfg.verbose,
+        )
+        inbound_msg = next(m for m in messages if m.subject == subject)
+        assert inbound_msg.direction == "inbound"
+
+        # ── message detail ────────────────────────────────────────
+        log_step(ctx, "get message detail")
+        detail = bravo.get_message(inbound_msg.id)
+        assert detail.body_text is not None
+        assert "Python SDK" in detail.body_text
+        assert detail.thread_id is not None
+
+        # ── mark read ─────────────────────────────────────────────
+        log_step(ctx, "mark message as read")
+        bravo.mark_emails_read([inbound_msg.id])
+
+        # ── thread ────────────────────────────────────────────────
+        log_step(ctx, "get thread")
+        thread = bravo.get_thread(detail.thread_id)
+        assert thread.subject == subject
+        assert len(thread.messages) >= 1
+
+        # ── forward bravo → alpha ─────────────────────────────────
+        forward_subject = f"Fwd: {subject}"
+        log_step(ctx, f"forward inbound message from bravo to alpha: {forward_subject}")
+        forwarded = bravo.forward_email(
+            inbound_msg.id,
+            to=[alpha.email_address],
+            body_text="Forwarded by the Python SDK integration test.",
+        )
+        assert forwarded.direction == "outbound"
+        assert forwarded.subject == forward_subject
+
+        log_step(ctx, "poll for forwarded delivery to alpha")
+
+        def fetch_alpha_inbound():
+            msgs = []
+            for msg in alpha.iter_emails(direction="inbound"):
+                msgs.append(msg)
+                if len(msgs) >= 50:
+                    break
+            return msgs
+
+        alpha_messages = poll_until(
+            "forwarded message delivered to alpha",
+            fetch_alpha_inbound,
+            timeout_seconds=cfg.poll_timeout,
+            interval_seconds=cfg.poll_interval,
+            is_ready=lambda msgs: any(m.subject == forward_subject for m in msgs),
+            verbose=cfg.verbose,
+        )
+        forwarded_inbound = next(
+            m for m in alpha_messages if m.subject == forward_subject
+        )
+        assert forwarded_inbound.direction == "inbound"
+
+        # ── mailbox storage ───────────────────────────────────────
+        # Both fields are present and numeric on the mail mailbox routes.
+        # The over-cap 402 (StorageLimitExceededError) is unit-tested, not
+        # exercised here — filling a 2 GiB cap in CI is not practical.
+        log_step(ctx, "mailbox storage fields on list + get")
+        alpha_mailbox = inkbox.mailboxes.get(alpha.email_address)
+        assert isinstance(alpha_mailbox.storage_used_bytes, int)
+        assert alpha_mailbox.storage_used_bytes >= 0
+        assert alpha_mailbox.storage_limit_bytes is None or (
+            isinstance(alpha_mailbox.storage_limit_bytes, int)
+            and alpha_mailbox.storage_limit_bytes > 0
+        )
+
+        listed = inkbox.mailboxes.list()
+        listed_alpha = next(
+            m for m in listed if m.email_address == alpha.email_address
+        )
+        assert isinstance(listed_alpha.storage_used_bytes, int)
+
+        # ── vault + credentials ───────────────────────────────────
+        vault_key = "IntegrationTest-Key-01!"
+        log_step(ctx, "initialize vault")
+        vault_result = inkbox.vault.initialize(vault_key)
+        assert vault_result.vault_key_id is not None
+        assert len(vault_result.recovery_codes) == 4
+
+        log_step(ctx, "vault info")
+        vault_info = inkbox.vault.info()
+        assert vault_info is not None
+        assert vault_info.key_count == 1
+        assert vault_info.recovery_key_count == 4
+        assert vault_info.secret_count == 0
+
+        log_step(ctx, "unlock vault")
+        inkbox.vault.unlock(vault_key)
+
+        log_step(ctx, "create secret via alpha identity")
+        from inkbox.vault.types import APIKeyPayload, LoginPayload
+        secret_a = alpha.create_secret(
+            name="test-api-key",
+            payload=APIKeyPayload(api_key="sk-test-secret-12345"),
+            description="Integration test API key",
+        )
+        assert secret_a.name == "test-api-key"
+        assert secret_a.secret_type == "api_key"
+
+        log_step(ctx, "create login secret via alpha identity")
+        secret_b = alpha.create_secret(
+            name="test-login",
+            payload=LoginPayload(username="testuser", password="testpass123"),
+            description="Integration test login",
+        )
+        assert secret_b.name == "test-login"
+        assert secret_b.secret_type == "login"
+
+        log_step(ctx, "list secrets shows both")
+        all_secrets = inkbox.vault.list_secrets()
+        assert len(all_secrets) == 2
+
+        log_step(ctx, "list secrets filtered by type")
+        api_key_secrets = inkbox.vault.list_secrets(secret_type="api_key")
+        assert len(api_key_secrets) == 1
+        assert api_key_secrets[0].name == "test-api-key"
+
+        log_step(ctx, "verify alpha credentials include both secrets (no client-side filtering)")
+        creds = alpha.credentials
+        api_keys = creds.list_api_keys()
+        assert len(api_keys) == 1
+        assert api_keys[0].payload.api_key == "sk-test-secret-12345"
+        logins = creds.list_logins()
+        assert len(logins) == 1
+        assert logins[0].payload.username == "testuser"
+
+        log_step(ctx, "get secret by ID and verify decrypted payload")
+        fetched = alpha.get_secret(secret_a.id)
+        assert fetched.name == "test-api-key"
+        assert fetched.payload.api_key == "sk-test-secret-12345"
+
+        log_step(ctx, "delete secrets")
+        alpha.delete_secret(secret_a.id)
+        alpha.delete_secret(secret_b.id)
+        assert len(inkbox.vault.list_secrets()) == 0
+
+        # ── identity-scoped contact rules + filter mode ───────────
+        # (mail only — alpha has no phone number, and we don't provision
+        # real numbers in CI; phone rules require a number server-side.)
+        log_step(ctx, "set alpha mail filter mode to whitelist")
+        alpha.update(mail_filter_mode="whitelist")
+        assert inkbox.get_identity(alpha_handle).mail_filter_mode == "whitelist"
+
+        log_step(ctx, "create a mail contact rule on alpha (identity-keyed)")
+        rule = alpha.create_mail_contact_rule(
+            action="allow", match_type="exact_email", match_target="vip@example.com",
+        )
+        assert str(rule.agent_identity_id) == str(alpha.id)
+
+        log_step(ctx, "list alpha's mail rules + org-wide list filtered by identity")
+        assert any(r.id == rule.id for r in alpha.list_mail_contact_rules())
+        org_rules = inkbox.mail_identity_contact_rules.list_all(agent_identity_id=alpha.id)
+        assert any(r.id == rule.id for r in org_rules)
+
+        log_step(ctx, "delete the mail contact rule + reset filter mode")
+        alpha.delete_mail_contact_rule(rule.id)
+        assert all(r.id != rule.id for r in alpha.list_mail_contact_rules())
+        alpha.update(mail_filter_mode="blacklist")
+        assert inkbox.get_identity(alpha_handle).mail_filter_mode == "blacklist"
+
+        # ── per-identity signing key ──────────────────────────────
+        log_step(ctx, "per-identity signing key: status -> create -> status")
+        pre = alpha.get_signing_key_status()
+        assert isinstance(pre.configured, bool)
+        signing_key = alpha.create_signing_key()
+        assert signing_key.signing_key is not None
+        assert signing_key.created_at is not None
+        assert alpha.get_signing_key_status().configured is True
+
+        # ── cleanup: delete identities (cascades to mailbox + tunnel) ─
+        log_step(ctx, "delete identities")
+        alpha.delete()
+        bravo.delete()
+
+        log_step(ctx, "verify empty after cleanup")
+        identities = inkbox.list_identities()
+        assert len(identities) == 0
+
+    # Test-org cleanup is now handled by the session-scoped sdk_context
+    # fixture teardown so that subsequent tests in the same pytest run
+    # (e.g. test_sdk_signup) can reuse the same test org.
