@@ -1,0 +1,117 @@
+"""
+tests/integration/python/test_sdk_signup.py
+
+Live agent-signup coverage for the Python SDK.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+import httpx
+import pytest
+
+from conftest import SdkIntegrationContext, log_step
+from inkbox import Inkbox
+
+
+# The signup human is shared, so this list can also hold an agent that a
+# concurrently running suite created moments ago. Only agents older than this
+# count as leftovers worth claiming.
+_LEFTOVER_MIN_AGE = timedelta(minutes=10)
+
+
+def _approve_stale_pending(jwt_client: httpx.Client, org_id: str) -> None:
+    """Claim leftover unclaimed agents linked to the signup human, freeing the cap.
+
+    Best-effort: a leftover that won't approve is skipped, since freeing even
+    one slot is enough for the subsequent signup to succeed.
+    """
+    cutoff = datetime.now(timezone.utc) - _LEFTOVER_MIN_AGE
+    resp = jwt_client.get("/agent-signup/pending")
+    resp.raise_for_status()
+    for agent in resp.json().get("agents", []):
+        if datetime.fromisoformat(agent["created_at"]) > cutoff:
+            continue
+        try:
+            jwt_client.post(
+                f"/agent-signup/{agent['identity_id']}/approve",
+                json={"organization_id": org_id},
+            ).raise_for_status()
+        except httpx.HTTPError:
+            pass
+
+
+@pytest.mark.sdk_integration
+def test_python_sdk_signup_accepts_custom_handle_and_email_local_part(
+    sdk_context: SdkIntegrationContext,
+) -> None:
+    ctx = sdk_context
+    cfg = ctx.config
+    suffix = uuid4().hex[:10]
+    agent_handle = f"sdk-signup-{suffix}"
+    # On the platform sending domain, the server forces
+    # `email_local_part == agent_handle`. Pass the same value through
+    # the SDK call so the wire body still includes `email_local_part`
+    # explicitly (exercising that arg) without triggering the 422.
+    email_local_part = agent_handle
+
+    api_url = f"{cfg.base_url.rstrip('/')}/api/v1"
+
+    log_step(ctx, "mint JWT for human approval")
+    jwt_resp = httpx.post(
+        f"{api_url}/testing/create-session-jwt",
+        headers={"X-Interservice-Secret": cfg.interservice_secret},
+        json={
+            "user_id": ctx.bootstrap.user_id,
+            "org_id": ctx.bootstrap.org_id,
+        },
+        timeout=cfg.http_timeout,
+    )
+    jwt_resp.raise_for_status()
+    jwt = jwt_resp.json()["jwt"]
+
+    with httpx.Client(
+        base_url=api_url,
+        headers={"Authorization": f"Bearer {jwt}"},
+        timeout=cfg.http_timeout,
+    ) as jwt_client:
+        # The signup human is shared, so unclaimed agents leaked by earlier
+        # failed runs accumulate against a per-email cap and would 429 this
+        # signup. Claim those leftovers first to free the cap.
+        log_step(ctx, "drain stale unclaimed agents for the signup human")
+        _approve_stale_pending(jwt_client, ctx.bootstrap.org_id)
+
+        log_step(ctx, "sign up agent with explicit handle and email local part")
+        signup = Inkbox.signup(
+            human_email=ctx.bootstrap.email_address,
+            note_to_human="Python SDK integration signup test",
+            agent_handle=agent_handle,
+            email_local_part=email_local_part,
+            harness="sdk-integration",
+            base_url=cfg.base_url,
+            timeout=cfg.http_timeout,
+        )
+        ctx.register_org_for_cleanup(signup.organization_id)
+        assert signup.agent_handle == agent_handle
+        assert signup.email_address.startswith(f"{email_local_part}@")
+
+        log_step(ctx, "find pending signup and approve it into bootstrap org")
+        pending = jwt_client.get("/agent-signup/pending")
+        pending.raise_for_status()
+        pending_agent = next(
+            agent for agent in pending.json()["agents"]
+            if agent["agent_handle"] == agent_handle
+        )
+        approved = jwt_client.post(
+            f"/agent-signup/{pending_agent['identity_id']}/approve",
+            json={"organization_id": ctx.bootstrap.org_id},
+        )
+        approved.raise_for_status()
+
+    log_step(ctx, "verify signed-up agent can load its identity after approval")
+    with Inkbox(api_key=signup.api_key, base_url=cfg.base_url, timeout=cfg.http_timeout) as inkbox:
+        identity = inkbox.get_identity(agent_handle)
+        assert identity.agent_handle == agent_handle
+        assert identity.email_address == signup.email_address

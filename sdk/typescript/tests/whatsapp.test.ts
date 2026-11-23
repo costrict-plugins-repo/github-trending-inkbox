@@ -1,0 +1,348 @@
+import { readFileSync } from "node:fs";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  Inkbox,
+  getMessageRequestKey,
+  WhatsAppResource,
+  parseWhatsAppMessage,
+} from "../src/index.js";
+import { HttpTransport } from "../src/_http.js";
+import type {
+  RawWhatsAppMessage,
+  WhatsAppWebhookPayload,
+} from "../src/index.js";
+const f = JSON.parse(
+  readFileSync(
+    new URL("../../../tests/fixtures/whatsapp.json", import.meta.url),
+    "utf8",
+  ),
+);
+const owner = f.identity_id,
+  conv = f.conversation.id,
+  media = f.media.id;
+const ok = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+const last = () => {
+  const [url, init] = vi.mocked(fetch).mock.calls.at(-1)!;
+  return {
+    url: new URL(String(url)),
+    init: init!,
+    body: typeof init?.body === "string" ? JSON.parse(init.body) : init?.body,
+  };
+};
+const resource = () =>
+  new WhatsAppResource(
+    new HttpTransport("test-only", "https://inkbox.ai/api/v1/whatsapp"),
+  );
+afterEach(() => vi.restoreAllMocks());
+describe("WhatsApp public wire", () => {
+  it("keeps ownership out of body and confirmed sent distinct from unknown delivery", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(ok({ message: f.message }, 201)),
+    );
+    const message = await resource().send({
+      to: "+15555550101",
+      text: "Hello",
+      mediaIds: [media],
+      agentIdentityId: owner,
+      idempotencyKey: "logical-send",
+    });
+    expect(last().url.searchParams.get("agent_identity_id")).toBe(owner);
+    expect(last().body).toEqual({
+      to: "+15555550101",
+      text: "Hello",
+      media_ids: [media],
+    });
+    expect(new Headers(last().init.headers).get("Idempotency-Key")).toBe(
+      "logical-send",
+    );
+    expect(message.status).toBe("sent");
+    expect(message.deliveryState).toBe("unknown");
+    expect(message.failedAt).toBeNull();
+  });
+  it("rejects invalid sends before I/O and counts Unicode code points", async () => {
+    vi.stubGlobal("fetch", vi.fn());
+    for (const options of [
+      {},
+      { to: "+15555550101", conversationId: conv, text: "hi" },
+      { to: [], text: "hi" },
+      { to: ["+15555550101", "+15555550101"], text: "hi" },
+      { to: "+15555550101", text: " " },
+      { to: "+15555550101", text: "😀".repeat(4001) },
+      { to: "+15555550101", mediaIds: [media, media] },
+    ])
+      await expect(resource().send(options)).rejects.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+    vi.mocked(fetch).mockResolvedValue(ok({ message: f.message }, 201));
+    await resource().send({ conversationId: conv, text: "😀".repeat(4000) });
+  });
+  it("retains bare array pagination and unavailable attachment identity", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(ok([f.inbound_message])));
+    const rows = await resource().list({
+      agentIdentityId: owner,
+      conversationId: conv,
+      limit: 10,
+      offset: 4,
+      isRead: false,
+      isBlocked: false,
+    });
+    expect(Object.fromEntries(last().url.searchParams)).toEqual({
+      agent_identity_id: owner,
+      conversation_id: conv,
+      limit: "10",
+      offset: "4",
+      is_read: "false",
+      is_blocked: "false",
+    });
+    expect(rows[0].media[0]).toMatchObject({
+      id: media,
+      status: "unavailable",
+      url: null,
+    });
+    vi.mocked(fetch).mockResolvedValue(ok(f.message));
+    expect(
+      (await resource().get(f.message.id, { agentIdentityId: owner })).id,
+    ).toBe(f.message.id);
+    vi.mocked(fetch).mockResolvedValue(ok([f.conversation_summary]));
+    expect(
+      (await resource().listConversations({ agentIdentityId: owner }))[0]
+        .unreadCount,
+    ).toBe(2);
+    vi.mocked(fetch).mockResolvedValue(ok(f.conversation));
+    expect((await resource().getConversation(conv)).participants).toEqual([
+      "+15555550101",
+    ]);
+  });
+  it("owns multipart uploads and renews URLs through GET without re-uploading", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(ok(f.media, 201)));
+    await resource().uploadMedia({
+      content: new Uint8Array([1, 2, 3]),
+      filename: "image.png",
+      contentType: "image/png",
+      agentIdentityId: owner,
+    });
+    expect(last().url.searchParams.get("agent_identity_id")).toBe(owner);
+    expect(last().body).toBeInstanceOf(FormData);
+    expect((last().body as FormData).get("file")).toBeInstanceOf(Blob);
+    await expect(
+      resource().uploadMedia({
+        content: new Uint8Array(20 * 1024 * 1024 + 1),
+        filename: "large",
+      }),
+    ).rejects.toThrow("20 MiB");
+    vi.mocked(fetch).mockResolvedValue(
+      ok({ ...f.media, url: "https://media.example/fresh" }),
+    );
+    expect(
+      (await resource().getMedia(media, { agentIdentityId: owner })).url,
+    ).toContain("fresh");
+    expect(last().url.pathname).toContain(`/media/${media}`);
+  });
+  it("marks local read state through an exact visible boundary", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(ok({ conversation_id: conv, updated_count: 2 })),
+    );
+    expect(
+      await resource().markRead(conv, f.message.id, { agentIdentityId: owner }),
+    ).toEqual({ conversationId: conv, updatedCount: 2, readReceiptsSent: false });
+    expect(last().body).toEqual({
+      conversation_id: conv,
+      through_message_id: f.message.id,
+    });
+  });
+  it("queries fresh status and does not deny sends from an older disabled snapshot", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        ok({
+          id: owner,
+          organization_id: "org_example",
+          agent_handle: "agent",
+          created_at: f.message.created_at,
+          updated_at: f.message.updated_at,
+        }),
+      ),
+    );
+    const client = new Inkbox({ apiKey: "test-only" });
+    const identity = await client.getIdentity("agent");
+    expect(identity.whatsappEnabled).toBe(false);
+    vi.mocked(fetch).mockResolvedValue(ok({ message: f.message }, 201));
+    await identity.sendWhatsApp({ to: "+15555550101", text: "Hi" });
+    expect(last().url.searchParams.get("agent_identity_id")).toBe(owner);
+    vi.mocked(fetch).mockResolvedValue(ok({ whatsapp: f.status }));
+    expect((await identity.getWhatsAppStatus())?.enabled).toBe(true);
+    vi.mocked(fetch).mockResolvedValue(ok({ imessage: {} }));
+    expect(await identity.getWhatsAppStatus()).toBeNull();
+  });
+  it.each([true, false, undefined])("preserves configured history (%s) without enabling sends", async configured => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(ok({
+      id: owner, organization_id: "org_example", agent_handle: "agent",
+      created_at: f.message.created_at, updated_at: f.message.updated_at,
+      whatsapp_configured: configured, whatsapp_enabled: false, whatsapp_number: null,
+    })));
+    const identity = await new Inkbox({ apiKey: "test-only" }).getIdentity("agent");
+    expect(identity.whatsappConfigured).toBe(configured ?? false);
+    expect(identity.whatsappEnabled).toBe(false);
+    expect(identity.whatsappNumber).toBeNull();
+  });
+  it("exports raw webhook payloads without converting received URLs or timestamps", () => {
+    const webhook: WhatsAppWebhookPayload = f.webhook;
+    expect(webhook.data.message!.sender_number).toBe("+15555550101");
+    expect(webhook.data.message!.media[0].url).toBeNull();
+    expect(
+      parseWhatsAppMessage(f.message as RawWhatsAppMessage).createdAt,
+    ).toBeInstanceOf(Date);
+  });
+});
+
+it("reads owned effective limits and retains unknown policy keys", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(ok(f.limits)));
+  const result = await resource().getLimits({ agentIdentityId: owner });
+  expect(last().url.pathname).toBe("/api/v1/whatsapp/limits");
+  expect(last().url.searchParams.get("agent_identity_id")).toBe(owner);
+  expect(result.agentIdentityId).toBe(owner);
+  expect(Object.keys(result).sort()).toEqual(["agentIdentityId", "limits", "usage"]);
+  expect(result.limits["whatsapp.texts_per_agent_identity_per_24h"]).toBe(1000);
+  expect(result.limits["whatsapp.pre_reply_messages"]).toBe(3);
+  expect(result.limits["whatsapp.pre_reply_max_text_length"]).toBe(159);
+  expect(result.limits["whatsapp.outbound_new_contact_min_interval_seconds"]).toBe(60);
+  expect(result.limits["whatsapp.future_limit"]).toBe(7);
+  expect(result.usage).toEqual({ "whatsapp.texts_per_agent_identity_per_24h": 2 });
+});
+
+
+it.each(["", "binary/octet-stream"])("uses explicit MIME for a Blob with existing type %j", async (type) => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(ok(f.media, 201)));
+  await resource().uploadMedia({content: new Blob([new Uint8Array([1, 2, 3])], {type}), filename: "image.png", contentType: "image/png", agentIdentityId: owner});
+  const file = (last().body as FormData).get("file") as File;
+  expect(file.type).toBe("image/png"); expect(file.name).toBe("image.png");
+  expect(new Uint8Array(await file.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
+});
+it("retains a Blob MIME when no explicit override is supplied", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(ok(f.media, 201)));
+  await resource().uploadMedia({content: new Blob(["image-bytes"], {type: "image/jpeg"}), filename: "image.jpg"});
+  expect(((last().body as FormData).get("file") as File).type).toBe("image/jpeg");
+});
+
+it("forwards date filters for both direct-message lists", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => ok([])));
+  for (const method of ["list", "listConversations"] as const) {
+    await resource()[method]({startDatetime: "2026-03-08", endDatetime: "2026-03-08", tz: "America/New_York"});
+    expect(Object.fromEntries(last().url.searchParams)).toEqual({limit: "50", offset: "0", start_datetime: "2026-03-08", end_datetime: "2026-03-08", tz: "America/New_York"});
+    expect(last().url.searchParams.has("include_groups")).toBe(false);
+  }
+});
+
+it("sends voice note options only when set", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => ok({message: f.message}, 201)));
+  await resource().send({to: "+15555550101", text: "Hello", sendAsVoiceNote: true, fallbackToText: false});
+  expect(last().body).toEqual({to: "+15555550101", text: "Hello", send_as_voice_note: true, fallback_to_text: false});
+  await resource().send({to: "+15555550101", text: "Hello", sendAsVoiceNote: false, fallbackToText: true});
+  expect(last().body).toEqual({to: "+15555550101", text: "Hello"});
+});
+
+it("preserves legacy quote/default bodies and binds only an explicit native requirement", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => ok({message: f.message}, 201)));
+  for (const quoted of [false, true]) for (const fallback of [false, true]) {
+    await resource().send({conversationId: conv, text: "Reply", ...(quoted ? {replyToMessageId: f.message.id} : {}), plainReplyFallback: fallback, idempotencyKey: "same-operation"});
+    expect(last().body).toEqual({conversation_id: conv, text: "Reply", ...(quoted ? {reply_to_message_id: f.message.id} : {}), ...(quoted && !fallback ? {plain_reply_fallback: false} : {})});
+  }
+  for (const invalid of [null, 0, 1, "false"]) {
+    await expect(resource().send({to: "+15555550101", text: "Hello", plainReplyFallback: invalid as unknown as boolean})).rejects.toThrow("boolean");
+  }
+  expect(fetch).toHaveBeenCalledTimes(4);
+});
+
+
+it.each([
+  { key: undefined, missing: true },
+  { key: "saved-logical-send", missing: true },
+  { key: undefined, missing: false },
+  { key: "saved-logical-send", missing: false },
+])("retains a decode failure key without another send (%j)", async ({ key, missing }) => {
+  const body = missing ? {} : { message: { ...f.message, media: {} } };
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => ok(body, 201)));
+  let failure: unknown;
+  try {
+    await resource().send({ conversationId: conv, text: "One logical message", idempotencyKey: key });
+  } catch (error) { failure = error; }
+  expect(failure).toBeInstanceOf(TypeError);
+  expect(fetch).toHaveBeenCalledTimes(1);
+  const original = last();
+  const retained = getMessageRequestKey(failure);
+  expect(retained).toBe(new Headers(original.init.headers).get("Idempotency-Key"));
+  if (key !== undefined) expect(retained).toBe(key);
+  vi.mocked(fetch).mockImplementation(async () => ok({ message: f.message }, 201));
+  await resource().send({ conversationId: conv, text: "One logical message", idempotencyKey: retained });
+  expect(fetch).toHaveBeenCalledTimes(2);
+  expect(last().body).toEqual(original.body);
+  expect(new Headers(last().init.headers).get("Idempotency-Key")).toBe(retained);
+});
+
+const onboarding = JSON.parse(readFileSync(new URL("../../../tests/fixtures/whatsapp-onboarding.json", import.meta.url), "utf8"));
+it.each(["ready", "unavailable", "disabled"])("onboarding preserves %s state and optional identity without sending", async (state) => {
+  const raw = { ...onboarding, ready: state === "ready" };
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(ok(raw))));
+  for (const agentIdentityId of [undefined, owner]) {
+    const result = await resource().getOnboarding({ agentIdentityId });
+    expect(result).toEqual({ agentIdentityId: raw.agent_identity_id, triageNumber: raw.triage_number, connectCommand: raw.connect_command, connectLink: raw.connect_link, connectQrPngDataUrl: raw.connect_qr_png_data_url,
+      number: raw.triage_number, messageText: raw.connect_command, messageLink: raw.connect_link, messageQrPngDataUrl: raw.connect_qr_png_data_url, ready: raw.ready });
+    expect(last().url.pathname).toBe("/api/v1/whatsapp/onboarding");
+    expect(Object.fromEntries(last().url.searchParams)).toEqual(agentIdentityId ? { agent_identity_id: owner } : {});
+    expect(last().init.method).toBe("GET");
+    expect(last().body).toBeUndefined();
+  }
+});
+it("identity onboarding uses fresh details for its own identity", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(ok({ id: owner, organization_id: "org_example", agent_handle: "agent",
+    created_at: f.message.created_at, updated_at: f.message.updated_at })).mockResolvedValueOnce(ok(onboarding)));
+  const identity = await new Inkbox({ apiKey: "test-only" }).getIdentity("agent");
+  expect((await identity.getWhatsAppOnboarding()).messageLink).toBe(onboarding.connect_link);
+  expect(last().url.searchParams.get("agent_identity_id")).toBe(owner);
+});
+
+
+it.each([true, false])("preserves legacy direct onboarding without inventing a router: %s", async available => {
+  const raw = { agent_identity_id: owner, number: available ? "+15555550100" : null, message_text: "Hello!",
+    message_link: available ? "https://wa.me/15555550100?text=Hello!" : null,
+    message_qr_png_data_url: available ? "data:image/png;base64,cXI=" : null, ready: available };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(ok(raw)));
+  const value = await resource().getOnboarding();
+  expect(value.number).toBe(raw.number);
+  expect(value.messageText).toBe("Hello!");
+  expect(value.messageLink).toBe(raw.message_link);
+  expect(value.messageQrPngDataUrl).toBe(raw.message_qr_png_data_url);
+  expect(value.triageNumber).toBeNull();
+  expect(value.connectCommand).toBeNull();
+  expect(value.connectLink).toBeNull();
+});
+
+it("management requests preserve ownership fences, clear, false and pagination", async () => {
+  const router = { id: conv, number: "+15555550100", revision: 2, state: "enabled", profile_display_name: null, accepting_new_connections: false };
+  const number = { id: conv, number: "+15555550100", agent_identity_id: null, revision: 2, state: "disabled", binding_state: null, assignable: false, unavailable_reason: "Requires setup" };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(ok({ numbers: [number], has_more: true }))
+    .mockResolvedValueOnce(ok(number)).mockResolvedValueOnce(ok({ router: null })).mockResolvedValueOnce(ok({ router }))
+    .mockResolvedValueOnce(ok({ router })).mockResolvedValueOnce(ok({ items: [], has_more: false })).mockResolvedValueOnce(ok({ items: [], has_more: true })));
+  const api = resource();
+  expect((await api.listNumbers({ offset: 100 })).hasMore).toBe(true);
+  expect(last().url.searchParams.get("offset")).toBe("100");
+  await api.assignNumber(conv, { agentIdentityId: null, expectedRevision: 1 });
+  expect(last().body).toEqual({ agent_identity_id: null, expected_revision: 1 });
+  expect(await api.getRouter()).toBeNull();
+  expect((await api.updateRouter({ expectedRouterId: conv, expectedRevision: 1, profileDisplayName: null, acceptingNewConnections: false })).acceptingNewConnections).toBe(false);
+  expect(last().body).toEqual({ expected_router_id: conv, expected_revision: 1, profile_display_name: null, accepting_new_connections: false });
+  await api.updateRouter({ expectedRouterId: conv, expectedRevision: 2 });
+  expect(last().body).toEqual({ expected_router_id: conv, expected_revision: 2 });
+  await api.listRouterThreads({ limit: 10, offset: 20 });
+  expect(last().url.pathname).toBe("/api/v1/whatsapp/router/conversations");
+  expect(last().url.searchParams.get("offset")).toBe("20");
+  await api.listRouterMessages("+15555550101", { offset: 50 });
+  expect(decodeURIComponent(last().url.pathname)).toBe("/api/v1/whatsapp/router/conversations/+15555550101/messages");
+});

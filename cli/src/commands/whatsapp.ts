@@ -1,0 +1,423 @@
+import { readFile, stat } from "node:fs/promises";
+import { basename } from "node:path";
+import { Command } from "commander";
+import type { WhatsAppSendOptions, WhatsAppReactionType } from "@inkbox/sdk";
+import { createClient, getGlobalOpts } from "../client.js";
+import { output } from "../output.js";
+import { withErrorHandler } from "../errors.js";
+
+export function buildWhatsAppSendOptions(options: {
+  to?: string;
+  conversationId?: string;
+  replyToMessageId?: string;
+  plainReplyFallback?: boolean;
+  gifPlayback?: boolean;
+  voiceNote?: boolean;
+  fallbackToText?: boolean;
+  text?: string;
+  mediaId?: string;
+  idempotencyKey?: string;
+}): WhatsAppSendOptions {
+  if ((options.to == null) === (options.conversationId == null))
+    throw new Error("Pass exactly one of --to or --conversation-id.");
+  if (options.to != null && (typeof options.to !== "string" || !/^\+[1-9][0-9]{6,14}$/.test(options.to)))
+    throw new Error("Provide one E.164 recipient.");
+  if (options.replyToMessageId !== undefined && !options.replyToMessageId) throw new Error("--reply-to-message-id requires a non-empty message ID.");
+  if (options.replyToMessageId !== undefined && !options.conversationId) throw new Error("--reply-to-message-id requires --conversation-id.");
+  if (options.gifPlayback && !options.mediaId) throw new Error("--gif-playback requires --media-id with an MP4 attachment.");
+  if (!options.text?.trim() && !options.mediaId)
+    throw new Error("Pass --text, --media-id, or both.");
+  if (options.voiceNote && (!options.text?.trim() || options.mediaId)) throw new Error("--voice-note requires --text and no --media-id.");
+  if (options.fallbackToText === false && !options.voiceNote) throw new Error("--no-fallback-to-text requires --voice-note.");
+  return {
+    ...(options.to != null ? { to: options.to } : {}),
+    ...(options.conversationId
+      ? { conversationId: options.conversationId }
+      : {}),
+    ...(options.replyToMessageId !== undefined ? { replyToMessageId: options.replyToMessageId } : {}),
+    ...(options.replyToMessageId !== undefined && options.plainReplyFallback === false ? { plainReplyFallback: false } : {}),
+    ...(options.text !== undefined ? { text: options.text } : {}),
+    ...(options.mediaId ? { mediaIds: [options.mediaId] } : {}),
+    ...(options.gifPlayback ? { gifPlayback: true } : {}),
+    ...(options.voiceNote ? { sendAsVoiceNote: true } : {}),
+    ...(options.voiceNote && options.fallbackToText === false ? { fallbackToText: false } : {}),
+    ...(options.idempotencyKey !== undefined
+      ? { idempotencyKey: options.idempotencyKey }
+      : {}),
+  };
+}
+
+/** Validate list selectors before making an API request. */
+export function buildWhatsAppListOptions(options: {
+  startDatetime?: string;
+  endDatetime?: string; tz?: string;
+}) {
+  return {
+    ...(options.startDatetime !== undefined ? { startDatetime: options.startDatetime } : {}),
+    ...(options.endDatetime !== undefined ? { endDatetime: options.endDatetime } : {}),
+    ...(options.tz !== undefined ? { tz: options.tz } : {}),
+  };
+}
+
+const WHATSAPP_MESSAGE_COLUMNS = [
+  "id", "conversationId", "direction", "groupName", "remoteNumber", "senderNumber", "content", "status", "deliveryState",
+];
+
+export function registerWhatsAppCommands(program: Command): void {
+  const whatsapp = program
+    .command("whatsapp")
+    .description("WhatsApp conversations, shared-number connections, quoted replies, and reactions");
+  whatsapp
+    .command("triage-number")
+    .description("Show the WhatsApp router number people message to connect with your agents")
+    .action(withErrorHandler(async function (this: Command) {
+      const global = getGlobalOpts(this);
+      output(await createClient(global).whatsapp.getTriageNumber(), { json: !!global.json });
+    }));
+  whatsapp.command("numbers").description("List already-owned dedicated numbers (admin API key)")
+    .option("--offset <n>", "Pagination offset", "0")
+    .action(withErrorHandler(async function (this: Command, opts) {
+      const global = getGlobalOpts(this);
+      output(await createClient(global).whatsapp.listNumbers({ offset: Number(opts.offset) }), { json: !!global.json });
+    }));
+  whatsapp.command("assign-number <account-id>").description("Attach or detach an already-owned number (admin API key)")
+    .requiredOption("--revision <n>", "Revision returned by numbers")
+    .option("--identity <handle>", "Agent to attach")
+    .option("--detach", "Detach the currently attached agent")
+    .option("--confirmed-imessage-number <number>", "Explicitly confirmed different iMessage number")
+    .action(withErrorHandler(async function (this: Command, id: string, opts) {
+      if (!!opts.identity === !!opts.detach) throw new Error("Pass exactly one of --identity or --detach.");
+      const global = getGlobalOpts(this), client = createClient(global);
+      const identity = opts.identity ? await client.getIdentity(opts.identity) : null;
+      output(await client.whatsapp.assignNumber(id, { agentIdentityId: identity?.id ?? null,
+        expectedRevision: Number(opts.revision), confirmedImessageNumber: opts.confirmedImessageNumber }), { json: !!global.json });
+    }));
+  whatsapp.command("router").description("Read your dedicated router (admin API key)")
+    .action(withErrorHandler(async function (this: Command) {
+      const global = getGlobalOpts(this);
+      output(await createClient(global).whatsapp.getRouter(), { json: !!global.json });
+    }));
+  whatsapp.command("update-router <router-id>").description("Edit the dedicated router you read (admin API key)")
+    .requiredOption("--revision <n>", "Revision returned by router")
+    .option("--name <name>", "Display name; empty string clears it")
+    .option("--accepting <boolean>", "Accept new connections: true or false")
+    .action(withErrorHandler(async function (this: Command, id: string, opts) {
+      if (opts.accepting !== undefined && !["true", "false"].includes(opts.accepting)) throw new Error("--accepting must be true or false.");
+      const global = getGlobalOpts(this);
+      output(await createClient(global).whatsapp.updateRouter({ expectedRouterId: id, expectedRevision: Number(opts.revision),
+        ...(opts.name !== undefined ? { profileDisplayName: opts.name || null } : {}),
+        ...(opts.accepting !== undefined ? { acceptingNewConnections: opts.accepting === "true" } : {}) }), { json: !!global.json });
+    }));
+  whatsapp.command("router-threads").description("List dedicated-router recipient threads (admin API key)")
+    .option("--limit <n>", "Maximum results, 1–100", "50").option("--offset <n>", "Pagination offset", "0")
+    .action(withErrorHandler(async function (this: Command, opts) {
+      const global = getGlobalOpts(this);
+      output(await createClient(global).whatsapp.listRouterThreads({ limit: Number(opts.limit), offset: Number(opts.offset) }), { json: !!global.json });
+    }));
+  whatsapp.command("router-messages <recipient>").description("Read a dedicated-router recipient thread (admin API key)")
+    .option("--limit <n>", "Maximum results, 1–100", "50").option("--offset <n>", "Pagination offset", "0")
+    .action(withErrorHandler(async function (this: Command, remote: string, opts) {
+      const global = getGlobalOpts(this);
+      output(await createClient(global).whatsapp.listRouterMessages(remote, { limit: Number(opts.limit), offset: Number(opts.offset) }), { json: !!global.json });
+    }));
+  const identityCommand = (name: string, description: string) =>
+    whatsapp
+      .command(name)
+      .description(description)
+      .requiredOption("-i, --identity <handle>", "Agent identity handle");
+
+  identityCommand(
+    "send",
+    "Queue a message (acceptance is not delivery confirmation)",
+  )
+    .option("--to <number>", "One E.164 recipient")
+    .option("--reply-to-message-id <id>", "Quote a message in --conversation-id")
+    .option("--no-plain-reply-fallback", "Require a native quoted reply; never resend an uncertain quote as plain")
+    .option("--conversation-id <id>", "Existing direct or inbound group conversation ID")
+    .option("--text <text>", "Message text (at most 4000 characters)")
+    .option("--media-id <id>", "Owned attachment ID from upload-media")
+    .option("--gif-playback", "Play an MP4 media attachment as an animation")
+    .option("--voice-note", "Speak --text (at most 600 characters) in the agent's voice and send it as a native voice note")
+    .option("--no-fallback-to-text", "With --voice-note, fail instead of sending the text when a voice note can't be produced")
+    .option(
+      "--idempotency-key <key>",
+      "Stable key for this logical send; reuse after uncertainty",
+    )
+    .action(
+      withErrorHandler(async function (this: Command, opts) {
+        const options = buildWhatsAppSendOptions(opts);
+        const global = getGlobalOpts(this);
+        const identity = await createClient(global).getIdentity(opts.identity);
+        output(await identity.sendWhatsApp(options), { json: !!global.json });
+      }),
+    );
+
+  for (const [name, description, method] of [
+    ["connect", "Reserve a shared number for a recipient; sends nothing, and the agent replies after they message it", "connect"],
+    ["disconnect", "Release a dedicated or shared recipient connection; history is kept", "disconnect"],
+  ] as const) {
+    identityCommand(name, `${description} (admin API key only)`)
+      .requiredOption("--recipient <number>", "One E.164 recipient")
+      .requiredOption("--idempotency-key <key>", "New UUID for each connect or disconnect; reuse it only to retry that same request")
+      .action(withErrorHandler(async function (this: Command, opts) {
+        if (!/^\+[1-9][0-9]{6,14}$/.test(opts.recipient)) throw new Error("Provide one E.164 recipient.");
+        const global = getGlobalOpts(this), client = createClient(global);
+        const identity = await client.getIdentity(opts.identity);
+        output(await client.whatsapp[method]({ agentIdentityId: identity.id, recipientNumber: opts.recipient,
+          idempotencyKey: opts.idempotencyKey }), { json: !!global.json });
+      }));
+  }
+  identityCommand("assignments", "List dedicated or shared recipient connections for this identity")
+    .option("--limit <n>", "Maximum results, 1–200", "50")
+    .option("--offset <n>", "Pagination offset", "0")
+    .action(withErrorHandler(async function (this: Command, opts) {
+      const global = getGlobalOpts(this), client = createClient(global);
+      const identity = await client.getIdentity(opts.identity);
+      output(await client.whatsapp.listAssignments({ agentIdentityId: identity.id, limit: Number(opts.limit), offset: Number(opts.offset) }), { json: !!global.json,
+        columns: ["id", "remoteNumber", "status", "updatedAt"] });
+    }));
+
+  identityCommand(
+    "status",
+    "Read fresh channel availability without enabling it",
+  ).action(
+    withErrorHandler(async function (this: Command, opts) {
+      const global = getGlobalOpts(this);
+      const status = await createClient(global).identities.getWhatsAppStatus(
+        opts.identity,
+      );
+      output(status, { json: !!global.json });
+    }),
+  );
+
+  identityCommand(
+    "onboarding",
+    "Get the agent's WhatsApp message link and QR code without sending a message",
+  ).action(
+    withErrorHandler(async function (this: Command, opts) {
+      const global = getGlobalOpts(this);
+      const identity = await createClient(global).getIdentity(opts.identity);
+      output(await identity.getWhatsAppOnboarding(), { json: !!global.json });
+    }),
+  );
+
+  identityCommand(
+    "limits",
+    "Read effective server policy limits and independent usage",
+  ).action(
+    withErrorHandler(async function (this: Command, opts) {
+      const global = getGlobalOpts(this);
+      output(
+        await (
+          await createClient(global).getIdentity(opts.identity)
+        ).getWhatsAppLimits(),
+        { json: !!global.json },
+      );
+    }),
+  );
+
+  for (const [name, description, method] of [
+    [
+      "get <message-id>",
+      "Read a message and its current delivery state",
+      "getWhatsAppMessage",
+    ],
+    [
+      "get-conversation <conversation-id>",
+      "Read conversation metadata",
+      "getWhatsAppConversation",
+    ],
+    [
+      "get-reaction <reaction-id>",
+      "Read the current versioned reaction receipt",
+      "getWhatsAppReaction",
+    ],
+    [
+      "get-media <media-id>",
+      "Get fresh temporary attachment access",
+      "getWhatsAppMedia",
+    ],
+  ] as const) {
+    identityCommand(name, description).action(
+      withErrorHandler(async function (this: Command, id: string, opts) {
+        const global = getGlobalOpts(this);
+        const identity = await createClient(global).getIdentity(opts.identity);
+        output(await identity[method](id), { json: !!global.json });
+      }),
+    );
+  }
+
+  identityCommand("list", "List messages, newest first")
+    .option("--conversation-id <id>", "Filter by conversation")
+    .option("--thread-id <id>", "Filter a conversation by quote-chain thread")
+    .option("--start-datetime <date>", "Inclusive creation date or instant")
+    .option("--end-datetime <date>", "Inclusive creation date or instant; bare dates include the whole day")
+    .option("--tz <zone>", "IANA timezone for zone-less dates (default UTC)")
+    .option("--limit <n>", "Maximum results", "50")
+    .option("--offset <n>", "Pagination offset", "0")
+    .option("--unread", "Only locally unread messages")
+    .option("--unread-only", "Only locally unread messages")
+    .action(
+      withErrorHandler(async function (this: Command, opts) {
+        const listOptions = buildWhatsAppListOptions(opts);
+        const global = getGlobalOpts(this);
+        const identity = await createClient(global).getIdentity(opts.identity);
+        output(
+          await identity.listWhatsAppMessages({
+            conversationId: opts.conversationId,
+            threadId: opts.threadId,
+            ...listOptions,
+            limit: Number(opts.limit),
+            offset: Number(opts.offset),
+            ...(opts.unread || opts.unreadOnly ? { isRead: false } : {}),
+          }),
+          {
+            json: !!global.json,
+            columns: WHATSAPP_MESSAGE_COLUMNS,
+          },
+        );
+      }),
+    );
+
+  identityCommand("conversation <conversation-id>", "Read messages in a conversation, newest first")
+    .option("--thread-id <id>", "Filter by reply thread")
+    .option("--limit <n>", "Maximum results", "50")
+    .option("--offset <n>", "Pagination offset", "0")
+    .action(withErrorHandler(async function (this: Command, conversationId: string, opts) {
+      const global = getGlobalOpts(this), identity = await createClient(global).getIdentity(opts.identity);
+      output(await identity.listWhatsAppMessages({ conversationId, threadId: opts.threadId,
+        limit: Number(opts.limit), offset: Number(opts.offset) }), { json: !!global.json, columns: WHATSAPP_MESSAGE_COLUMNS });
+    }));
+
+  identityCommand("react <message-id>", "Submit a reaction; acceptance is not an applied reaction")
+    .option("--reaction <name>", "love, like, dislike, laugh, emphasize, question, or eyes")
+    .option("--custom-emoji <emoji>", "Exact custom emoji; exclusive with --reaction")
+    .requiredOption("--idempotency-key <key>", "Stable key; reuse it after uncertainty")
+    .action(withErrorHandler(async function (this: Command, messageId: string, opts) {
+      const global = getGlobalOpts(this), identity = await createClient(global).getIdentity(opts.identity);
+      output(await identity.sendWhatsAppReaction({ messageId, reaction: opts.reaction as WhatsAppReactionType | undefined, customEmoji: opts.customEmoji, idempotencyKey: opts.idempotencyKey }), { json: !!global.json });
+    }));
+  identityCommand("remove-reaction <reaction-id>", "Remove this version of your reaction, without affecting a newer one")
+    .alias("unreact")
+    .requiredOption("--idempotency-key <key>", "Stable removal key; reuse it after uncertainty")
+    .action(withErrorHandler(async function (this: Command, reactionId: string, opts) {
+      const global = getGlobalOpts(this), identity = await createClient(global).getIdentity(opts.identity);
+      output(await identity.removeWhatsAppReaction(reactionId, opts.idempotencyKey), { json: !!global.json });
+    }));
+  identityCommand("thread <message-id>", "Read chronological visible replies to a quote-chain root")
+    .option("--limit <n>", "Maximum results, 1–200", "50").option("--cursor <cursor>", "Opaque cursor from this thread")
+    .action(withErrorHandler(async function (this: Command, messageId: string, opts) {
+      const global = getGlobalOpts(this), identity = await createClient(global).getIdentity(opts.identity);
+      output(await identity.getWhatsAppThread(messageId, { limit: Number(opts.limit), cursor: opts.cursor }), { json: !!global.json });
+    }));
+  identityCommand("conversation-thread <conversation-id> <thread-id>", "Read a quote chain by conversation and thread ID")
+    .option("--limit <n>", "Maximum results, 1–200", "50").option("--cursor <cursor>", "Opaque cursor from this thread")
+    .action(withErrorHandler(async function (this: Command, conversationId: string, threadId: string, opts) {
+      const global = getGlobalOpts(this), identity = await createClient(global).getIdentity(opts.identity);
+      output(await identity.getWhatsAppConversationThread(conversationId, threadId, { limit: Number(opts.limit), cursor: opts.cursor }), { json: !!global.json });
+    }));
+
+  identityCommand(
+    "conversations",
+    "List conversations with local unread counts",
+  )
+    .option("--start-datetime <date>", "Inclusive creation date or instant")
+    .option("--end-datetime <date>", "Inclusive creation date or instant; bare dates include the whole day")
+    .option("--tz <zone>", "IANA timezone for zone-less dates (default UTC)")
+    .option("--limit <n>", "Maximum results", "50")
+    .option("--offset <n>", "Pagination offset", "0")
+    .option("--participants <addresses...>", "Match any email address or E.164 phone number")
+    .option("--contact-id <id>", "Match a saved contact; mutually exclusive with --participants")
+    .action(
+      withErrorHandler(async function (this: Command, opts) {
+        const listOptions = buildWhatsAppListOptions(opts);
+        const global = getGlobalOpts(this);
+        const identity = await createClient(global).getIdentity(opts.identity);
+        output(
+          await identity.listWhatsAppConversations({
+            ...listOptions,
+            participants: opts.participants,
+            contactId: opts.contactId,
+            limit: Number(opts.limit),
+            offset: Number(opts.offset),
+          }),
+          {
+            json: !!global.json,
+            columns: [
+              "id",
+              "groupName",
+              "remoteNumber",
+              "participants",
+              "latestText",
+              "unreadCount",
+              "latestMessageAt",
+            ],
+          },
+        );
+      }),
+    );
+
+  identityCommand(
+    "upload-media <file>",
+    "Upload one attachment (at most 20 MiB); reuse its ID when sending",
+  )
+    .option(
+      "--content-type <type>",
+      "Attachment MIME type",
+      "application/octet-stream",
+    )
+    .option("--recipient <number>", "E.164 recipient; required when replying through a shared number")
+    .action(
+      withErrorHandler(async function (this: Command, file: string, opts) {
+        if (opts.recipient !== undefined && !/^\+[1-9][0-9]{6,14}$/.test(opts.recipient))
+          throw new Error("Provide one E.164 recipient.");
+        if ((await stat(file)).size > 20 * 1024 * 1024)
+          throw new Error("WhatsApp media must be at most 20 MiB.");
+        const global = getGlobalOpts(this);
+        const identity = await createClient(global).getIdentity(opts.identity);
+        output(
+          await identity.uploadWhatsAppMedia({
+            content: await readFile(file),
+            filename: basename(file),
+            contentType: opts.contentType,
+            ...(opts.recipient !== undefined ? { recipientNumber: opts.recipient } : {}),
+          }),
+          { json: !!global.json },
+        );
+      }),
+    );
+
+  whatsapp.command("delete-assignment <assignment-id>")
+    .description("Release a shared-number assignment; keeps history (admin API key only)")
+    .action(withErrorHandler(async function (this: Command, assignmentId: string) {
+      const global = getGlobalOpts(this);
+      await createClient(global).whatsapp.deleteAssignment(assignmentId);
+      output({ released: true }, { json: !!global.json });
+    }));
+
+  identityCommand("typing <conversation-id>", "Send a typing indicator in an existing direct conversation")
+    .action(withErrorHandler(async function (this: Command, conversationId: string, opts) {
+      const global = getGlobalOpts(this), identity = await createClient(global).getIdentity(opts.identity);
+      output(await identity.sendWhatsAppTyping(conversationId), { json: !!global.json });
+    }));
+
+  identityCommand(
+    "mark-read",
+    "Mark history read and send supported read receipts",
+  )
+    .requiredOption("--conversation-id <id>", "Conversation ID")
+    .option("--through-message-id <id>", "Last visible message ID; omit for all unread messages")
+    .action(
+      withErrorHandler(async function (this: Command, opts) {
+        const global = getGlobalOpts(this);
+        const identity = await createClient(global).getIdentity(opts.identity);
+        output(
+          await identity.markWhatsAppRead(
+            opts.conversationId,
+            opts.throughMessageId,
+          ),
+          { json: !!global.json },
+        );
+      }),
+    );
+}

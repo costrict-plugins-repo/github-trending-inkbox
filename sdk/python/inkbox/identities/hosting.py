@@ -1,0 +1,107 @@
+"""Hosted-agent settings for an Inkbox identity."""
+from dataclasses import dataclass, field
+from typing import Any, Literal, TypedDict, NotRequired
+
+
+HostingHarness = Literal['codex', 'hermes', 'claude_code', 'opencode', 'deepseek', 'openclaw']
+HostingModel = Literal[
+    'gpt-6-luna', 'gpt-6.1-terra', 'gpt-6.1-sol', 'gpt-6-astra',
+    'claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-fable-5-2',
+    'deepseek-flash', 'deepseek-v4-pro',
+]
+
+
+class HostingPortSetting(TypedDict):
+    port: int
+    public: bool
+
+
+class HostingPort(HostingPortSetting):
+    url: str | None
+    token_url: str | None  # url with a ?_token= access token; keep private
+
+
+class HostingPortsUpdate(TypedDict):
+    """Omitted fields are unchanged. Pass the ``version`` you read; a stale one gets 409 ``stale_version``."""
+
+    version: int
+    default_port: NotRequired[int | None]
+    ports: NotRequired[list[HostingPortSetting]]
+
+
+@dataclass
+class HostingPorts:
+    url: str | None = None
+    default_port: int | None = None
+    ports: list[HostingPort] = field(default_factory=list)
+    version: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> 'HostingPorts':
+        return cls(**{key: value for key, value in data.items() if key in cls.__dataclass_fields__})
+
+
+class HostingUpdate(TypedDict):
+    """Partial command: omit to preserve; enabled defaults to activate/retry.
+
+    Only credential_binding_id accepts None (included credits). Empty events
+    disable triggers; follow_defaults/reset_instructions reset their settings.
+    enabled=False removes hosting.
+    """
+
+    expected_generation: int
+    enabled: NotRequired[bool]
+    harness: NotRequired[HostingHarness]
+    default_model: NotRequired[HostingModel]
+    tier: NotRequired[Literal['medium']]
+    shape_id: NotRequired[str]
+    instructions: NotRequired[str]
+    trigger_events: NotRequired[list[str]]
+    follow_defaults: NotRequired[bool]
+    credential_binding_id: NotRequired[str | None]
+    idle_timeout_seconds: NotRequired[Literal[60, 300]]
+    idle_stop_enabled: NotRequired[Literal[True]]
+    reset_instructions: NotRequired[bool]
+
+
+@dataclass
+class HostingConfiguration:
+    mode: str
+    identity_id: str
+    state: str = 'disabled'
+    generation: int = 0
+    applied_generation: int = 0
+    machine_id: str | None = None
+    harness: str | None = None
+    default_model: str = 'gpt-6.1-terra'
+    tier: str | None = None
+    shape_id: str | None = None
+    instructions: str = ''
+    trigger_events: list[str] = field(default_factory=list)
+    follow_defaults: bool = True
+    credential_binding_id: str | None = None
+    idle_timeout_seconds: int = 60
+    idle_stop_enabled: bool = True
+    last_error: str | None = None
+    updated_at: str | None = None
+    url: str | None = None
+    delivery: Literal['internal', 'tunnel'] = 'tunnel'
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> 'HostingConfiguration':
+        return cls(**{key: value for key, value in data.items() if key in cls.__dataclass_fields__})
+
+
+@dataclass
+class HostingDelivery:
+    id: str
+    event: str
+    state: str
+    attempts: int
+    received_at: str
+    last_error: str | None
+    retryable: bool
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> 'HostingDelivery':
+        return cls(**{key: value for key, value in data.items() if key in cls.__dataclass_fields__})

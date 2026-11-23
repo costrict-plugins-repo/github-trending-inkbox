@@ -1,0 +1,1117 @@
+# Inkbox
+
+https://inkbox.ai
+
+[![PyPI](https://img.shields.io/pypi/v/inkbox)](https://pypi.org/project/inkbox/)
+[![npm](https://img.shields.io/npm/v/@inkbox/sdk)](https://www.npmjs.com/package/@inkbox/sdk)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+API-first communication infrastructure for AI agents — email (with custom sending domains), phone, identities, encrypted vault (login credentials, API keys, key pairs, SSH keys, OTP, etc.), and tunnels (expose a local server at a public URL via outbound HTTP/2).
+
+| Package | Language | Install |
+|---|---|---|
+| [`inkbox`](./sdk/python/) | Python ≥ 3.11 | `pip install inkbox` |
+| [`@inkbox/sdk`](./sdk/typescript/) | TypeScript / Node ≥ 22 | `npm install @inkbox/sdk` |
+| [`@inkbox/cli`](./cli/) | CLI / Node ≥ 22 | `npm install -g @inkbox/cli` |
+| [`@inkbox/chat-sdk-adapter`](./adapters/chat-sdk/) | Chat SDK / Node ≥ 22 | `npm install @inkbox/chat-sdk-adapter chat` |
+
+## Chat SDK and Eve
+
+Connect email, SMS/MMS, iMessage, Slack, A2A, and completed-call transcripts to
+Chat SDK through [`@inkbox/chat-sdk-adapter`](./adapters/chat-sdk/). Receive
+messages through one webhook handler and reply in the originating conversation.
+The [Eve example](./examples/eve-agent/) connects that adapter to durable agent
+sessions; the [standalone example](./examples/chat-sdk/) works with a Fetch API
+web framework. Voice supplies post-call context, not a realtime audio bridge.
+WhatsApp is not included in the adapter.
+
+## Companion mode
+
+Companion mode is off by default and separate from whitelist/blacklist settings.
+An eligible sender can introduce the agent to a group by sending a qualifying
+message there. Eligibility requires active exact email, number, or Slack-account allow rules for
+both inbound and outbound communication, either one Both rule or two applicable
+one-way allows. It is per normalized identifier and channel, not per saved contact;
+phone and iMessage share one policy. Domain allowances, default access, contact
+visibility, and access through another Companion conversation do not qualify.
+
+Multiple senders may qualify. The first qualifying message activates the group;
+listing an eligible participant is insufficient, and additional eligible senders
+do not repeat initialization. Continued access depends on the actual trigger
+sender's permissions and membership, without transferring to another participant.
+Blocks and existing sending requirements still apply. The SDKs load complete
+authorized history into one bounded initialization transcript before live turns.
+
+An administrator can set `enabled=true` before any eligible sender or channel
+resource exists. This saves the preference; per-channel readiness reports unmet
+prerequisites, including `bidirectional_allow_required`, independently of the
+enabled setting. Configuration contains enabled state, revision, readiness, and
+optional notices. See the [Companion mode guide](https://inkbox.ai/docs/capabilities/companion-mode).
+
+- [Python: `client.companion.load_initialization`](./sdk/python/README.md#companion-mode)
+- [TypeScript: `client.companion.loadInitialization`](./sdk/typescript/README.md#companion-mode)
+- [Rust: `client.companion().load_initialization`](./sdk/rust/README.md#companion-mode)
+- [CLI: `inkbox identity companion`](./cli/README.md#companion-mode)
+
+## Cursor plugin
+
+Inkbox is available in the
+[Cursor Marketplace](https://cursor.com/marketplace/inkbox). The plugin is an
+MCP-only package that connects to `https://inkbox.ai/mcp/cursor` and gives
+Cursor an Inkbox identity for email, SMS, iMessage, WhatsApp, Slack, voice
+calls, contacts, notes, and agent-to-agent tasks.
+
+Install **Inkbox** from Cursor's **Customize** view, enable the Inkbox MCP
+server, and select **Connect** to authorize an organization and identity in the
+browser. No API key, client secret, local process, or bundled Cursor skills are
+required.
+
+---
+
+## Quick Start
+
+Get an API key from the [Inkbox Console](https://inkbox.ai/console), then:
+
+### Python
+
+```python
+from inkbox import Inkbox
+
+with Inkbox(api_key="ApiKey_...") as inkbox:
+    # Create an agent identity with a linked mailbox
+    identity = inkbox.create_identity("my-agent", display_name="My Agent")
+    identity.provision_phone_number()  # provisions a local number
+
+    # Send an email
+    identity.send_email(
+        to=["user@example.com"],
+        subject="Hello",
+        body_text="Hi from my agent!",
+    )
+
+    # List recent emails
+    for msg in identity.iter_emails():
+        print(msg.subject, msg.from_address)
+
+    # Place a phone call
+    call = identity.place_call(to_number="+15551234567")
+
+    # Send a text message (SMS/MMS); pass a list for group MMS.
+    identity.send_text(to="+15551234567", text="Hi from my agent!")
+
+    # Read text messages
+    for t in identity.list_texts():
+        print(t.remote_phone_number, t.text)
+
+    # Reply over iMessage (identity must be iMessage-enabled and the
+    # recipient connected to it via the shared triage line first)
+    identity.send_imessage(to="+15551234567", text="Hi over iMessage!")
+```
+
+### TypeScript
+
+```typescript
+import { Inkbox } from "@inkbox/sdk";
+
+const inkbox = new Inkbox({ apiKey: "ApiKey_..." });
+
+// Create an agent identity with a linked mailbox
+const identity = await inkbox.createIdentity("my-agent", { displayName: "My Agent" });
+const phone = await identity.provisionPhoneNumber(); // provisions a local number
+
+// Send an email
+await identity.sendEmail({
+  to: ["user@example.com"],
+  subject: "Hello",
+  bodyText: "Hi from my agent!",
+});
+
+// List recent emails
+for await (const msg of identity.iterEmails()) {
+  console.log(msg.subject, msg.fromAddress);
+}
+
+// Place a phone call
+const call = await identity.placeCall({ toNumber: "+15551234567" });
+
+// Send a text message (SMS/MMS); pass an array for group MMS.
+await identity.sendText({ to: "+15551234567", text: "Hi from my agent!" });
+
+// Read text messages
+const texts = await identity.listTexts();
+for (const t of texts) {
+  console.log(t.remotePhoneNumber, t.text);
+}
+
+// Reply over iMessage (identity must be iMessage-enabled and the
+// recipient connected to it via the shared triage line first)
+await identity.sendIMessage({ to: "+15551234567", text: "Hi over iMessage!" });
+```
+
+### CLI
+
+```bash
+# Create an agent identity (mailbox is created automatically)
+inkbox identity create my-agent
+
+# Send an email
+inkbox email send -i my-agent \
+  --to user@example.com \
+  --subject "Hello" \
+  --body-text "Hi from my agent!"
+
+# List recent emails
+inkbox email list -i my-agent --limit 10
+
+# Save an incomplete draft, then list it with its current generation
+inkbox email drafts create -i my-agent --subject "Work in progress" \
+  --idempotency-key draft-create-2026-08-19-1
+inkbox email drafts list -i my-agent
+
+# Place a phone call
+inkbox phone call -i my-agent --to +15551234567
+
+# Or call over an existing shared iMessage connection (no dedicated number)
+inkbox phone call -i my-agent --to +15551234567 \
+  --origination shared_imessage_number
+
+# Override one Voice AI call to use broader authority. This requires an admin
+# API key unless the identity's saved authority is already yolo.
+inkbox phone call -i my-agent --to +15551234567 \
+  --hosted --reason "Coordinate the appointment and send confirmations." \
+  --authority-mode yolo
+
+# Send a text message (SMS/MMS; comma-separate --to for groups)
+inkbox text send -i my-agent --to +15551234567 --text "Hi from my agent!"
+
+# Reply over iMessage (identity must be iMessage-enabled and the
+# recipient connected to it via the shared triage line first)
+inkbox imessage send -i my-agent --to +15551234567 --text "Hi over iMessage!"
+
+# Read text messages
+inkbox text list -i my-agent
+
+# Initialize vault (first time only — requires INKBOX_VAULT_KEY)
+inkbox vault init --vault-key "my-vault-key"
+
+# Manage vault secrets
+inkbox vault create --name "CRM Login" --type login --username bot@crm.com --password s3cret
+inkbox vault secrets
+inkbox vault get <secret-id>
+```
+
+### Voice AI voice discovery
+
+Discover the voice catalog for your organization, including the default voice,
+availability, and optional preview URLs. No identity ID is needed:
+
+| Client | Catalog |
+|---|---|
+| Python | `inkbox.hosted_agent.list_voices()` |
+| TypeScript | `await inkbox.hostedAgent.listVoices()` |
+| Rust | `client.hosted_agent().list_voices()?` |
+| CLI | `inkbox phone hosted-agent voices --json` |
+
+The response contains `voices` and `default_voice` (`defaultVoice` in
+TypeScript and CLI JSON). Each voice has `id`, `name`, `description`,
+`available`, and optional `preview_url` (`previewUrl`). Unavailable voices
+remain in the catalog; choose an entry with `available: true` and pass its
+string ID to the existing hosted-agent config setter. Setters replace the
+voice and instructions, so preserve the saved instructions when changing only
+the voice. Discovery requires an API that supports the catalog endpoint;
+existing string-based voice selection does not require this new method.
+
+### A2A discovery and history
+
+Each identity can inspect work it received, work it requested, or both without
+duplicating task records. Task lists are newest-first and cursor-paginated.
+Keyword search matches string and numeric content values from `text` and
+`data` parts; message metadata is not searched, and results remain
+newest-first. A message's `role` is its author (`caller` or `agent`),
+independent of task direction.
+
+Enabled same-organization identities can call each other without contact rules.
+Public agents accept enabled callers that allow public egress. Private
+cross-organization calls require the requester to allow the worker outbound and
+the worker to allow the requester inbound; explicit blocks always win.
+
+Search enabled agents in your organization or agents that opted into the public
+directory. Results include typed Agent Cards and opaque cursor pagination:
+
+```python
+public_agents = inkbox.a2a.public_directory(q="research", limit=25)
+organization_agents = inkbox.a2a.organization_directory(q="support")
+```
+
+An A2A context is a shared collaboration between its original two
+participants. Either participant can start another task in that context, and
+tasks in both directions may run concurrently. The context's top-level caller
+and target remain the original opener and recipient; each task's caller and
+target identify that task's direction. New contexts start as `New A2A Session`;
+that exact default may be replaced with a short name based on the first task
+message. Either participant can rename the persisted value at any time.
+
+```python
+identity = inkbox.get_identity("coordinator")
+
+page = identity.a2a_tasks(
+    direction="both",
+    worker_handle="researcher",
+    q="quarterly summary",
+)
+for task in page.items:
+    print(task.id, task.state)
+
+for message in identity.iter_a2a_messages(
+    direction="outbound",
+    worker_handle="researcher",
+    q="revenue",
+):
+    print(message.task_id, message.task_state, message.role, message.parts)
+
+for context in identity.a2a_contexts(direction="both").items:
+    print(context.name, context.id)
+
+identity.a2a_update_context(
+    "context-uuid",
+    name="Quarterly Research Review",
+)
+```
+
+```bash
+inkbox a2a directory --public --query research --limit 25
+inkbox a2a directory --query support
+inkbox a2a tasks -i coordinator --direction both --worker researcher
+inkbox a2a messages -i coordinator --direction outbound \
+  --worker researcher --query revenue --json
+```
+
+Task detail includes current state and message history.
+
+### Tunnels (Python)
+
+```python
+# Bring a local server online at https://my-app.inkboxwire.com.
+# Outbound HTTP/2 only — no inbound port to open. Linux, macOS, and Windows.
+listener = inkbox.tunnels.connect(name="my-app", forward_to="http://127.0.0.1:8080")
+print(listener.public_url)
+print(listener.status, listener.is_connected, listener.last_connected_at)
+listener.wait()
+```
+
+### Mailbox Imports
+
+Import MBOX and EML files, or a ZIP holding either (a Gmail Takeout ZIP imports
+as-is), through `mailboxes.imports`. Create a job, upload directly with the
+returned target, start it, then wait for any terminal state (`completed`,
+`failed`, or `cancelled`). Entries in a ZIP that are not mail, including nested
+archives, are ignored. Imported content that is unsafe may be rejected and
+counted separately.
+
+```bash
+inkbox mailbox imports run agent@inkboxmail.com ./archive.mbox \
+  --original-address old-address@example.com
+```
+
+Use `--no-wait` to return after queueing, or `inkbox mailbox imports wait
+<email> <job-id>` to resume watching later. Processing counters are cumulative
+and never go backwards, but they can sit unchanged while a large message is
+processed, and they do not yield a percentage. Jobs run one at a time per
+organization and share overall import capacity, so a long `queued` stretch is
+normal rather than a stall.
+
+Limits: 1 GiB per upload, 50 MiB per message, 100,000 messages and 20
+`original_addresses` per job, 65,000 entries per ZIP, and 20 import jobs per
+organization per 24 hours. Upload targets expire after 5 minutes and can be
+re-issued; a job whose upload never arrives is cancelled after 24 hours.
+
+### Email Drafts
+
+Python, TypeScript, Rust, and the CLI support creating, listing, reading,
+updating, duplicating, deleting, and sending saved drafts. Drafts may be
+incomplete. Each draft response includes a `generation`; pass that exact value
+to the next mutation so edits from another client are not overwritten.
+
+Drafts share the mailbox's standard Drafts folder, so changes made through the
+SDK or CLI are visible in connected mail clients and vice versa. Attachment
+`part_index` / `partIndex` values belong to the generation that returned them;
+refresh the draft before using an index after any edit.
+
+A successful send returns the sent message and removes the draft. Retrying send
+with the same draft ID and exact generation may return that same sent message.
+HTTP 409 responses carry a structured `error`: refresh before retrying
+`draft_generation_conflict`, retry the same generation for
+`draft_send_in_progress`. Do not resend `draft_delivery_uncertain`; after
+checking sent mail, duplicate or delete that draft instead.
+
+### Tunnels (TypeScript)
+
+```typescript
+import { connect } from "@inkbox/sdk/tunnels/connect";
+
+const listener = await connect(inkbox, {
+  name: "my-app",
+  forwardTo: "http://127.0.0.1:8080",
+});
+console.log(listener.publicUrl);
+console.log(listener.status, listener.isConnected, listener.lastConnectedAt);
+await listener.wait();
+```
+
+### Tunnels (Rust)
+
+The blocking Rust runtime is behind the `tunnels-runtime` feature. Run it on a
+caller-owned thread and retain a cloneable local status handle:
+
+```rust
+use inkbox::tunnels::client::TunnelStatusHandle;
+
+let status = TunnelStatusHandle::new();
+let runtime_status = status.clone();
+let client = inkbox.clone();
+let tunnel_thread = std::thread::spawn(move || {
+    client.tunnels().connect_with_status(
+        "my-app",
+        "http://127.0.0.1:8080",
+        runtime_status.callback(),
+    )
+});
+println!("{:?} {}", status.status(), status.is_connected());
+
+// Join when shutdown is expected so startup/runtime errors are surfaced.
+if let Err(error) = tunnel_thread.join().expect("tunnel thread panicked") {
+    eprintln!("tunnel stopped: {error}");
+}
+```
+
+Python and TypeScript also accept an in-process callable (Fetch handler in TS,
+ASGI app in Python) instead of a `forward_to` URL. All three runtimes reconnect
+after transient connection failures. See [`skills/inkbox-tunnels/`](./skills/inkbox-tunnels/)
+for the full reference.
+
+**Redeploys are graceful.** When the tunnel service redeploys, a long-running listener reconnects make-before-break: it stands up a fresh connection before closing the draining one, so short HTTP requests see no gap. In-progress WebSocket and passthrough-TCP sessions cannot migrate across a redeploy — they end with a typed `server_draining` close and the third-party peer reconnects onto the new task. Write handlers to reconnect idempotently.
+
+### Outbound SMS — current limits
+
+- Outbound SMS works only from **local** numbers (not toll-free).
+- **100 recipient sends per phone number per rolling 24h.** A 3-recipient group message counts as 3 recipient sends. A single accepted send may push usage past the cap; the next capped send fails with `429 sender_rate_limited`.
+- A new local number waits **~10-15 minutes** for the 10DLC campaign to propagate at the carrier; until then `phone_number.sms_status` (Python) / `phoneNumber.smsStatus` (TS) is `"pending"` and sends fail with `409 sender_sms_pending`.
+- Recipients must text **`START`** to any number in your organization to opt in. Unknown recipients fail with `403 recipient_not_opted_in`; opt-outs (`STOP`) return `403 recipient_opted_out`.
+- **Beta:** Group MMS and conversation sends are beta. Some carriers may reject group chats or MMS from 10DLC numbers even when the sender is ready and recipients have opted in.
+
+Customer-managed 10DLC brands and campaigns lift the default per-number cap to the carrier-assigned tier. Toll-free SMS sending is still coming soon.
+
+---
+
+## Agent Signup
+
+Agents can self-register without a pre-existing API key. The flow provisions a mailbox, identity, and API key in one call:
+
+### Python
+
+```python
+import os
+from inkbox import Inkbox
+
+# 1. Sign up (no API key needed)
+result = Inkbox.signup(
+    human_email="john@example.com",
+    note_to_human="Hey John, this is your agent signing up!",
+    display_name="My Agent",          # optional
+    agent_handle="my-agent",          # optional
+    email_local_part="my.agent",      # optional
+    invitation_token=os.getenv("INKBOX_A2A_INVITATION"),  # optional link or raw token
+)
+api_key = result.api_key  # save this — shown only once
+print(result.message)     # authoritative delivery/acceptance outcome
+
+# 2. Verify only when signup did not already accept and claim the invitation
+already_claimed = (
+    result.invitation is not None and result.invitation.status == "accepted"
+) or result.claim_status == "agent_claimed"
+if not already_claimed:
+    Inkbox.verify_signup(api_key, verification_code="483921")
+
+# 3. Use the API key
+with Inkbox(api_key=api_key) as inkbox:
+    identity = inkbox.get_identity(result.agent_handle)
+    identity.send_email(to=["john@example.com"], subject="Hello!", body_text="I'm set up.")
+```
+
+### TypeScript
+
+```typescript
+import { Inkbox } from "@inkbox/sdk";
+
+// 1. Sign up (no API key needed)
+const result = await Inkbox.signup({
+  humanEmail: "john@example.com",
+  noteToHuman: "Hey John, this is your agent signing up!",
+  displayName: "My Agent",      // optional
+  agentHandle: "my-agent",      // optional
+  emailLocalPart: "my.agent",   // optional
+  invitationToken: process.env.INKBOX_A2A_INVITATION, // optional link or raw token
+});
+const apiKey = result.apiKey; // save this — shown only once
+console.log(result.message);  // authoritative delivery/acceptance outcome
+
+// 2. Verify only when signup did not already accept and claim the invitation
+const alreadyClaimed = result.invitation?.status === "accepted"
+  || result.claimStatus === "agent_claimed";
+if (!alreadyClaimed) {
+  await Inkbox.verifySignup(apiKey, { verificationCode: "483921" });
+}
+
+// 3. Use the API key
+const inkbox = new Inkbox({ apiKey });
+const identity = await inkbox.getIdentity(result.agentHandle);
+await identity.sendEmail({ to: ["john@example.com"], subject: "Hello!", bodyText: "I'm set up." });
+```
+
+### CLI
+
+```bash
+# 1. Sign up (no --api-key needed)
+inkbox signup create --human-email john@example.com \
+  --note-to-human "Hey John, this is your agent signing up!" \
+  --display-name "My Agent" \
+  --agent-handle my-agent \
+  --email-local-part my.agent
+# When invited, use --invitation-prompt, --invitation-stdin, or
+# INKBOX_A2A_INVITATION (the legacy token-named environment variable remains supported).
+
+# 2. Verify only if signup did not report an accepted/claimed invitation
+inkbox signup verify --code 483921
+
+# 3. Check status
+inkbox signup status
+```
+
+Use an admin-scoped API key to create and manage invitations through
+`inkbox.a2a_invitations` (Python), `inkbox.a2aInvitations` (TypeScript), or
+`inkbox a2a invites`. Acceptance is agent-only and automatically makes the
+bilateral A2A contact rules needed for the invited peer bundle.
+
+---
+
+## What's in this repo
+
+| Directory | Description |
+|---|---|
+| [`sdk/python/`](./sdk/python/) | Python SDK (`inkbox`) |
+| [`sdk/typescript/`](./sdk/typescript/) | TypeScript SDK (`@inkbox/sdk`) |
+| [`cli/`](./cli/) | CLI (`@inkbox/cli`) |
+| [`skills/inkbox-python/`](./skills/inkbox-python/) | Python agent skill for Claude Code and other coding agents |
+| [`skills/inkbox-ts/`](./skills/inkbox-ts/) | TypeScript agent skill for Claude Code and other coding agents |
+| [`skills/inkbox-onboarding/`](./skills/inkbox-onboarding/) | Language-agnostic identity and channel onboarding skill |
+| [`skills/inkbox-tunnels/`](./skills/inkbox-tunnels/) | Tunnels skill — bring a local server online at a public Inkbox URL |
+| [`examples/use-inkbox-browser-use/`](./examples/use-inkbox-browser-use/) | Inkbox + Browser Use — give your agent an email, phone, and vault |
+| [`examples/use-inkbox-kernel/`](./examples/use-inkbox-kernel/) | Inkbox + Kernel — give your agent an email and browser |
+| [`examples/use-inkbox-cli/`](./examples/use-inkbox-cli/) | Shell script examples for CLI automation and CI pipelines |
+| [`examples/use-inkbox-vault/`](./examples/use-inkbox-vault/) | Vault TOTP example — create credentials with one-time codes |
+| [`examples/use-inkbox-signup/`](./examples/use-inkbox-signup/) | Agent self-signup — register without an API key, verify, send welcome email |
+| [`examples/use-inkbox-webhook/`](./examples/use-inkbox-webhook/) | Inbound email webhook — tunnel + signature verification + auto-reply |
+
+---
+
+## Agent Skills
+
+Load the Inkbox skills into your coding agent so it automatically knows how to use the SDK.
+
+### Claude Code (plugin)
+
+```
+/plugin marketplace add inkbox-ai/inkbox   # <github-owner>/<repo>
+/plugin install inkbox@inkbox              # <plugin-name>@<marketplace-name>
+/reload-plugins
+```
+
+The plugin loads the Inkbox skills and connects the remote MCP server. Sign in when prompted to authorize an identity.
+
+The plugin's version tracks the SDK and CLI release it documents, so `/plugin update` pulls the skills that match the version you're running.
+
+### Codex (plugin)
+
+```bash
+codex plugin marketplace add inkbox-ai/inkbox
+```
+
+Then install `inkbox` from the Codex plugin UI. See the [Codex plugin docs](https://developers.openai.com/codex/plugins/build) for current installation options.
+
+### Any Agent (individual skills)
+
+```bash
+npx skills add inkbox-ai/inkbox/skills
+```
+
+See [`skills/README.md`](./skills/README.md) for details.
+
+---
+
+## Documentation
+
+- [Inkbox Docs](https://inkbox.ai/docs)
+- [API Reference](https://inkbox.ai/docs/api-reference)
+- [Console](https://inkbox.ai/console)
+
+## Releasing
+
+Maintainers: see [RELEASING.md](./RELEASING.md) for the lockstep version-bump and per-registry publish steps (PyPI, npm, crates.io).
+
+## Custom email signatures
+
+Custom signatures are saved per mailbox and require an eligible paid plan to set or enable.
+Each HTML/text field supports up to 16,384 characters. HTML is sanitized; logos
+must use absolute HTTPS URLs. Updating HTML without text generates a plain-text
+fallback. Omitted fields stay unchanged; null clears saved content. If saved text
+is null, sending derives it from HTML when possible. Disable without deleting to
+pause automatic insertion. Disabling and clearing remain available on every plan.
+Signatures are inserted when mail is sent, including replies, forwards, and sent
+drafts; do not append them manually. The Inkbox watermark is controlled separately.
+Signed/encrypted SMTP mail cannot have a custom signature inserted; disable
+automatic insertion before sending those messages.
+A `.sig` file is not a standardized attachment format: read its UTF-8 text or HTML
+content into the corresponding field; images and proprietary formats are not imported.
+
+```python
+from pathlib import Path
+
+inkbox.mailboxes.update(
+    "alex@example.com",
+    signature_html=Path("signature.html").read_text(encoding="utf-8"),
+    signature_enabled=True,
+)
+# Pause without deleting; use None for both content fields to clear them.
+inkbox.mailboxes.update("alex@example.com", signature_enabled=False)
+```
+```typescript
+await inkbox.mailboxes.update("alex@example.com", {
+  signatureHtml: '<b>Alex</b><br><a href="https://example.com">Website</a>',
+  signatureEnabled: true,
+});
+// Pause without deleting; use null for both content fields to clear them.
+await inkbox.mailboxes.update("alex@example.com", { signatureEnabled: false });
+```
+
+## Webhook subscriptions
+
+Mixed subscriptions and explicit identity-wide lists require SDK/CLI **0.7.8 or
+later** and `supports_identity_subscriptions: true` from `GET /webhooks/catalog`.
+Until available, keep separate channel subscriptions using mailbox, phone, and
+identity selectors without explicit scope. Explicit identity scope checks the
+catalog once per list call and fails clearly when unsupported; omitted scope adds
+no request. The mixed-event examples below assume the capability is available.
+
+Subscriptions belong to an identity and can combine mail, text, iMessage,
+call-lifecycle, A2A, and Slack notifications, even before channels are configured.
+Existing list calls keep their single-family views. Explicitly pass
+`scope="identity"` (Python), `scope: "identity"` (TypeScript), or use Rust's
+`list_with_scope` to include every family and mixed subscription. The CLI supports
+`inkbox webhook subscription list --agent-identity-id <id> --scope identity`.
+Mixed subscriptions also require explicit identity scope for updates and deletion:
+pass `scope="identity"` in Python, `{ scope: "identity" }` in TypeScript, use Rust's
+`update_with_scope` / `delete_with_scope`, or CLI `--scope identity`. Omitted scope
+preserves legacy behavior and receives 409 when targeting a mixed subscription.
+Event-list updates replace the complete selection. Incoming-call actions remain
+separate identity settings.
+
+## Safe message retries
+
+SDK send methods automatically include `Prefer: idempotency-replay`. Raw HTTP
+callers use this preference with `Idempotency-Key`. Older requests keep their
+existing behavior. Email and SMS continue waiting for send acceptance; iMessage
+continues returning its queued acknowledgement.
+
+Email, SMS/MMS, and iMessage send calls generate a request key and reuse it during
+bounded request retries. Pass an explicit `idempotency_key` (Python) or
+`idempotencyKey` (TypeScript) when your workflow retries across separate calls.
+Rust provides `send_with_idempotency_key` variants without changing existing methods.
+
+After a failed send, recover its generated key with `get_message_request_key(error)`
+(Python, imported from `inkbox`) or `getMessageRequestKey(error)` (TypeScript,
+imported from `@inkbox/sdk`). Both handle transport and API errors. The CLI prints
+the key in its error output. Rust errors do not expose automatically generated
+keys: preserve your own key and use an explicit-key variant for cross-call recovery.
+
+A completed retry returns the original response, not current delivery status.
+Read the message or use webhooks for delivery updates. A queued response confirms
+acceptance, not delivery or a guarantee of delivery retries. Use `message_sends.lookup` (Python),
+`messageSends.lookup` (TypeScript), or `inkbox send-lookup` to recover an original ID.
+See [message send retries](https://inkbox.ai/docs/api/message-sends).
+
+Read an iMessage by ID with `imessages.get(...)`, Rust's `imessages().get(...)`,
+or `inkbox imessage get <message-id> --identity <handle>`.
+
+## Slack workspace connections
+
+Slack contact rules support exact people and home workspaces, with whitelist or
+blacklist defaults and optional per-direction settings. Import visible people
+into real contact cards and use Slack with Companion mode. Importing a contact does not allow communication. Contact import
+requires an organization admin API key or a human Console session.
+See [Slack contact rules](https://inkbox.ai/docs/api/slack/contact-rules) and
+[contact import](https://inkbox.ai/docs/api/slack/contact-import) for version
+`0.7.14` examples.
+
+Slack sponsorship covers the channel or group DM, including all its threads.
+A new participant joining or the sponsor leaving requires fresh sponsorship;
+another participant leaving alone does not. Explicit blocks still apply.
+Optional `thread_ts` selects a reply thread; it does not limit sponsorship.
+
+Slack SDK and CLI methods require version **0.7.11 or later**.
+
+Connect an existing Inkbox identity to your Slack workspace. The
+[Python SDK](sdk/python/README.md#slack), [TypeScript SDK](sdk/typescript/README.md#slack),
+[Rust SDK](sdk/rust/README.md#slack), and [CLI](cli/README.md#slack) support reusable organization-owned workspace setup
+and direct browser handoffs, live conversations/history, durable message
+and utility actions, general file uploads/downloads, and identity-owned Slack
+webhooks with five selectable incoming-message events. Identity-wide message search spans workspace connections by default.
+Prepare the identity’s Slack app in a saved workspace before installing it;
+no identity toggle is required. Organization-member sessions, organization admin API
+keys, and claimed agent keys can save setup workspaces; claimed agent keys prepare
+and install only their own identity’s app.
+Accessible observed messages are captured automatically, independently of webhook
+subscriptions. Searchable retained history, bounded imports, and coverage are separate
+from live reads. Retention has no time limit by default; organization management
+can set a retention limit or delete existing history without stopping new capture.
+Pausing the identity stops live operations and webhook delivery while preserving
+its connections and history. Workspace approval, connection ownership, and current
+conversation access remain required.
+
+Version **0.7.23** adds app removal with organization management credentials.
+Read the app generation from the connection list and remove with a saved request
+UUID. This does not create another app. Connect again explicitly when ready;
+you can choose a different workspace. Previous connection history
+is no longer accessible through Inkbox. Removal always attempts permanent deletion
+of the old app from Slack, with its outcome reported separately. See the SDK and
+CLI Slack sections above.
+
+## iMessage sender addresses
+
+Dedicated lines can also receive one-to-one messages from non-phone sender
+addresses, such as `sender@example.com`. Read responses and `imessage.received`
+webhooks preserve the address as a string; do not normalize it into a phone number
+or assume every received message can be answered. These conversations are
+**receive-only**: sending messages, reactions, typing indicators, or read receipts
+returns HTTP `422` with `recipient_not_e164`. Outbound `to` recipients must still
+be E.164 phone numbers. Reading message history does not send a read receipt.
+
+## Voice notes
+
+Set the voice-note option on an iMessage, SMS/MMS, WhatsApp, or Slack send and the
+server speaks `text` in the agent's configured Voice AI voice and sends it as audio.
+iMessage and WhatsApp get a native voice note; SMS/MMS and Slack get a plain audio file.
+`text` is required and may be at most 600 characters. Media, iMessage `send_style`, and
+WhatsApp `gif_playback` can't be combined with a voice note.
+
+| Channel | Python | TypeScript | Rust | CLI |
+|---|---|---|---|---|
+| iMessage | `send_imessage(..., send_as_voice_note=True)` | `sendIMessage({ ..., sendAsVoiceNote: true })` | `send_imessage_voice_note(...)` | `imessage send --voice-note` |
+| SMS/MMS | `send_text(..., send_as_voice_note=True)` | `sendText({ ..., sendAsVoiceNote: true })` | `send_text_voice_note(...)` | `text send --voice-note` |
+| WhatsApp | `send_whatsapp(..., send_as_voice_note=True)` | `sendWhatsApp({ ..., sendAsVoiceNote: true })` | `send_whatsapp_voice_note(...)` | `whatsapp send --voice-note` |
+| Slack | `slack.send_message(..., send_as_voice_note=True)` | `slack.sendMessage(id, { ..., sendAsVoiceNote: true })` | `slack().send_voice_note(...)` | `slack message send --voice-note` |
+
+Fallback defaults to on: when the voice note can't be produced, including text over 600
+characters or an SMS/MMS recipient outside the US and Canada (SMS/MMS voice notes go only
+to US and Canadian numbers), the text is sent as an ordinary message. Pass
+`fallback_to_text=False` (Python), `fallbackToText: false` (TypeScript), `false` for
+Rust's `fallback_to_text` argument, or `--no-fallback-to-text` (CLI) to fail instead
+(`422 voice_note_text_too_long`, `422 voice_note_unsupported_destination`,
+`502 voice_note_unavailable`, or `409 whatsapp_capability_not_ready`).
+
+A voice note has no message text. The spoken text is stored with the message as the
+audio attachment's completed `transcription`. iMessage, SMS/MMS and WhatsApp send
+responses include it, as do later reads. On Slack, the
+uploaded audio file carries it in archived message reads once Slack confirms which
+message the upload became, which is nearly always. A fallback comes back as an
+ordinary text message.
+
+Before the recipient's first reply, a 1:1 iMessage voice note counts as media: it is
+sent as text, or without fallback fails with
+`422 imessage_reply_required_for_links_or_media`. On WhatsApp, before the recipient's first reply, a voice note is
+sent as text when opening messages are allowed but opening media isn't, or without
+fallback fails with `422 whatsapp_reply_required_for_media`; when no opening messages
+are allowed, the send returns `409 whatsapp_awaiting_inbound`. On Slack, a failure without fallback also
+returns `422 voice_note_text_too_long` or `502 voice_note_unavailable` on the first
+request, and is recorded on the send action (`status: failed` with the `error_code`).
+Repeating the same idempotency key returns that failed action with `200`, so use a new
+key to try again.
+
+## Threaded iMessage replies
+
+Requires SDK/CLI **0.7.13 or later**. These reply examples require a
+phone-number conversation or a supported group; non-phone one-to-one
+conversations remain receive-only, including threaded replies.
+
+Reply to a specific message in an existing one-to-one or group conversation with
+Python `reply_to_message_id`, TypeScript `replyToMessageId`, Rust `send_reply`, or
+CLI `--reply-to-message-id`. Supply its conversation ID too; do not use `to`.
+Messages expose nullable direct-parent, thread, and root-message IDs. A thread ID
+is opaque and distinct from its root message ID. Standalone messages can have a
+thread ID before anyone replies, with their own message ID as the root. A non-null
+reply-parent ID identifies a visible parent; a thread ID does not prove there are replies.
+
+Read a chronological page by any message using Python `imessages.get_thread`,
+TypeScript `imessages.getThread`, Rust `imessages().get_thread`, or CLI
+`imessage thread`. Read by conversation and thread IDs with the corresponding
+`get_conversation_thread` / `getConversationThread` / `conversation-thread` operation.
+Follow the returned cursor for more; existing message lists remain flat and
+newest-first with optional conversation-scoped thread filtering. See each
+language's README for complete examples and Rust's additive wrapper types.
+
+Reply sends allow an ordinary message in the same conversation when native
+threading is unsupported, including SMS/RCS targets. Set Python
+`plain_reply_fallback=False`, TypeScript `plainReplyFallback: false`, or CLI
+`--no-plain-reply-fallback` to require native threading. Rust offers
+`send_reply_with_fallback` / `send_imessage_reply_with_fallback` with a final
+boolean argument. The API owns fallback; clients do not resend failed replies
+as ordinary messages. Invalid or inaccessible targets still fail. Keep agent
+memory tied to the conversation; a native thread is optional context, and an
+ordinary fallback has no reply parent and does not join the target's native
+thread. Unsettled targets or missing reply metadata still fail. A previously
+supported target can still fail if native delivery becomes unavailable; fallback
+does not resend rejected replies. Read the queued message status and error fields
+because delivery webhooks do not cover every failure before dispatch.
+
+### Outbound Voice AI opening wait
+
+Set `outbound_greeting_wait_seconds` (Python/Rust),
+`outboundGreetingWaitSeconds` (TypeScript), or
+`--outbound-greeting-wait-seconds` (CLI) when placing a hosted call.
+Use 0–60 seconds; omission preserves the 1.5-second default. Zero requests an
+immediate opening. This setting does not change incoming-call greetings.
+
+## License
+
+MIT
+
+## Dedicated WhatsApp
+
+From version 0.7.29, `identity.get_whatsapp_onboarding()` (Python),
+`await identity.getWhatsAppOnboarding()` (TypeScript),
+`identity.get_whatsapp_onboarding()?` (Rust), or
+`inkbox whatsapp onboarding --identity my-agent`
+returns a router connect link and PNG QR code for dedicated and shared-number agents.
+The draft is `connect @handle` to the router; the person taps Send, follows the
+returned destination link with `start` prefilled, and taps Send again. Check `ready`
+before presenting the draft. Onboarding does not enable WhatsApp or send a message.
+Read channel status to find an agent's dedicated number; onboarding publishes the router number.
+
+WhatsApp never starts a conversation by default: an agent replies after the
+recipient messages first. Shared numbers never start conversations; dedicated
+numbers can only with approval for your organization. Until the recipient writes,
+sends return `409 whatsapp_awaiting_inbound` (Python and TypeScript raise
+`WhatsAppAwaitingInboundError`; in Rust, `error.is_whatsapp_awaiting_inbound()`
+is true). Wait for the recipient's message instead of retrying with a new key.
+
+Dedicated numbers are available by approval and assigned to one agent.
+A dedicated number can match the agent’s iMessage number or be different; an iMessage
+number is not required. Agents without one can use [shared numbers](#shared-whatsapp-numbers). Check fresh channel status instead of assuming
+an old identity snapshot grants or denies access. If access is not available,
+request it in the console. Sending does not provision or enable the channel.
+
+```python
+identity = client.get_identity("my-agent")
+status = identity.get_whatsapp_status()  # None on APIs without this channel
+message = identity.send_whatsapp(
+    to="+15555550101", text="Hello", idempotency_key="order-confirmation-123"
+)
+current = identity.get_whatsapp_message(message.id)
+```
+
+```typescript
+const identity = await client.getIdentity("my-agent");
+const status = await identity.getWhatsAppStatus(); // null on older APIs
+const message = await identity.sendWhatsApp({
+  to: "+15555550101", text: "Hello", idempotencyKey: "order-confirmation-123",
+});
+const current = await identity.getWhatsAppMessage(message.id);
+```
+
+```rust,no_run
+# fn example() -> inkbox::Result<()> {
+let client = inkbox::Inkbox::builder("your-api-key").build()?;
+let identity = client.get_identity("my-agent")?;
+let status = identity.get_whatsapp_status()?;
+let message = identity.send_whatsapp(&inkbox::WhatsAppSendOptions {
+    to: Some("+15555550101".into()),
+    text: Some("Hello".into()),
+    idempotency_key: Some("order-confirmation-123".into()),
+    ..Default::default()
+})?;
+# Ok(()) }
+```
+
+```bash
+inkbox whatsapp status --identity my-agent
+inkbox whatsapp send --identity my-agent --to +15555550101 --text Hello \
+  --idempotency-key order-confirmation-123
+inkbox whatsapp conversations --identity my-agent
+inkbox whatsapp list --identity my-agent --conversation-id <conversation-id>
+```
+
+Use either one E.164 recipient string (`to`) or an existing `conversation_id` /
+`conversationId`, never both. Recipient arrays are not supported. WhatsApp supports
+direct conversations and existing groups. Outbound text is at most 4,000 Unicode code points.
+Each message can contain text, one owned attachment, or both.
+
+### Shared WhatsApp numbers
+
+An agent without a dedicated number can reach a recipient through one of the
+organization's shared numbers. Connecting reserves a number for that recipient
+and sends nothing; give the recipient the returned `assigned_number` / `assignedNumber` when present. `awaiting_inbound` /
+`awaitingInbound` stays true until they message it, and the agent can reply
+after that. Connect and disconnect require an admin-scoped API key and an
+idempotency key. Disconnecting keeps conversation history. Use a new key for each new connect or disconnect; reuse a key only to retry that same request. People can also text the router number to connect with an agent.
+Groups work only on dedicated numbers.
+
+```python
+from uuid import uuid4
+
+result = client.whatsapp.connect(
+    agent_identity_id=identity.id, recipient_number="+15555550101",
+    idempotency_key=str(uuid4()),
+)
+connections = client.whatsapp.list_assignments(agent_identity_id=identity.id)
+client.whatsapp.disconnect(
+    agent_identity_id=identity.id, recipient_number="+15555550101",
+    idempotency_key=str(uuid4()),
+)
+router = client.whatsapp.get_triage_number()
+```
+
+```typescript
+const result = await client.whatsapp.connect({
+  agentIdentityId: identity.id, recipientNumber: "+15555550101",
+  idempotencyKey: crypto.randomUUID(),
+});
+const connections = await client.whatsapp.listAssignments({ agentIdentityId: identity.id });
+await client.whatsapp.disconnect({
+  agentIdentityId: identity.id, recipientNumber: "+15555550101",
+  idempotencyKey: crypto.randomUUID(),
+});
+const router = await client.whatsapp.getTriageNumber();
+```
+
+```rust,no_run
+# fn example() -> inkbox::Result<()> {
+let client = inkbox::Inkbox::builder("your-api-key").build()?;
+let identity = client.get_identity("my-agent")?;
+let result = client
+    .whatsapp()
+    .connect(&identity.id(), "+15555550101", &uuid::Uuid::new_v4().to_string())?;
+let connections = client.whatsapp().list_assignments(Some(&identity.id()))?;
+client
+    .whatsapp()
+    .disconnect(&identity.id(), "+15555550101", &uuid::Uuid::new_v4().to_string())?;
+let router = client.whatsapp().get_triage_number(None)?;
+# Ok(()) }
+```
+
+```bash
+inkbox whatsapp connect --identity my-agent --recipient +15555550101 \
+  --idempotency-key "$(uuidgen)"
+inkbox whatsapp assignments --identity my-agent
+inkbox whatsapp disconnect --identity my-agent --recipient +15555550101 \
+  --idempotency-key "$(uuidgen)"
+inkbox whatsapp triage-number
+```
+
+When replying through a shared number with an attachment, pass the recipient
+number on upload: `recipient_number=` (Python), `recipientNumber` (TypeScript),
+`upload_media_for_recipient` / `upload_whatsapp_media_for_recipient` (Rust), or
+`--recipient` (`inkbox whatsapp upload-media`).
+
+Shared-number errors: replying before the recipient's first message returns
+`409 whatsapp_awaiting_inbound`; sending through a shared number to a recipient
+the agent is not connected to returns `403 whatsapp_access_required`. Connect can
+also return `409 whatsapp_identity_has_dedicated_line`, `409 whatsapp_pool_unavailable`,
+`409 whatsapp_recipient_connections_full` (disconnect an existing assignment first),
+`409 whatsapp_connection_busy` (retry with the same key), or
+`403 recipient_blocked`. A disabled agent returns `400` with
+`detail: "Agent identity is not enabled for WhatsApp"`. Key errors on connect and disconnect:
+`422 invalid_idempotency_key`; `409 idempotency_key_reused` (the key was used for a
+different request); `409 idempotency_in_progress` (the original request is still
+running; retry with the same key); and `409 result_unavailable` (the stored result
+expired; check `assignments` before acting again with a new key).
+
+### Existing groups
+
+Add the agent to a group in WhatsApp, then send a message from another participant.
+The agent cannot create groups or initiate group conversations. Text, attachments,
+reactions, and quoted replies require an allowed incoming message.
+All group participants must have known phone numbers (`unresolved_participant_count`
+must be zero). Receiving checks every participant against inbound contact rules;
+blocked incoming messages do not trigger `whatsapp.received`. Sending content or
+reactions checks outbound contact rules and returns `recipient_blocked`
+if any participant is unresolved or not allowed for outbound traffic. An outbound-only
+block does not block incoming messages or erase an earlier qualifying incoming
+message. A new allowed incoming message is needed only when none already qualifies.
+
+A `409 whatsapp_group_reply_required` means the current WhatsApp connection has no
+qualifying incoming group message, including after a connection replacement.
+Wait for an allowed message from another participant. Do not retry with a new
+idempotency key or fall back to a direct message.
+
+Use the returned conversation ID to address the group, not its display name.
+Names can change or be shared by multiple groups.
+
+Messages and conversations expose `is_group`, `group_name`, and
+`unresolved_participant_count` (TypeScript: `isGroup`, `groupName`, and
+`unresolvedParticipantCount`). A group's `remote_number` / `remoteNumber` is null;
+`sender_number` / `senderNumber` may also be null when a participant's phone number
+is unavailable in a blocked incoming message. `participants` contains only known
+remote phone numbers.
+
+Existing attachment, reaction, quote, and thread methods also work in eligible
+groups. Upload an MP4 with `content_type="video/mp4"` (Python),
+`contentType: "video/mp4"` (TypeScript), or `Some("video/mp4")` as the upload
+content-type argument (Rust). Then set `gif_playback=True` (Python), `gifPlayback: true`
+(TypeScript), or `gif_playback: Some(true)` (Rust) for animated playback. In the
+CLI, upload with `inkbox whatsapp upload-media animation.mp4 --identity my-agent
+--content-type video/mp4`, then send with `--media-id <id> --gif-playback`. A raw GIF file is a document attachment;
+the SDK does not convert files.
+
+### Attachments and recovery
+
+Upload one file (default policy 5 MiB, hard ceiling 20 MiB) with `upload_whatsapp_media` /
+`uploadWhatsAppMedia` / `upload_media`, then send its returned ID in `media_ids` /
+`mediaIds`. CLI: `whatsapp upload-media <file>`, then `whatsapp send --media-id <id>`.
+Uploads and sends are separate operations: persist the media ID and logical send
+key before sending. After a timeout or ambiguous outcome, reuse both; do not
+re-upload or generate a new key for that same intended message. Existing
+`message_sends.lookup` / `messageSends.lookup` uses `sender_kind=whatsapp_identity`,
+the identity UUID, and `operation=whatsapp.send`.
+
+Attachment URLs expire. `get_whatsapp_media` / `getWhatsAppMedia` / `get_media`
+reauthorizes access and returns fresh metadata and a temporary URL. Media can be
+`pending`, `ready`, or `unavailable`; retain the ID and metadata when URL is null.
+Read responses use `content` while send requests use `text`.
+
+A queued response is acceptance, not delivery. Inspect message `status` separately
+from `delivery_state` / `deliveryState`. A confirmed `sent` message with delivery
+`unknown` has not become a failed send. Do not resend automatically to chase a
+missing delivery confirmation. `mark_whatsapp_read` / `markWhatsAppRead` /
+`mark_read` updates unread history and sends supported read receipts. Omit the message boundary to mark all unread messages; inspect `read_receipts_sent` / `readReceiptsSent`.
+
+### Notifications and contact history
+
+Identity webhook subscriptions accept `whatsapp.received`, `whatsapp.sent`,
+`whatsapp.delivered`, `whatsapp.delivery_failed`,
+`whatsapp.delivery_unconfirmed`, and `whatsapp.reaction_received`, including subscriptions created before approval.
+Only `whatsapp.received` represents a new incoming message. Deduplicate retries by
+event ID; delivery notifications should update delivery state without starting an
+agent reply. Payloads keep snake_case fields and ISO timestamps. Received events
+can opt into the existing `texts` context class, whose items can have channel
+`whatsapp`. No new context class is required.
+
+Subscribe once to `message.transcription_finished` for MMS, iMessage, WhatsApp and Slack.
+It updates the original message when all its audio attachments have completed,
+failed, or been skipped. When `data.channel` is `whatsapp`, results are in
+`data.message.media[].transcription`. When it is `slack`, results are in
+`data.event.files[].transcription`, alongside `connection_id`, `conversation_id`,
+`message_ts` and `thread_ts`. Every subscription with this event receives every
+completion for the identity, on Slack too, whichever Slack message events it selects. Match the receiving identity, channel and
+`data.message_id` to the original receipt; don't start a second reply. Slack
+received-message events carry the same `data.message_id`; read that message once with
+the archive `message_id` filter (`list_archived_messages(..., message_id=...)`,
+`listArchivedMessages(id, { messageId })`, Rust `get_archived_message`, or
+`slack archive messages --message-id`).
+
+Contact correspondence is explicitly opt-in: select `channels=["whatsapp"]` and
+optionally `whatsapp_limit` / `whatsappLimit` (`--channels whatsapp
+--whatsapp-limit 10` in the CLI). Default correspondence selectors are unchanged.
+Conversation participants contain remote numbers only, and `sender_number` /
+`senderNumber` is the message author, or null when the number is hidden. Typing
+indicators and read receipts are supported for eligible direct conversations.
+WhatsApp calls are not supported.
+
+### Native quotes and reactions
+
+Message and conversation lists accept creation-date bounds (`start_datetime` /
+`startDatetime`, `end_datetime` / `endDatetime`) and an optional IANA `tz`;
+a bare end date includes the whole day.
+
+Quote an existing authorized message with `reply_to_message_id` /
+`replyToMessageId`, always together with its `conversation_id` / `conversationId`.
+`plain_reply_fallback` / `plainReplyFallback` defaults to true; false explicitly
+requires native quoting. All currently supported WhatsApp targets support native
+quotes, so no current target uses plain fallback. Missing evidence, rejected sends,
+and uncertain sends never trigger an unquoted replacement. Read chronological quote chains with
+`get_whatsapp_thread` / `getWhatsAppThread` or `get_whatsapp_conversation_thread` /
+`getWhatsAppConversationThread`. Both return conversation, thread, root message,
+messages, and an opaque next cursor. A message-list `thread_id` / `threadId` filter
+also requires the conversation ID.
+
+```python
+reply = identity.send_whatsapp(
+    conversation_id=incoming.conversation_id,
+    reply_to_message_id=incoming.id,
+    text="I will review this milestone.",
+    idempotency_key="milestone-quoted-reply",
+)
+receipt = identity.send_whatsapp_reaction(
+    message_id=incoming.id, reaction="like", idempotency_key="milestone-reaction",
+)
+current = identity.get_whatsapp_reaction(receipt.id)
+removed = identity.remove_whatsapp_reaction(receipt.id, idempotency_key="milestone-reaction-removal")
+```
+
+```typescript
+const reply = await identity.sendWhatsApp({
+  conversationId: incoming.conversationId, replyToMessageId: incoming.id,
+  text: "I will review this milestone.", idempotencyKey: "milestone-quoted-reply",
+});
+const receipt = await identity.sendWhatsAppReaction({
+  messageId: incoming.id, reaction: "like", idempotencyKey: "milestone-reaction",
+});
+const current = await identity.getWhatsAppReaction(receipt.id);
+const removed = await identity.removeWhatsAppReaction(receipt.id, "milestone-reaction-removal");
+```
+
+Named reactions are `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`, and
+`eyes`. Alternatively supply `custom_emoji` / `customEmoji`, exclusively. Reactions
+apply to the whole message; there is no part index. Each mutation requires an
+explicit stable key. POST, GET, and DELETE return a versioned receipt. Receipt states
+are queued, sending, applied, removed, failed, uncertain, or superseded. Message
+reaction arrays contain only live applied reactions. A queued or uncertain reaction
+must not appear applied. Removing an old receipt never removes a newer reaction.
+Reaction notifications carry `data.reaction` and do not represent a new text turn.
+
+CLI: `whatsapp send --to +15555550101 --text "Hello"`,
+`whatsapp send --conversation-id <id> --reply-to-message-id <id>`,
+`whatsapp react <message-id> --reaction like --idempotency-key <key>`,
+`whatsapp get-reaction <reaction-id>`, `whatsapp remove-reaction <reaction-id>
+--idempotency-key <key>`, `whatsapp thread <message-id>`, and
+`whatsapp conversation-thread <conversation-id> <thread-id>`. All require `--identity`.
+
+
+Effective WhatsApp policy limits and usage are independent from iMessage. Read them with Python `identity.get_whatsapp_limits()`, TypeScript `identity.getWhatsAppLimits()`, Rust `identity.get_whatsapp_limits()`, or `inkbox whatsapp limits -i agent-handle`. The returned public `whatsapp.*` maps retain future policy keys. The 4,000-character / 20 MiB transport ceilings do not promise that a particular identity's effective limits are that high; the server enforces its current configured policy.
+
+The limits response contains the agent identity, effective `limits`, and daily-only
+`usage`; it has no billing-cycle timestamp, monthly allowance, or enabled-agent
+cap. Current defaults allow 1,000 outbound messages per identity in a rolling
+24-hour window. Direct conversations allow 10 new contacts per day, with 60 seconds
+between new contacts, three openings of at most 159 characters before the first
+reply, and 15 consecutive unanswered messages. Before the first direct reply,
+links, phone numbers, email addresses, and media are not allowed. Read the effective limits rather than assuming these defaults apply to every identity.
+
+Group sends also count toward the identity message quota, the rolling 24-hour
+conversation limit, and the consecutive-unanswered-message limit. Groups require
+an allowed incoming message before the first send; the direct-conversation
+opening allowance does not apply.
+
+## Conversation participant filters
+
+From version 0.7.30, email thread lists and SMS, iMessage, and WhatsApp conversation
+lists accept optional participant or contact filters. Supply one to 100 email
+addresses or E.164 phone numbers to match any participant, or a saved contact ID
+to match its active identifiers. Use one selector, not both. Filtering happens
+before pagination and does not grant additional access.
+
+```python
+identity.list_whatsapp_conversations(participants=["+14155550123"])
+identity.list_imessage_conversations(contact_id=contact_id, include_groups=True)
+```
+
+WhatsApp filters include direct and group conversations. Existing group-listing
+options continue to apply to SMS and iMessage.

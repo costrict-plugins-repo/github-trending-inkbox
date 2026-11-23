@@ -1,0 +1,32 @@
+# Cross-language conformance fixtures
+
+These fixtures pin the wire-shape transformations both SDKs must perform
+identically. Same input on both sides → same output. If a fixture
+diverges between Python and TypeScript, one side is wrong.
+
+* `h1_envelope_reference/` — feed a raw HTTP/1.1 request to the
+  in-process h1 parser; verify the `DispatchRequest` it builds has the
+  same fields on both SDKs.
+* `h2_transcode_reference/` — feed h2 pseudo-headers + body chunks to
+  the transcoder; verify the `DispatchRequest` it produces matches.
+
+Each fixture is a JSON file with `input` (wire-shaped) and `expected`
+(the parsed `DispatchRequest`-equivalent shape). Both SDKs load the
+same JSON and assert.
+
+Slack fixtures are shared by Python, TypeScript, Rust, and CLI wire tests:
+`slack.json` contains API response examples, and `slack_webhook_events.json`
+contains all 23 event envelopes. Both files contain synthetic identifiers and data.
+
+`slack_operations.json` covers public Slack utility, retained-history, identity-wide
+search, and browser-handoff operations with shared synthetic requests and responses.
+Search cases include optional filters, multiple workspace connections, precise
+timestamps, Unicode queries, and an empty page with a continuation cursor.
+
+`imessage_sender_addresses.json` exercises receive-only sender addresses through
+Python, TypeScript, Rust, webhook reads, and CLI output. The same checks retain
+ordinary phone-number compatibility and the structured outbound rejection.
+
+`slack_task_streams.json` pins task-stream creation, updates, closure, and read-only
+operation recovery by key across all four clients, including empty final chunks,
+plan presentation, and failed or uncertain operation responses.

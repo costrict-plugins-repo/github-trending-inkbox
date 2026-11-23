@@ -1,0 +1,432 @@
+// sdk/typescript/tests/identities/identities.test.ts
+import { describe, it, expect, vi } from "vitest";
+import { IdentitiesResource } from "../../src/identities/resources/identities.js";
+import { AgentIdentity } from "../../src/agent_identity.js";
+import type { Inkbox } from "../../src/inkbox.js";
+import { parseAgentIdentityData } from "../../src/identities/types.js";
+import type { HttpTransport } from "../../src/_http.js";
+import {
+  RAW_IDENTITY,
+  RAW_IDENTITY_DETAIL,
+  RAW_IDENTITY_LIST_DETAIL,
+} from "../sampleData.js";
+
+function mockHttp() {
+  return {
+    get: vi.fn(),
+    post: vi.fn(),
+    patch: vi.fn(),
+    delete: vi.fn(),
+  } as unknown as HttpTransport;
+}
+
+const HANDLE = "sales-agent";
+
+describe("IdentitiesResource.create", () => {
+  it("posts and returns AgentIdentity", async () => {
+    const http = mockHttp();
+    vi.mocked(http.post).mockResolvedValue(RAW_IDENTITY);
+    const res = new IdentitiesResource(http);
+
+    const identity = await res.create({ agentHandle: HANDLE });
+
+    expect(http.post).toHaveBeenCalledWith("/", { agent_handle: HANDLE });
+    expect(identity.agentHandle).toBe(HANDLE);
+  });
+
+  it("supports nested mailbox, phone number, and vault secret payloads", async () => {
+    const http = mockHttp();
+    vi.mocked(http.post).mockResolvedValue({
+      ...RAW_IDENTITY,
+      email_address: "sales.team@inkboxmail.com",
+    });
+    const res = new IdentitiesResource(http);
+
+    const identity = await res.create({
+      agentHandle: HANDLE,
+      displayName: "Sales Team",
+      description: "Sales outreach",
+      mailbox: {
+        emailLocalPart: "sales.team",
+      },
+      tunnel: { tlsMode: "passthrough" },
+      phoneNumber: {
+        type: "local",
+        state: "NY",
+        incomingCallAction: "webhook",
+        incomingCallWebhookUrl: "https://example.com/calls",
+      },
+      vaultSecretIds: [
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222",
+      ],
+    });
+
+    expect(http.post).toHaveBeenCalledWith("/", {
+      agent_handle: HANDLE,
+      display_name: "Sales Team",
+      description: "Sales outreach",
+      mailbox: {
+        email_local_part: "sales.team",
+      },
+      tunnel: { tls_mode: "passthrough" },
+      phone_number: {
+        type: "local",
+        state: "NY",
+        incoming_call_action: "webhook",
+        incoming_call_webhook_url: "https://example.com/calls",
+      },
+      vault_secret_ids: [
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222",
+      ],
+    });
+    expect(identity.emailAddress).toBe("sales.team@inkboxmail.com");
+  });
+
+  it.each([
+    { incomingCallAction: "forward" as const, forwardingTargetType: "phone" as const },
+    { incomingCallAction: "forward" as const, forwardingTargetType: "sip" as const },
+    { forwardingPhoneNumber: "+14155550100" },
+    {
+      incomingCallAction: "forward" as const,
+      forwardingTargetType: "phone" as const,
+      forwardingPhoneNumber: "+14155550100",
+      forwardingSipUri: "sip:line@voice.example.com",
+    },
+  ])("rejects incoherent nested forwarding options", async (phoneNumber) => {
+    const http = mockHttp();
+    const res = new IdentitiesResource(http);
+
+    await expect(res.create({ agentHandle: HANDLE, phoneNumber })).rejects.toThrow(/forwarding/i);
+    expect(http.post).not.toHaveBeenCalled();
+  });
+
+  it("supports a single vault secret ID", async () => {
+    const http = mockHttp();
+    vi.mocked(http.post).mockResolvedValue(RAW_IDENTITY);
+    const res = new IdentitiesResource(http);
+
+    await res.create({
+      agentHandle: HANDLE,
+      vaultSecretIds: "11111111-1111-1111-1111-111111111111",
+    });
+
+    expect(http.post).toHaveBeenCalledWith("/", {
+      agent_handle: HANDLE,
+      vault_secret_ids: "11111111-1111-1111-1111-111111111111",
+    });
+  });
+
+  it("claims and attaches a dedicated iMessage number during create", async () => {
+    const http = mockHttp();
+    vi.mocked(http.post).mockResolvedValue(RAW_IDENTITY_DETAIL);
+    const res = new IdentitiesResource(http);
+
+    const identity = await res.create({
+      agentHandle: HANDLE,
+      imessageEnabled: true,
+      claimIMessageNumber: true,
+    });
+
+    expect(http.post).toHaveBeenCalledWith("/", {
+      agent_handle: HANDLE,
+      imessage_enabled: true,
+      claim_imessage_number: true,
+    });
+    expect(identity.imessageNumber?.type).toBe("dedicated_outbound");
+  });
+
+  it("sends the contact-sharing toggle on create and update", async () => {
+    const http = mockHttp();
+    vi.mocked(http.post).mockResolvedValue(RAW_IDENTITY_DETAIL);
+    vi.mocked(http.patch).mockResolvedValue(RAW_IDENTITY_DETAIL);
+    const res = new IdentitiesResource(http);
+
+    await res.create({ agentHandle: HANDLE, contactSharingEnabled: false });
+    expect(http.post).toHaveBeenCalledWith("/", {
+      agent_handle: HANDLE,
+      contact_sharing_enabled: false,
+    });
+
+    await res.update(HANDLE, { contactSharingEnabled: true });
+    expect(http.patch).toHaveBeenCalledWith(`/${HANDLE}`, {
+      contact_sharing_enabled: true,
+    });
+  });
+
+  it("requires iMessage to be enabled when claiming during create", async () => {
+    const http = mockHttp();
+    const res = new IdentitiesResource(http);
+
+    await expect(res.create({
+      agentHandle: HANDLE,
+      claimIMessageNumber: true,
+    })).rejects.toThrow("claimIMessageNumber requires imessageEnabled: true");
+    expect(http.post).not.toHaveBeenCalled();
+  });
+
+  it("rejects a false claim value from untyped JavaScript callers", async () => {
+    const http = mockHttp();
+    const res = new IdentitiesResource(http);
+
+    await expect(res.create({
+      agentHandle: HANDLE,
+      claimIMessageNumber: false,
+    } as unknown as Parameters<IdentitiesResource["create"]>[0])).rejects.toThrow(
+      "claimIMessageNumber must be true when supplied",
+    );
+
+    expect(http.post).not.toHaveBeenCalled();
+  });
+});
+
+describe("IdentitiesResource.list", () => {
+  it("preserves hydrated fields", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue([RAW_IDENTITY_LIST_DETAIL]);
+    const res = new IdentitiesResource(http);
+
+    const identities = await res.list();
+
+    expect(http.get).toHaveBeenCalledWith("/");
+    expect(identities).toHaveLength(1);
+    expect(identities[0].agentHandle).toBe(HANDLE);
+    expect(identities[0].mailbox?.emailAddress).toBe("sales-agent@inkbox.ai");
+    expect(identities[0].tunnel?.tunnelName).toBe(HANDLE);
+  });
+
+  it("accepts older summary responses", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue([RAW_IDENTITY]);
+    const res = new IdentitiesResource(http);
+
+    const identity = (await res.list())[0];
+
+    expect(identity.agentHandle).toBe(HANDLE);
+    expect(identity.mailbox).toBeNull();
+    expect(identity.tunnel).toBeNull();
+  });
+
+  it("returns empty list", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue([]);
+    const res = new IdentitiesResource(http);
+    expect(await res.list()).toEqual([]);
+  });
+});
+
+describe("IdentitiesResource.get", () => {
+  it("returns AgentIdentityDetail", async () => {
+    const http = mockHttp();
+    vi.mocked(http.get).mockResolvedValue(RAW_IDENTITY_DETAIL);
+    const res = new IdentitiesResource(http);
+
+    const detail = await res.get(HANDLE);
+
+    expect(http.get).toHaveBeenCalledWith(`/${HANDLE}`);
+    expect(detail.mailbox!.emailAddress).toBe("sales-agent@inkbox.ai");
+  });
+});
+
+describe("IdentitiesResource.update", () => {
+  it.each(["new-handle", HANDLE, null, undefined])("rejects a supplied newHandle (%s) before HTTP through either API", async (newHandle) => {
+    const http = mockHttp();
+    const res = new IdentitiesResource(http);
+    const identity = new AgentIdentity(parseAgentIdentityData(RAW_IDENTITY_DETAIL), { _idsResource: res } as Inkbox);
+    const options = { newHandle, displayName: "Must not change" } as unknown as Parameters<IdentitiesResource["update"]>[1];
+    await expect(res.update(HANDLE, options)).rejects.toThrow("Agent handles are read-only");
+    await expect(identity.update(options)).rejects.toThrow("Agent handles are read-only");
+    expect(http.patch).not.toHaveBeenCalled();
+    expect(identity.agentHandle).toBe(HANDLE);
+  });
+
+  it("omits undefined fields", async () => {
+    const http = mockHttp();
+    vi.mocked(http.patch).mockResolvedValue(RAW_IDENTITY);
+    const res = new IdentitiesResource(http);
+
+    await res.update(HANDLE, { displayName: "New display" });
+
+    const [, body] = vi.mocked(http.patch).mock.calls[0] as [string, Record<string, unknown>];
+    expect(body).toEqual({ display_name: "New display" });
+  });
+
+  it("claims a dedicated number during update with a stable idempotency key", async () => {
+    const http = mockHttp();
+    vi.mocked(http.patch).mockResolvedValue(RAW_IDENTITY);
+    const res = new IdentitiesResource(http);
+
+    await res.update(HANDLE, {
+      claimIMessageNumber: true,
+      idempotencyKey: "identity-claim-123",
+    });
+
+    expect(http.patch).toHaveBeenCalledWith(
+      `/${HANDLE}`,
+      { claim_imessage_number: true },
+      { headers: { "Idempotency-Key": "identity-claim-123" } },
+    );
+  });
+
+  it("rejects a false update claim from untyped JavaScript callers", async () => {
+    const http = mockHttp();
+    const res = new IdentitiesResource(http);
+
+    await expect(res.update(HANDLE, {
+      claimIMessageNumber: false,
+    } as unknown as Parameters<IdentitiesResource["update"]>[1])).rejects.toThrow(
+      "claimIMessageNumber must be true when supplied",
+    );
+
+    expect(http.patch).not.toHaveBeenCalled();
+  });
+
+  it("forwards a caller-provided idempotency key on other updates", async () => {
+    const http = mockHttp();
+    vi.mocked(http.patch).mockResolvedValue(RAW_IDENTITY);
+    const res = new IdentitiesResource(http);
+
+    await res.update(HANDLE, {
+      displayName: "Updated",
+      idempotencyKey: "profile-update-123",
+    });
+
+    expect(http.patch).toHaveBeenCalledWith(
+      `/${HANDLE}`,
+      { display_name: "Updated" },
+      { headers: { "Idempotency-Key": "profile-update-123" } },
+    );
+  });
+
+  it("requires and validates the idempotency key for an update claim", async () => {
+    const http = mockHttp();
+    const res = new IdentitiesResource(http);
+
+    await expect(res.update(HANDLE, {
+      claimIMessageNumber: true,
+    })).rejects.toThrow("idempotencyKey is required with claimIMessageNumber");
+    await expect(res.update(HANDLE, {
+      claimIMessageNumber: true,
+      idempotencyKey: "x".repeat(256),
+    })).rejects.toThrow("between 1 and 255 characters");
+    expect(http.patch).not.toHaveBeenCalled();
+  });
+
+  it("rejects incompatible identity number changes", async () => {
+    const http = mockHttp();
+    const res = new IdentitiesResource(http);
+
+    await expect(res.update(HANDLE, {
+      claimIMessageNumber: true,
+      imessageNumberId: "99999999-0000-0000-0000-000000000001",
+      idempotencyKey: "identity-claim-123",
+    })).rejects.toThrow("claimIMessageNumber and imessageNumberId cannot be set together");
+    await expect(res.update(HANDLE, {
+      imessageEnabled: false,
+      claimIMessageNumber: true,
+      idempotencyKey: "identity-claim-456",
+    })).rejects.toThrow("cannot be combined with disabling iMessage");
+    expect(http.patch).not.toHaveBeenCalled();
+  });
+
+  it("preserves explicit null when moving back to shared iMessage", async () => {
+    const http = mockHttp();
+    vi.mocked(http.patch).mockResolvedValue(RAW_IDENTITY);
+    const res = new IdentitiesResource(http);
+
+    await res.update(HANDLE, { imessageNumberId: null });
+
+    expect(http.patch).toHaveBeenCalledWith(`/${HANDLE}`, {
+      imessage_number_id: null,
+    });
+  });
+
+  it("allows disabling iMessage while explicitly returning to shared service", async () => {
+    const http = mockHttp();
+    vi.mocked(http.patch).mockResolvedValue(RAW_IDENTITY_DETAIL);
+    const res = new IdentitiesResource(http);
+
+    await res.update(HANDLE, {
+      imessageEnabled: false,
+      imessageNumberId: null,
+    });
+
+    expect(http.patch).toHaveBeenCalledWith(`/${HANDLE}`, {
+      imessage_enabled: false,
+      imessage_number_id: null,
+    });
+  });
+
+  it("passes through number attachment conflicts without remapping them as handle errors", async () => {
+    const http = mockHttp();
+    const { InkboxAPIError } = await import("../../src/_http.js");
+    vi.mocked(http.patch).mockRejectedValue(new InkboxAPIError(409, {
+      error: "number_already_attached",
+      message: "Choose another number.",
+    }));
+    const res = new IdentitiesResource(http);
+
+    const err = await res.update(HANDLE, {
+      imessageNumberId: "99999999-0000-0000-0000-000000000001",
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(InkboxAPIError);
+    expect(err).toMatchObject({ name: "InkboxAPIError" });
+  });
+
+  it("maps a handle collision during creation", async () => {
+    const http = mockHttp();
+    const { InkboxAPIError } = await import("../../src/_http.js");
+    const { HandleUnavailableError } = await import("../../src/identities/exceptions.js");
+    const support = "Contact the Support Agent using its Agent Card.";
+    vi.mocked(http.post).mockRejectedValue(
+      new InkboxAPIError(
+        409,
+        {
+          code: "agent_handle_unavailable",
+          message: "That handle is unavailable.",
+          blocking_namespace: "identities",
+        },
+        null,
+        support,
+      ),
+    );
+    const res = new IdentitiesResource(http);
+
+    const err = await res.create({
+      agentHandle: "already-used",
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(HandleUnavailableError);
+    expect(err).toMatchObject({
+      blockingNamespace: "identities",
+      agentSupport: support,
+    });
+  });
+});
+
+describe("IdentitiesResource.delete", () => {
+  it("calls delete on the correct path", async () => {
+    const http = mockHttp();
+    vi.mocked(http.delete).mockResolvedValue(undefined);
+    const res = new IdentitiesResource(http);
+
+    await res.delete(HANDLE);
+
+    expect(http.delete).toHaveBeenCalledWith(`/${HANDLE}`);
+  });
+});
+
+
+describe("IdentitiesResource.releasePhoneNumber", () => {
+  it("releases the identity's phone number", async () => {
+    const http = mockHttp();
+    vi.mocked(http.delete).mockResolvedValue(undefined);
+    const res = new IdentitiesResource(http);
+
+    await res.releasePhoneNumber(HANDLE);
+
+    expect(http.delete).toHaveBeenCalledWith(`/${HANDLE}/phone_number`);
+  });
+});

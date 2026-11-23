@@ -1,0 +1,383 @@
+// tests/integration/typescript/sdk_lifecycle.test.ts
+
+import { randomUUID } from "node:crypto";
+import { describe, it, expect, beforeAll } from "vitest";
+import {
+  Inkbox,
+  MailRuleAction,
+  MailRuleMatchType,
+  MailImportFormat,
+  MailImportJobStatus,
+  MessageDirection,
+} from "@inkbox/sdk";
+import type { Message, DecryptedVaultSecret, APIKeyPayload } from "@inkbox/sdk";
+import {
+  loadConfig,
+  loadBootstrapFromEnv,
+  logStep,
+  pollUntil,
+  type SdkIntegrationConfig,
+  type BootstrapResult,
+} from "./helpers.js";
+
+describe("TypeScript SDK lifecycle", { timeout: 300_000 }, () => {
+  let config: SdkIntegrationConfig;
+  let bootstrap: BootstrapResult;
+
+  beforeAll(() => {
+    // Bootstrap is provisioned once per vitest run by globalSetup.ts and
+    // shared across every test file in this directory.
+    config = loadConfig();
+    bootstrap = loadBootstrapFromEnv();
+  });
+
+  it("exercises the full SDK lifecycle", async () => {
+    const inkbox = new Inkbox({
+      apiKey: bootstrap.apiKey,
+      baseUrl: config.baseUrl,
+      timeoutMs: config.httpTimeout,
+    });
+
+    // Globally unique handles (`agent_handle` is now unique across all
+    // orgs and shares its namespace with `tunnel_name`), so parallel CI
+    // runs and any prior runs that left stragglers must not collide.
+    const runSuffix = randomUUID().slice(0, 8);
+    const alphaHandle = `ts-alpha-${runSuffix}`;
+    const bravoHandle = `ts-bravo-${runSuffix}`;
+    const publicHostRe = new RegExp(`^${alphaHandle}\\..+\\.inkboxwire\\.com$`);
+
+    // ── whoami ──────────────────────────────────────────────────
+    logStep(config, "whoami");
+    const whoami = await inkbox.whoami();
+    expect(whoami.organizationId).toBe(bootstrap.orgId);
+
+    const claimDomain = `certification-${randomUUID().replaceAll("-", "")}.example.com`;
+    const claim = await inkbox.organizationDomains.create(claimDomain);
+    try {
+      expect(claim.state).toBe("pending");
+      expect((await inkbox.organizationDomains.create(claimDomain.toUpperCase() + ".")).id).toBe(claim.id);
+      expect((await inkbox.organizationDomains.get(claim.id)).dnsRecord.name).toBe(`_inkbox.${claimDomain}`);
+      expect((await inkbox.organizationDomains.verify(claim.id)).validUntil).toBeNull();
+      expect((await inkbox.a2a.publicDirectory({ verifiedDomain: claimDomain })).items).toEqual([]);
+    } finally {
+      await inkbox.organizationDomains.delete(claim.id);
+    }
+
+    // ── empty state ────────────────────────────────────────────
+    logStep(config, "verify empty identity list");
+    const empty = await inkbox.listIdentities();
+    expect(empty).toHaveLength(0);
+
+    // ── create identities ─────────────────────────────────────
+    logStep(config, `create identity ${alphaHandle} (mailbox + tunnel provisioned atomically)`);
+    const alpha = await inkbox.createIdentity(alphaHandle, {
+      description: "alpha integration-test identity",
+    });
+    expect(alpha.agentHandle).toBe(alphaHandle);
+    expect(alpha.mailbox).not.toBeNull();
+    expect(alpha.emailAddress).toBeTruthy();
+    expect(alpha.tunnel).not.toBeNull();
+    expect(alpha.tunnel!.publicHost).toMatch(publicHostRe);
+    expect(alpha.description).toBe("alpha integration-test identity");
+    expect((await inkbox.identities.getDomainAffiliation(alphaHandle)).affiliation).toBeNull();
+
+    logStep(config, `create identity ${bravoHandle}`);
+    const bravo = await inkbox.createIdentity(bravoHandle);
+    expect(bravo.agentHandle).toBe(bravoHandle);
+    expect(bravo.mailbox).not.toBeNull();
+    expect(bravo.tunnel).not.toBeNull();
+
+    logStep(config, "import one EML through the TypeScript SDK");
+    const importedSubject = `typescript-import-${runSuffix}`;
+    const eml = new Blob([
+      `From: sender@example.com\r\nTo: ${alpha.emailAddress}\r\n` +
+        `Subject: ${importedSubject}\r\nMessage-ID: <${runSuffix}@example.com>\r\n` +
+        "Date: Wed, 1 Jul 2026 12:00:00 +0000\r\n\r\nImported body.\r\n",
+    ]);
+    const createdImport = await inkbox.mailboxes.imports.create(alpha.emailAddress!, {
+      sourceFormat: MailImportFormat.EML,
+    });
+    await inkbox.mailboxes.imports.upload(createdImport.upload, eml, { fileName: "message.eml" });
+    await inkbox.mailboxes.imports.start(alpha.emailAddress!, createdImport.job.id);
+    const imported = await inkbox.mailboxes.imports.wait(alpha.emailAddress!, createdImport.job.id, {
+      timeoutMs: config.pollTimeout,
+      pollIntervalMs: config.pollInterval,
+    });
+    expect(imported.status).toBe(MailImportJobStatus.COMPLETED);
+    expect(imported.messagesImported).toBe(1);
+
+    logStep(config, "list identities shows 2");
+    const identities = await inkbox.listIdentities();
+    expect(identities).toHaveLength(2);
+
+    // ── tunnel get (smoke) ────────────────────────────────────
+    logStep(config, "fetch alpha's tunnel from the tunnel surface");
+    const alphaTunnel = await inkbox.tunnels.get(alpha.tunnel!.id);
+    expect(alphaTunnel.tunnelName).toBe(alphaHandle);
+    expect(alphaTunnel.tlsMode).toBe("edge");
+
+    // ── get identity ──────────────────────────────────────────
+    logStep(config, `get identity ${alphaHandle}`);
+    const alphaFetched = await inkbox.getIdentity(alphaHandle);
+    expect(alphaFetched.id).toBe(alpha.id);
+    expect(alphaFetched.emailAddress).toBe(alpha.emailAddress);
+    expect(alphaFetched.tunnel?.id).toBe(alpha.tunnel!.id);
+    expect(alphaFetched.description).toBe("alpha integration-test identity");
+
+    // ── update description: omit vs explicit-null semantics ───
+    logStep(config, "update alpha description (set)");
+    await alphaFetched.update({ description: "alpha updated" });
+    expect((await inkbox.getIdentity(alphaHandle)).description).toBe("alpha updated");
+    logStep(config, "update alpha description (clear via explicit null)");
+    await alphaFetched.update({ description: null });
+    expect((await inkbox.getIdentity(alphaHandle)).description).toBeNull();
+
+    // ── email draft lifecycle ──────────────────────────────────
+    logStep(config, "create, list, get, update, and delete an email draft");
+    const draft = await alpha.createEmailDraft({ subject: `draft-${runSuffix}` });
+    expect(draft.generation).toBe(1);
+    const drafts = [];
+    for await (const item of alpha.iterEmailDrafts()) drafts.push(item);
+    expect(drafts.some((item) => item.id === draft.id)).toBe(true);
+    expect((await alpha.getEmailDraft(draft.id)).id).toBe(draft.id);
+    const updatedDraft = await alpha.updateEmailDraft(draft.id, {
+      generation: draft.generation,
+      recipients: { to: [bravo.emailAddress!] },
+      bodyText: "Updated draft body",
+    });
+    expect(updatedDraft.generation).toBeGreaterThan(draft.generation);
+    expect(updatedDraft.bodyText).toBe("Updated draft body");
+    await alpha.deleteEmailDraft(updatedDraft.id, updatedDraft.generation);
+
+    logStep(config, "create and send a draft with an attachment");
+    const sendDraft = await alpha.createEmailDraft({
+      to: [bravo.emailAddress!],
+      subject: `draft-send-${runSuffix}`,
+      bodyText: "Sent from a draft.",
+      attachments: [{
+        filename: "hello.txt",
+        contentType: "text/plain",
+        contentBase64: "aGVsbG8=",
+      }],
+    });
+    expect(sendDraft.attachmentCount).toBe(1);
+    const sentDraftMessage = await alpha.sendEmailDraft(
+      sendDraft.id,
+      sendDraft.generation,
+    );
+    expect(sentDraftMessage.subject).toBe(`draft-send-${runSuffix}`);
+
+    // ── send email alpha → bravo ──────────────────────────────
+    const subject = `sdk-integration-ts-${config.environment}`;
+    logStep(config, `send email from alpha to bravo: ${subject}`);
+    const sent = await alpha.sendEmail({
+      to: [bravo.emailAddress!],
+      subject,
+      bodyText: "Hello from the TypeScript SDK integration test!",
+    });
+    expect(sent.subject).toBe(subject);
+    expect(sent.direction).toBe("outbound");
+
+    // ── poll for delivery ─────────────────────────────────────
+    logStep(config, "poll for inbound delivery to bravo");
+    const messages = await pollUntil<Message[]>(
+      "inbound message delivered to bravo",
+      async () => {
+        const msgs: Message[] = [];
+        for await (const msg of bravo.iterEmails({ direction: MessageDirection.INBOUND })) {
+          msgs.push(msg);
+          if (msgs.length >= 50) break;
+        }
+        return msgs;
+      },
+      {
+        timeoutMs: config.pollTimeout,
+        intervalMs: config.pollInterval,
+        isReady: (msgs) => msgs.some((m) => m.subject === subject),
+        verbose: config.verbose,
+      },
+    );
+    const inboundMsg = messages.find((m) => m.subject === subject)!;
+    expect(inboundMsg.direction).toBe("inbound");
+
+    // ── message detail ────────────────────────────────────────
+    logStep(config, "get message detail");
+    const detail = await bravo.getMessage(inboundMsg.id);
+    expect(detail.bodyText).toBeTruthy();
+    expect(detail.bodyText).toContain("TypeScript SDK");
+    expect(detail.threadId).toBeTruthy();
+
+    // ── mark read ─────────────────────────────────────────────
+    logStep(config, "mark message as read");
+    await bravo.markEmailsRead([inboundMsg.id]);
+
+    // ── thread ────────────────────────────────────────────────
+    logStep(config, "get thread");
+    const thread = await bravo.getThread(detail.threadId!);
+    expect(thread.subject).toBe(subject);
+    expect(thread.messages.length).toBeGreaterThanOrEqual(1);
+
+    // ── forward bravo → alpha ─────────────────────────────────
+    const forwardSubject = `Fwd: ${subject}`;
+    logStep(
+      config,
+      `forward inbound message from bravo to alpha: ${forwardSubject}`,
+    );
+    const forwarded = await bravo.forwardEmail(inboundMsg.id, {
+      to: [alpha.emailAddress!],
+      bodyText: "Forwarded by the TypeScript SDK integration test.",
+    });
+    expect(forwarded.direction).toBe("outbound");
+    expect(forwarded.subject).toBe(forwardSubject);
+
+    logStep(config, "poll for forwarded delivery to alpha");
+    const alphaMessages = await pollUntil<Message[]>(
+      "forwarded message delivered to alpha",
+      async () => {
+        const msgs: Message[] = [];
+        for await (const msg of alpha.iterEmails({ direction: MessageDirection.INBOUND })) {
+          msgs.push(msg);
+          if (msgs.length >= 50) break;
+        }
+        return msgs;
+      },
+      {
+        timeoutMs: config.pollTimeout,
+        intervalMs: config.pollInterval,
+        isReady: (msgs) => msgs.some((m) => m.subject === forwardSubject),
+        verbose: config.verbose,
+      },
+    );
+    const forwardedInbound = alphaMessages.find(
+      (m) => m.subject === forwardSubject,
+    )!;
+    expect(forwardedInbound.direction).toBe("inbound");
+
+    // ── mailbox storage ───────────────────────────────────────
+    // Both fields are present and numeric on the mail mailbox routes. The
+    // over-cap 402 (StorageLimitExceededError) is unit-tested, not exercised
+    // here — filling a 2 GiB cap in CI is not practical.
+    logStep(config, "mailbox storage fields on list + get");
+    const alphaMailbox = await inkbox.mailboxes.get(alpha.emailAddress!);
+    expect(typeof alphaMailbox.storageUsedBytes).toBe("number");
+    expect(alphaMailbox.storageUsedBytes).toBeGreaterThanOrEqual(0);
+    if (alphaMailbox.storageLimitBytes !== null) {
+      expect(typeof alphaMailbox.storageLimitBytes).toBe("number");
+      expect(alphaMailbox.storageLimitBytes).toBeGreaterThan(0);
+    }
+
+    const listedMailboxes = await inkbox.mailboxes.list();
+    const listedAlpha = listedMailboxes.find(
+      (m) => m.emailAddress === alpha.emailAddress,
+    )!;
+    expect(typeof listedAlpha.storageUsedBytes).toBe("number");
+
+    // ── vault + credentials ───────────────────────────────────
+    const vaultKey = "IntegrationTest-Key-01!";
+    logStep(config, "initialize vault");
+    const vaultResult = await inkbox.vault.initialize(vaultKey);
+    expect(vaultResult.vaultKeyId).toBeTruthy();
+    expect(vaultResult.recoveryCodes).toHaveLength(4);
+
+    logStep(config, "vault info");
+    const vaultInfo = await inkbox.vault.info();
+    expect(vaultInfo).not.toBeNull();
+    expect(vaultInfo!.keyCount).toBe(1);
+    expect(vaultInfo!.recoveryKeyCount).toBe(4);
+    expect(vaultInfo!.secretCount).toBe(0);
+
+    logStep(config, "unlock vault");
+    await inkbox.vault.unlock(vaultKey);
+
+    logStep(config, "create API key secret via alpha identity");
+    const secretA = await alpha.createSecret({
+      name: "test-api-key",
+      payload: { apiKey: "sk-test-secret-12345" },
+      description: "Integration test API key",
+    });
+    expect(secretA.name).toBe("test-api-key");
+    expect(secretA.secretType).toBe("api_key");
+
+    logStep(config, "create login secret via alpha identity");
+    const secretB = await alpha.createSecret({
+      name: "test-login",
+      payload: { username: "testuser", password: "testpass123" },
+      description: "Integration test login",
+    });
+    expect(secretB.name).toBe("test-login");
+    expect(secretB.secretType).toBe("login");
+
+    logStep(config, "list secrets shows both");
+    const allSecrets = await inkbox.vault.listSecrets();
+    expect(allSecrets).toHaveLength(2);
+
+    logStep(config, "list secrets filtered by type");
+    const apiKeySecrets = await inkbox.vault.listSecrets({ secretType: "api_key" });
+    expect(apiKeySecrets).toHaveLength(1);
+    expect(apiKeySecrets[0].name).toBe("test-api-key");
+
+    logStep(config, "verify alpha credentials include both secrets (no client-side filtering)");
+    const creds = await alpha.getCredentials();
+    const apiKeys = creds.listApiKeys();
+    expect(apiKeys).toHaveLength(1);
+    expect(creds.getApiKey(apiKeys[0].id).apiKey).toBe("sk-test-secret-12345");
+    const logins = creds.listLogins();
+    expect(logins).toHaveLength(1);
+    expect(creds.getLogin(logins[0].id).username).toBe("testuser");
+
+    logStep(config, "get secret by ID and verify decrypted payload");
+    const fetched = await alpha.getSecret(secretA.id);
+    expect(fetched.name).toBe("test-api-key");
+    expect((fetched.payload as APIKeyPayload).apiKey).toBe("sk-test-secret-12345");
+
+    logStep(config, "delete secrets");
+    await alpha.deleteSecret(secretA.id);
+    await alpha.deleteSecret(secretB.id);
+    const remaining = await inkbox.vault.listSecrets();
+    expect(remaining).toHaveLength(0);
+
+    // ── identity-scoped contact rules + filter mode ───────────
+    // (mail only — alpha has no phone number, and we don't provision
+    // real numbers in CI; phone rules require a number server-side.)
+    logStep(config, "set alpha mail filter mode to whitelist");
+    await alpha.update({ mailFilterMode: "whitelist" });
+    expect((await inkbox.getIdentity(alphaHandle)).mailFilterMode).toBe("whitelist");
+
+    logStep(config, "create a mail contact rule on alpha (identity-keyed)");
+    const rule = await alpha.createMailContactRule({
+      action: MailRuleAction.ALLOW,
+      matchType: MailRuleMatchType.EXACT_EMAIL,
+      matchTarget: "vip@example.com",
+    });
+    expect(rule.agentIdentityId).toBe(alpha.id);
+
+    logStep(config, "list alpha's mail rules + org-wide list filtered by identity");
+    expect((await alpha.listMailContactRules()).some((r) => r.id === rule.id)).toBe(true);
+    const orgRules = await inkbox.mailIdentityContactRules.listAll({ agentIdentityId: alpha.id });
+    expect(orgRules.some((r) => r.id === rule.id)).toBe(true);
+
+    logStep(config, "delete the mail contact rule + reset filter mode");
+    await alpha.deleteMailContactRule(rule.id);
+    expect((await alpha.listMailContactRules()).some((r) => r.id === rule.id)).toBe(false);
+    await alpha.update({ mailFilterMode: "blacklist" });
+    expect((await inkbox.getIdentity(alphaHandle)).mailFilterMode).toBe("blacklist");
+
+    // ── per-identity signing key ──────────────────────────────
+    logStep(config, "per-identity signing key: status -> create -> status");
+    const preStatus = await alpha.getSigningKeyStatus();
+    expect(typeof preStatus.configured).toBe("boolean");
+    const signingKey = await alpha.createSigningKey();
+    expect(signingKey.signingKey).toBeTruthy();
+    expect(signingKey.createdAt).toBeTruthy();
+    expect((await alpha.getSigningKeyStatus()).configured).toBe(true);
+
+    // ── cleanup: delete identities ────────────────────────────
+    logStep(config, "delete identities (cascades to mailbox + tunnel)");
+    await alpha.delete();
+    await bravo.delete();
+
+    logStep(config, "verify empty after cleanup");
+    const final = await inkbox.listIdentities();
+    expect(final).toHaveLength(0);
+  });
+});
